@@ -1,0 +1,8 @@
+listen_port: 53
+upstream:
+  - "udp://223.5.5.5:53"
+cf_mrs_url4: "https://www.cloudflare-cn.com/ips-v4"
+cf_mrs_url6: "https://www.cloudflare-cn.com/ips-v6"
+cf_mrs_cache: "./cloudflare.txt"
+replace_cname: "xx.xx" # 找一个好用的cf域名被替换
+cf_cache_time: 23h59m # 控制cf_mrs_cache文件在内存缓存的时间
