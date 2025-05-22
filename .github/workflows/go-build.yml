@@ -28,10 +28,10 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v3
 
-      - name: Set up Go 1.23
+      - name: Set up Go 1.23.9
         uses: actions/setup-go@v4
         with:
-          go-version: '1.23'
+          go-version: '1.23.9'
 
       - name: Generate version
         if: matrix.os == 'linux' && matrix.arch == 'amd64'  # 只在一次构建里生成并set环境变量
@@ -71,8 +71,19 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04  # 改用 20.04 避免最新版 Ubuntu 的问题
+    permissions:
+      contents: write
+      actions: read
     steps:
+      - name: Clean download-artifact cache
+        run: rm -rf ~/.local/share/actions/download-artifact
+
+      - name: Download artifacts and upload to Release
+        uses: actions/download-artifact@v4  # 改用 v4
+        with:
+          path: artifacts
+
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -83,11 +94,6 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download artifacts and upload to Release
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
 
       - name: Upload assets
         uses: softprops/action-gh-release@v1
