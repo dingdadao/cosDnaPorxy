@@ -1,6 +1,6 @@
 module cosDnaPorxy
 
-go 1.19
+go 1.23
 
 require (
 	github.com/miekg/dns v1.1.65
