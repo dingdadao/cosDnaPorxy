@@ -1,15 +1,15 @@
-name: Go Multi-Platform Build
+name: Go Multi-Platform Build and Release
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false  # ❗️失败不会终止全部任务，便于你重试单个失败的平台
+      fail-fast: false
       matrix:
         os: [linux, windows, darwin]
         arch: [amd64]
@@ -33,6 +33,16 @@ jobs:
         with:
           go-version: '1.19'
 
+      - name: Generate version
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'  # 只在一次构建里生成并set环境变量
+        id: version
+        run: |
+          SHORT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date -u +'%Y%m%d%H%M%S')
+          VERSION="v${DATE}-${SHORT_HASH}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Build binary
         run: |
           mkdir -p build
@@ -42,7 +52,7 @@ jobs:
       - name: Package binary and config
         run: |
           cd build
-          PACKAGE=dnsproxy-${{ matrix.os }}-${{ matrix.arch }}
+          PACKAGE=dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}
           if [ "${{ matrix.archive }}" = "zip" ]; then
             zip ../$PACKAGE.zip dnsproxy${{ matrix.ext }} config.yaml
           else
@@ -53,8 +63,36 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}
+          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}
           path: |
-            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
-            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}.zip
+            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.tar.gz
+            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.zip
           if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts and upload to Release
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Upload assets
+        uses: softprops/action-gh-release@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
