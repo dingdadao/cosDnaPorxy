@@ -26,12 +26,12 @@ jobs:
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Go 1.23.9
+      - name: Set up Go 1.22.4
         uses: actions/setup-go@v4
         with:
-          go-version: '1.23.9'
+          go-version: '1.22.4'
 
       - name: Generate version
         id: version
@@ -59,6 +59,15 @@ jobs:
           fi
         shell: bash
 
+      - name: Save version info
+        run: echo "${{ env.VERSION }}" > build/version.txt
+
+      - name: Upload version artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: version
+          path: build/version.txt
+
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
@@ -70,7 +79,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-24.04 # 改用 20.04 避免最新版 Ubuntu 的问题
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
@@ -79,9 +88,18 @@ jobs:
         run: rm -rf ~/.local/share/actions/download-artifact
 
       - name: Download artifacts and upload to Release
-        uses: actions/download-artifact@v4  # 改用 v4
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Download version artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: version
+          path: artifacts
+
+      - name: Set VERSION env
+        run: echo "VERSION=$(cat artifacts/version.txt)" >> $GITHUB_ENV
 
       - name: Create GitHub Release
         id: create_release
