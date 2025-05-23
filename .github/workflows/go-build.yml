@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -71,7 +71,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-20.04  # 改用 20.04 避免最新版 Ubuntu 的问题
+    runs-on: ubuntu-24.04 # 改用 20.04 避免最新版 Ubuntu 的问题
     permissions:
       contents: write
       actions: read
