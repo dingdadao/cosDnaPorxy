@@ -71,7 +71,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}
+          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}-${{ github.run_id }}
           path: |
             dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.tar.gz
             dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.zip
