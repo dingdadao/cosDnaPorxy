@@ -23,21 +23,21 @@ import (
 )
 
 // 常量定义
-const (
-	LOG_HIT_WHITELIST  = "[WHITELIST] Hit: %s"
-	LOG_HIT_CFNET      = "[CFNET] Cloudflare network matched: %s -> %s"
-	LOG_REPLACE_CNAME  = "[REPLACE] Replaced CNAME: %s -> %v"
-	LOG_UPSTREAM_QUERY = "[UPSTREAM] Query: %s (Type: %d)"
-)
+//const (
+//	LOG_HIT_WHITELIST  = "[WHITELIST] Hit: %s"
+//	LOG_HIT_CFNET      = "[CFNET] Cloudflare network matched: %s -> %s"
+//	LOG_REPLACE_CNAME  = "[REPLACE] Replaced CNAME: %s -> %v"
+//	LOG_UPSTREAM_QUERY = "[UPSTREAM] Query: %s (Type: %d)"
+//)
 
-// 配置结构体
+// Config 配置结构体
 type Config struct {
 	ListenPort       int      `yaml:"listen_port"`
 	Upstream         []string `yaml:"upstream"`
 	CFMrsURL4        string   `yaml:"cf_mrs_url4"`
 	CFMrsURL6        string   `yaml:"cf_mrs_url6"`
 	CFMrsCache       string   `yaml:"cf_mrs_cache"`
-	ReplaceCNAME     string   `yaml:"replace_cname"`
+	REplaceDomain    string   `yaml:"replace_domain"`
 	CFCacheTime      string   `yaml:"cf_cache_time"`
 	ReplaceCacheTime string   `yaml:"replace_cache_time"`
 	WhitelistFile    string   `yaml:"whitelist_file"`
@@ -151,7 +151,9 @@ func loadWhitelist(path string) {
 		log.Printf("[ERROR] Failed to open whitelist: %v", err)
 		return
 	}
-	defer f.Close()
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
 
 	scanner := bufio.NewScanner(f)
 	var patterns []string
@@ -215,7 +217,9 @@ func downloadToFile(url, path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
@@ -224,7 +228,9 @@ func downloadToFile(url, path string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func(out *os.File) {
+		_ = out.Close()
+	}(out)
 
 	_, err = io.Copy(out, resp.Body)
 	return err
@@ -500,7 +506,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 					if ip, err := netip.ParseAddr(v.A.String()); err == nil && cfNetSet4.Contains(ip) {
 						// 替换逻辑
 						if shouldReplace(upstreamResp) {
-							replaceAddrs := resolveReplaceCNAME(config.ReplaceCNAME, config.Upstream)
+							replaceAddrs := resolveReplaceCNAME(config.REplaceDomain, config.Upstream)
 							if len(replaceAddrs) > 0 {
 								resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
 								//log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
@@ -516,7 +522,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 					if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && cfNetSet6.Contains(ip) {
 						// 替换逻辑
 						if shouldReplace(upstreamResp) {
-							replaceAddrs := resolveReplaceCNAME(config.ReplaceCNAME, config.Upstream)
+							replaceAddrs := resolveReplaceCNAME(config.REplaceDomain, config.Upstream)
 							if len(replaceAddrs) > 0 {
 								resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
 								//log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
@@ -606,7 +612,7 @@ func main() {
 	log.Printf("[INFO] Starting DNS server on :%d", config.ListenPort)
 	log.Printf("[INFO] Using upstreams: %v", config.Upstream)
 	log.Printf("[INFO] Whitelist file: %s", config.WhitelistFile)
-	log.Printf("[INFO] Replace CNAME: %s", config.ReplaceCNAME)
+	log.Printf("[INFO] Replace CNAME: %s", config.REplaceDomain)
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("[FATAL] Server failed: %v", err)
