@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +29,8 @@ jobs:
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整的git历史记录
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -53,7 +57,6 @@ jobs:
           else
             tar -czvf $PACKAGE_NAME.tar.gz dnsproxy${{ matrix.ext }} config.yaml
           fi
-        shell: bash
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -81,5 +84,6 @@ jobs:
           tag_name: ${{ needs.build.outputs.version }}
           name: "Release ${{ needs.build.outputs.version }}"
           files: release-artifacts/**/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
