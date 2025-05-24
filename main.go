@@ -1,259 +1,368 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/miekg/dns"
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	ListenPort  int      `yaml:"listen_port"`
-	Upstream    []string `yaml:"upstream"`
-	CFMrsURL4   string   `yaml:"cf_mrs_url4"`
-	CFMrsURL6   string   `yaml:"cf_mrs_url6"`
-	CFMrsCache  string   `yaml:"cf_mrs_cache"`
-	ReplaceCame string   `yaml:"replace_cname"`
-	CFCacheTime string   `yaml:"cf_cache_time"`
+	ListenPort       string   `json:"ListenPort"`
+	Upstreams        []string `json:"Upstreams"`
+	CFMrsURL4        string   `json:"CFMrsURL4"`
+	CFMrsURL6        string   `json:"CFMrsURL6"`
+	ReplaceCNAME     string   `json:"ReplaceCNAME"`
+	CFMrsCacheTime   string   `json:"CFMrsCacheTime"`
+	ReplaceCacheTime string   `json:"ReplaceCacheTime"`
+	WhitelistFile    string   `json:"WhitelistFile"`
+
+	cfmrsCacheDuration   time.Duration
+	replaceCacheDuration time.Duration
 }
 
 var (
-	cfIPNets = struct {
-		nets []*net.IPNet
-		mu   sync.RWMutex
-	}{}
+	cfCIDRs4     []netip.Prefix
+	cfCIDRs6     []netip.Prefix
+	cfLock       sync.RWMutex
+	cfExpire     time.Time
+	replaceCache sync.Map
+
+	whitelist struct {
+		exact    map[string]struct{}
+		wildcard []string
+		lock     sync.RWMutex
+	}
 )
 
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func loadConfig(filename string) (Config, error) {
 	var cfg Config
-	err = yaml.Unmarshal(data, &cfg)
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, err
+		return cfg, err
 	}
-	return &cfg, nil
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+
+	durationCF, err := time.ParseDuration(cfg.CFMrsCacheTime)
+	if err != nil {
+		return cfg, fmt.Errorf("invalid CFMrsCacheTime: %w", err)
+	}
+
+	durationReplace, err := time.ParseDuration(cfg.ReplaceCacheTime)
+	if err != nil {
+		return cfg, fmt.Errorf("invalid ReplaceCacheTime: %w", err)
+	}
+
+	cfg.cfmrsCacheDuration = durationCF
+	cfg.replaceCacheDuration = durationReplace
+	return cfg, nil
 }
 
-// 从文件加载并解析缓存文件到内存
-func loadCFMrsCache(cachePath string) error {
-	log.Printf("尝试从缓存文件加载 Cloudflare IP 列表: %s", cachePath)
-	f, err := os.Open(cachePath)
+func loadWhitelist(filename string) {
+	newExact := make(map[string]struct{})
+	newWildcard := make([]string, 0)
+
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	ipnets, err := parseCIDRListFromReader(f)
-	if err != nil {
-		return err
+		log.Printf("Error reading whitelist: %v", err)
+		return
 	}
 
-	cfIPNets.mu.Lock()
-	cfIPNets.nets = ipnets
-	cfIPNets.mu.Unlock()
-	log.Printf("成功从缓存加载 %d 个 Cloudflare IP 网段", len(ipnets))
-	return nil
-}
-
-// 修改downloadAndUpdateCFMrs函数，支持两个URL合并请求
-func downloadAndUpdateCFMrs(cfg *Config) error {
-	log.Printf("开始下载 Cloudflare IP 列表: %s 和 %s", cfg.CFMrsURL4, cfg.CFMrsURL6)
-
-	var allData []string
-
-	urls := []string{cfg.CFMrsURL4, cfg.CFMrsURL6}
-	for _, url := range urls {
-		resp, err := http.Get(url)
-		if url == "" {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("请求 %s 失败: %v", url, err)
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return fmt.Errorf("读取 %s 响应失败: %v", url, err)
-		}
-
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		allData = append(allData, lines...)
-	}
-
-	// 写入缓存文件
-	err := os.WriteFile(cfg.CFMrsCache, []byte(strings.Join(allData, "\n")), 0644)
-	if err != nil {
-		return fmt.Errorf("写入缓存文件失败: %v", err)
-	}
-	log.Printf("缓存文件写入成功: %s，共 %d 条IP", cfg.CFMrsCache, len(allData))
-
-	// 解析内容更新内存缓存
-	ipnets, err := parseMrsFromBytes([]byte(strings.Join(allData, "\n")))
-	if err != nil {
-		return err
-	}
-
-	cfIPNets.mu.Lock()
-	cfIPNets.nets = ipnets
-	cfIPNets.mu.Unlock()
-	log.Printf("成功更新内存 Cloudflare IP 网段缓存，数量: %d", len(ipnets))
-
-	return nil
-}
-
-// 解析 .mrs 格式内容（字节数组）
-func parseMrsFromBytes(data []byte) ([]*net.IPNet, error) {
-	return parseCIDRListFromReader(strings.NewReader(string(data)))
-}
-
-// 通用解析器，从 io.Reader 读取并解析 .mrs 文件，提取 Cloudflare IP网段
-func parseCIDRListFromReader(r io.Reader) ([]*net.IPNet, error) {
-	scanner := bufio.NewScanner(r)
-	var ipnets []*net.IPNet
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		_, ipnet, err := net.ParseCIDR(line)
-		if err != nil {
-			log.Printf("[WARN] 第 %d 行 CIDR 解析失败，跳过: %s", lineNum, line)
-			continue
+
+		if strings.HasPrefix(line, "*.") {
+			domain := strings.ToLower(line[1:]) + "."
+			newWildcard = append(newWildcard, domain)
+		} else {
+			domain := dns.Fqdn(strings.ToLower(line))
+			newExact[domain] = struct{}{}
 		}
-		ipnets = append(ipnets, ipnet)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return ipnets, nil
+
+	whitelist.lock.Lock()
+	defer whitelist.lock.Unlock()
+	whitelist.exact = newExact
+	whitelist.wildcard = newWildcard
+	log.Printf("Whitelist updated: %d exact, %d wildcard", len(newExact), len(newWildcard))
 }
 
-func isCFIP(ip net.IP) bool {
-	cfIPNets.mu.RLock()
-	defer cfIPNets.mu.RUnlock()
-	for _, ipnet := range cfIPNets.nets {
-		if ipnet.Contains(ip) {
+func isWhitelisted(domain string) bool {
+	domain = dns.Fqdn(strings.ToLower(domain))
+
+	whitelist.lock.RLock()
+	defer whitelist.lock.RUnlock()
+
+	if _, ok := whitelist.exact[domain]; ok {
+		return true
+	}
+
+	for _, suffix := range whitelist.wildcard {
+		if strings.HasSuffix(domain, suffix) {
 			return true
 		}
 	}
 	return false
 }
 
-func handleDNSRequest(cfg *Config, w dns.ResponseWriter, req *dns.Msg) {
-	c := new(dns.Client)
-	c.Net = "udp"
+func watchWhitelist(filename string) {
+	watcher, _ := fsnotify.NewWatcher()
+	defer watcher.Close()
 
-	for _, upstream := range cfg.Upstream {
-		r, _, err := c.Exchange(req, strings.TrimPrefix(upstream, "udp://"))
-		if err != nil || r == nil {
-			continue
-		}
-
-		var hasCFIP bool
-		var domainName string
-
-		// 先检测是否有 Cloudflare IP
-		for _, ans := range r.Answer {
-			switch rr := ans.(type) {
-			case *dns.A:
-				if isCFIP(rr.A) {
-					hasCFIP = true
-					domainName = rr.Header().Name
-					break
-				}
-			case *dns.AAAA:
-				if isCFIP(rr.AAAA) {
-					hasCFIP = true
-					domainName = rr.Header().Name
-					break
-				}
-			}
-			if hasCFIP {
-				break
-			}
-		}
-
-		if hasCFIP {
-			// 清空所有答案，返回单条CNAME
-			cnameRR, err := dns.NewRR(fmt.Sprintf("%s 300 IN CNAME %s.", domainName, cfg.ReplaceCame))
-			if err != nil {
-				log.Printf("生成CNAME失败: %v", err)
-				_ = w.WriteMsg(r)
-				return
-			}
-			r.Answer = []dns.RR{cnameRR}
-			_ = w.WriteMsg(r)
-			return
-		}
-
-		// 没有Cloudflare IP，原样返回所有记录（包括A/AAAA及其它类型）
-		_ = w.WriteMsg(r)
+	if err := watcher.Add(filename); err != nil {
+		log.Printf("File watch error: %v", err)
 		return
 	}
 
-	// 所有上游失败，返回SERVFAIL
-	m := new(dns.Msg)
-	m.SetRcode(req, dns.RcodeServerFailure)
-	_ = w.WriteMsg(m)
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op.Has(fsnotify.Write) {
+				loadWhitelist(filename)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Watcher error: %v", err)
+		}
+	}
+}
+
+func refreshCFList(cfg Config) {
+	for {
+		func() {
+			cfLock.Lock()
+			defer cfLock.Unlock()
+
+			cfCIDRs4 = downloadPrefixes(cfg.CFMrsURL4)
+			cfCIDRs6 = downloadPrefixes(cfg.CFMrsURL6)
+			cfExpire = time.Now().Add(cfg.cfmrsCacheDuration)
+		}()
+		time.Sleep(cfg.cfmrsCacheDuration)
+	}
+}
+
+func downloadPrefixes(url string) []netip.Prefix {
+	data, err := download(url)
+	if err != nil {
+		log.Printf("Download error: %v", err)
+		return nil
+	}
+
+	var prefixes []netip.Prefix
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if prefix, err := netip.ParsePrefix(line); err == nil {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes
+}
+
+func download(url string) ([]byte, error) {
+	if strings.HasPrefix(url, "http") {
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+			},
+			Timeout: 10 * time.Second,
+		}
+		resp, err := client.Get(url)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	}
+	return os.ReadFile(url)
+}
+
+func handleDNS(w dns.ResponseWriter, r *dns.Msg, cfg Config) {
+	msg := new(dns.Msg)
+	msg.SetReply(r)
+	msg.Authoritative = true
+
+	for _, q := range r.Question {
+		if isWhitelisted(q.Name) {
+			resp := fetchDoH(r, cfg.Upstreams[0])
+			if resp != nil {
+				msg.Answer = append(msg.Answer, resp.Answer...)
+			}
+			continue
+		}
+
+		resp := fetchDoH(r, cfg.Upstreams[0])
+		if resp == nil {
+			continue
+		}
+
+		for i, ans := range resp.Answer {
+			switch rr := ans.(type) {
+			case *dns.A:
+				if isCloudflareIP(rr.A) {
+					if newIP := resolveReplaceIP(cfg.ReplaceCNAME, dns.TypeA, cfg); newIP != nil {
+						rr.A = newIP
+						resp.Answer[i] = rr
+					}
+				}
+			case *dns.AAAA:
+				if isCloudflareIP(rr.AAAA) {
+					if newIP := resolveReplaceIP(cfg.ReplaceCNAME, dns.TypeAAAA, cfg); newIP != nil {
+						rr.AAAA = newIP
+						resp.Answer[i] = rr
+					}
+				}
+			}
+		}
+		msg.Answer = append(msg.Answer, resp.Answer...)
+	}
+
+	if err := w.WriteMsg(msg); err != nil {
+		log.Printf("Write error: %v", err)
+	}
+}
+
+func fetchDoH(m *dns.Msg, dohURL string) *dns.Msg {
+	packed, _ := m.Pack()
+	req, _ := http.NewRequest("POST", dohURL, bytes.NewReader(packed))
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		},
+		Timeout: 5 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	response := new(dns.Msg)
+	if err := response.Unpack(data); err != nil {
+		return nil
+	}
+	return response
+}
+
+func resolveReplaceIP(domain string, qtype uint16, cfg Config) net.IP {
+	key := fmt.Sprintf("%s-%d", domain, qtype)
+	if cached, ok := replaceCache.Load(key); ok {
+		if entry := cached.(replaceCacheEntry); time.Now().Before(entry.expire) {
+			return entry.ip
+		}
+	}
+
+	m := new(dns.Msg).SetQuestion(dns.Fqdn(domain), qtype)
+	resp := fetchDoH(m, cfg.Upstreams[0])
+	if resp == nil || len(resp.Answer) == 0 {
+		return nil
+	}
+
+	for _, ans := range resp.Answer {
+		switch rr := ans.(type) {
+		case *dns.A:
+			entry := replaceCacheEntry{
+				ip:     rr.A,
+				expire: time.Now().Add(cfg.replaceCacheDuration),
+			}
+			replaceCache.Store(key, entry)
+			return rr.A
+		case *dns.AAAA:
+			entry := replaceCacheEntry{
+				ip:     rr.AAAA,
+				expire: time.Now().Add(cfg.replaceCacheDuration),
+			}
+			replaceCache.Store(key, entry)
+			return rr.AAAA
+		}
+	}
+	return nil
+}
+
+func isCloudflareIP(ip net.IP) bool {
+	cfLock.RLock()
+	defer cfLock.RUnlock()
+
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+
+	check := func(prefixes []netip.Prefix) bool {
+		for _, p := range prefixes {
+			if p.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return check(cfCIDRs4) || check(cfCIDRs6)
+}
+
+type replaceCacheEntry struct {
+	ip     net.IP
+	expire time.Time
 }
 
 func main() {
-	cfg, err := loadConfig("config.yaml")
+	configPath := flag.String("config", "config.json", "Path to config file")
+	flag.Parse()
+
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		log.Fatalf("Config error: %v", err)
 	}
 
-	// 启动时先尝试加载缓存文件
-	err = loadCFMrsCache(cfg.CFMrsCache)
-	if err != nil {
-		log.Printf("加载缓存失败: %v，尝试下载最新列表", err)
-		if err = downloadAndUpdateCFMrs(cfg); err != nil {
-			log.Fatalf("首次下载Cloudflare列表失败: %v", err)
-		}
-	}
+	loadWhitelist(cfg.WhitelistFile)
+	go watchWhitelist(cfg.WhitelistFile)
+	go refreshCFList(cfg)
 
-	// 后台定时刷新Cloudflare IP列表
+	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		handleDNS(w, r, cfg)
+	})
 
+	server := &dns.Server{Addr: cfg.ListenPort, Net: "udp"}
 	go func() {
-		for {
-			// 解析配置中的时间
-			cacheDuration, err := time.ParseDuration(cfg.CFCacheTime)
-			if err != nil {
-				log.Printf("配置中的 CFCacheTime 无效（%s），使用默认值 10h", cfg.CFCacheTime)
-				cacheDuration, _ = time.ParseDuration("1h") // fallback 默认值
-			}
-			time.Sleep(cacheDuration)
-			if err := downloadAndUpdateCFMrs(cfg); err != nil {
-				log.Printf("定时刷新 Cloudflare IP 列表失败: %v", err)
-			}
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Server failed: %v", err)
 		}
 	}()
 
-	// DNS 服务器启动
-	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		handleDNSRequest(cfg, w, r)
-	})
-	server := &dns.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.ListenPort),
-		Net:     "udp",
-		UDPSize: 65535,
-	}
-	log.Printf("DNS代理服务启动，监听端口 :%d", cfg.ListenPort)
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("服务器启动失败: %v", err)
-	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.ShutdownContext(ctx)
+	log.Println("Server stopped")
 }

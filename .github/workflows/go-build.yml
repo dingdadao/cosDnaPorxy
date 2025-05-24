@@ -28,10 +28,10 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Set up Go 1.22.4
+      - name: Set up Go 1.23.9
         uses: actions/setup-go@v4
         with:
-          go-version: '1.22.4'
+          go-version: '1.23.9'
 
       - name: Generate version
         id: version
@@ -71,11 +71,9 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}-${{ github.run_id }}
-          path: |
-            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.tar.gz
-            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.zip
-          if-no-files-found: ignore
+          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}
+          path: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.${{ matrix.archive }}
+          if-no-files-found: error
 
   release:
     needs: build
@@ -84,10 +82,7 @@ jobs:
       contents: write
       actions: read
     steps:
-      - name: Clean download-artifact cache
-        run: rm -rf ~/.local/share/actions/download-artifact
-
-      - name: Download artifacts and upload to Release
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -107,15 +102,6 @@ jobs:
         with:
           tag_name: ${{ env.VERSION }}
           name: Release ${{ env.VERSION }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload assets
-        uses: softprops/action-gh-release@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/
+          files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
