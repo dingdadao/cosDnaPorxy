@@ -41,10 +41,11 @@ jobs:
           VERSION="v${DATE}-${SHORT_HASH}"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          mkdir -p build
+          echo "$VERSION" > build/version.txt
 
       - name: Build binary
         run: |
-          mkdir -p build
           GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -o build/dnsproxy${{ matrix.ext }} main.go
           cp config.yaml build/
 
@@ -59,20 +60,13 @@ jobs:
           fi
         shell: bash
 
-      - name: Save version info
-        run: echo "${{ env.VERSION }}" > build/version.txt
-
-      - name: Upload version artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: version
-          path: build/version.txt
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}
-          path: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.${{ matrix.archive }}
+          name: dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}
+          path: |
+            dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}.${{ matrix.archive }}
+            build/version.txt
           if-no-files-found: error
 
   release:
@@ -82,22 +76,19 @@ jobs:
       contents: write
       actions: read
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Download version artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: version
-          path: artifacts
-
-      - name: Set VERSION env
-        run: echo "VERSION=$(cat artifacts/version.txt)" >> $GITHUB_ENV
+      - name: Find version file
+        id: find_version
+        run: |
+          VERSION_FILE=$(find artifacts -name version.txt -type f | head -1)
+          echo "VERSION=$(cat $VERSION_FILE)" >> $GITHUB_ENV
+          echo "version_file=$VERSION_FILE" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.VERSION }}
