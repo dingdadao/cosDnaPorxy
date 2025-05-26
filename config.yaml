@@ -8,3 +8,4 @@ replace_domain: "qh.niao.fun" # 找一个好用的cf域名被替换
 cf_cache_time: 23h59m # 控制cf_mrs_cache文件在内存缓存的时间
 replace_cache_time: "30m"
 whitelist_file: "./whitelist.txt"
+designated_domain: "./designated.txt" #指定域名走dns解析

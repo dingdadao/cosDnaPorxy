@@ -41,20 +41,28 @@ type Config struct {
 	CFCacheTime      string   `yaml:"cf_cache_time"`
 	ReplaceCacheTime string   `yaml:"replace_cache_time"`
 	WhitelistFile    string   `yaml:"whitelist_file"`
+	DesignatedDomain string   `yaml:"designated_domain"`
 	LogLevel         string   `yaml:"log_level"`
 	MetricsPort      int      `yaml:"metrics_port"`
 }
 
+type DesignatedDomain struct {
+	Domain string
+	DNS    string
+}
+
 // 全局变量
 var (
-	cfLoadMutex   sync.Mutex
-	cfNetSet4     = &netipx{}
-	cfNetSet6     = &netipx{}
-	cfLastLoaded  time.Time
-	cfExpire      time.Duration
-	replaceCache  = sync.Map{}
-	replaceExpire time.Duration
-	config        Config
+	cfLoadMutex       sync.Mutex
+	cfNetSet4         = &netipx{}
+	cfNetSet6         = &netipx{}
+	cfLastLoaded      time.Time
+	cfExpire          time.Duration
+	replaceCache      = sync.Map{}
+	replaceExpire     time.Duration
+	config            Config
+	designatedMutex   sync.RWMutex
+	designatedDomains []DesignatedDomain
 
 	// Prometheus指标
 	queriesTotal = prometheus.NewCounterVec(
@@ -70,6 +78,12 @@ var (
 			Help: "Total whitelist hits",
 		},
 	)
+	designatedHits = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "designated_hits_total",
+			Help: "Total designated hits",
+		},
+	)
 	replacedCount = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "replaced_records_total",
@@ -81,6 +95,7 @@ var (
 func init() {
 	prometheus.MustRegister(queriesTotal)
 	prometheus.MustRegister(whitelistHits)
+	prometheus.MustRegister(designatedHits)
 	prometheus.MustRegister(replacedCount)
 }
 
@@ -168,6 +183,91 @@ func loadWhitelist(path string) {
 	whitelistPatterns = patterns
 	whitelistMutex.Unlock()
 	log.Printf("[INFO] Whitelist loaded: %d entries", len(patterns))
+}
+
+func loadDesignatedDomains(path string) {
+	if path == "" {
+		log.Printf("[WARN] 未配置定向域名规则文件路径")
+		return
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Printf("[WARN] 定向域名规则文件不存在，已自动创建: %s", path)
+		defaultContent := []byte("# 格式: 域名 DNS服务器\n*.example.com 8.8.8.8\n")
+		if err := os.WriteFile(path, defaultContent, 0644); err != nil {
+			log.Printf("[ERROR] 创建 designated 文件失败: %v", err)
+			return
+		}
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("[ERROR] 打开 designated 文件失败: %v", err)
+		return
+	}
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+
+	var rules []DesignatedDomain
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			log.Printf("[WARN] 格式不合法，跳过行: %s", line)
+			continue
+		}
+		rules = append(rules, DesignatedDomain{
+			Domain: parts[0],
+			DNS:    parts[1],
+		})
+	}
+
+	designatedMutex.Lock()
+	designatedDomains = rules
+	designatedMutex.Unlock()
+
+	log.Printf("[INFO] Designated domains loaded: %d entries", len(rules))
+}
+
+// 指定域名走dns
+func matchDesignatedDomain(qname string) (DesignatedDomain, bool) {
+	// 去除末尾点，小写
+	domain := strings.ToLower(strings.TrimSuffix(qname, "."))
+
+	designatedMutex.RLock()
+	defer designatedMutex.RUnlock()
+
+	for _, rule := range designatedDomains {
+		pattern := strings.ToLower(rule.Domain)
+
+		// 精确匹配
+		if pattern == domain {
+			return rule, true
+		}
+
+		// 前缀通配符 *.example.com
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := pattern[1:] // ".example.com"
+			if strings.HasSuffix(domain, suffix) || domain == pattern[2:] {
+				return rule, true
+			}
+		}
+
+		// 全通配符 *abc*.xyz
+		if strings.Contains(pattern, "*") {
+			regexPattern := "^" + strings.ReplaceAll(pattern, ".", `\.`)
+			regexPattern = strings.ReplaceAll(regexPattern, "*", ".*") + "$"
+			if matched, _ := regexp.MatchString(regexPattern, domain); matched {
+				return rule, true
+			}
+		}
+	}
+	return DesignatedDomain{}, false
 }
 
 func isWhitelisted(qname string) bool {
@@ -480,6 +580,20 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		//log.Printf(LOG_UPSTREAM_QUERY, domain, qtype)
 		queriesTotal.WithLabelValues(dns.TypeToString[qtype], "received").Inc()
 
+		// 检查是否命中定向域名
+		if rule, matched := matchDesignatedDomain(domain); matched {
+			designatedHits.Inc()
+			resp, err := resolveViaDesignatedDNS(r, rule.DNS) // 传入整个req消息
+			if err != nil {
+				log.Printf("[ERROR] 定向查询失败 %s via %s: %v", domain, rule.DNS, err)
+				// 这里可以fallback，或者返回SERVFAIL
+			} else {
+				_ = w.WriteMsg(resp)
+				log.Printf("[DESIGNATED] %s -> %s", domain, rule.DNS)
+				return
+			}
+		}
+
 		// 白名单检查
 		if isWhitelisted(domain) {
 			log.Printf("[DEBUG] 域名 %s 匹配白名单模式: %v", domain, whitelistPatterns)
@@ -555,6 +669,20 @@ func proxyQuery(w dns.ResponseWriter, r *dns.Msg, upstream []string) {
 	_ = w.WriteMsg(new(dns.Msg).SetRcode(r, dns.RcodeServerFailure))
 }
 
+// 分流部分域名走特别的解析
+func resolveViaDesignatedDNS(req *dns.Msg, dnsServer string) (*dns.Msg, error) {
+	c := &dns.Client{
+		Net:     "udp",
+		Timeout: 2 * time.Second,
+	}
+
+	resp, _, err := c.Exchange(req, dnsServer)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 func main() {
 	configPath := flag.String("c", "config.yaml", "Path to config file")
 	flag.Parse()
@@ -585,6 +713,7 @@ func main() {
 	go func() {
 		for {
 			loadWhitelist(config.WhitelistFile)
+			loadDesignatedDomains(config.DesignatedDomain)
 			time.Sleep(1 * time.Minute)
 		}
 	}()
@@ -612,6 +741,7 @@ func main() {
 	log.Printf("[INFO] Starting DNS server on :%d", config.ListenPort)
 	log.Printf("[INFO] Using upstreams: %v", config.Upstream)
 	log.Printf("[INFO] Whitelist file: %s", config.WhitelistFile)
+	log.Printf("[INFO] DesignatedDomain file: %s", config.DesignatedDomain)
 	log.Printf("[INFO] Replace CNAME: %s", config.REplaceDomain)
 
 	if err := server.ListenAndServe(); err != nil {

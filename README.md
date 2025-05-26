@@ -38,3 +38,4 @@ replace_cname: "proxy.example.com"                # 匹配命中时替换的域�
 cf_cache_time: "12h"                              # 刷新间隔（支持 1h、12h、24h 等）
 replace_cache_time: "30m"                         # 域名替换的域名解析后的IP缓存时间，就不会重复询问上游了
 whitelist_file: "./whitelist.txt"                 # 白名单域名一行一条支持通配符*.domain.*
+designated_domain: "./designated.txt"
