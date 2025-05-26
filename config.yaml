@@ -1,6 +1,6 @@
 listen_port: 5354
 upstream:
-  - "223.5.5.5:53"
+  - "10.0.0.1:1053"
 cf_mrs_url4: "https://www.cloudflare-cn.com/ips-v4"
 cf_mrs_url6: "https://www.cloudflare-cn.com/ips-v6"
 cf_mrs_cache: "./cloudflare.txt"

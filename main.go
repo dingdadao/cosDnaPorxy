@@ -23,12 +23,12 @@ import (
 )
 
 // 常量定义
-//const (
-//	LOG_HIT_WHITELIST  = "[WHITELIST] Hit: %s"
-//	LOG_HIT_CFNET      = "[CFNET] Cloudflare network matched: %s -> %s"
-//	LOG_REPLACE_CNAME  = "[REPLACE] Replaced CNAME: %s -> %v"
-//	LOG_UPSTREAM_QUERY = "[UPSTREAM] Query: %s (Type: %d)"
-//)
+const (
+	LOG_HIT_WHITELIST  = "[WHITELIST] Hit: %s"
+	LOG_HIT_CFNET      = "[CFNET] Cloudflare network matched: %s -> %s"
+	LOG_REPLACE_CNAME  = "[REPLACE] Replaced CNAME: %s -> %v"
+	LOG_UPSTREAM_QUERY = "[UPSTREAM] Query: %s (Type: %d)"
+)
 
 // Config 配置结构体
 type Config struct {
@@ -37,7 +37,7 @@ type Config struct {
 	CFMrsURL4        string   `yaml:"cf_mrs_url4"`
 	CFMrsURL6        string   `yaml:"cf_mrs_url6"`
 	CFMrsCache       string   `yaml:"cf_mrs_cache"`
-	REplaceDomain    string   `yaml:"replace_domain"`
+	ReplaceDomain    string   `yaml:"replace_domain"`
 	CFCacheTime      string   `yaml:"cf_cache_time"`
 	ReplaceCacheTime string   `yaml:"replace_cache_time"`
 	WhitelistFile    string   `yaml:"whitelist_file"`
@@ -440,11 +440,13 @@ func resolveReplaceCNAME(cname string, upstream []string) []netip.Addr {
 				m.SetQuestion(dns.Fqdn(cname), qtype)
 				c := new(dns.Client)
 				resp, _, err := c.ExchangeContext(ctx, m, server)
-				if err != nil {
+				if resp == nil || len(resp.Answer) == 0 {
 					log.Printf("[WARN] Query failed for %s (type %d): %v", cname, qtype, err)
 					return
 				}
-				if resp == nil {
+
+				if err != nil {
+					log.Printf("[WARN] Query failed for %s (type %d): %v", cname, qtype, err)
 					return
 				}
 
@@ -456,6 +458,7 @@ func resolveReplaceCNAME(cname string, upstream []string) []netip.Addr {
 						if ip, err := netip.ParseAddr(rr.A.String()); err == nil {
 							addrs = append(addrs, ip)
 						}
+
 					case *dns.AAAA:
 						if ip, err := netip.ParseAddr(rr.AAAA.String()); err == nil {
 							addrs = append(addrs, ip)
@@ -470,7 +473,7 @@ func resolveReplaceCNAME(cname string, upstream []string) []netip.Addr {
 	addrs = uniqueAddrs(addrs)
 	if len(addrs) > 0 {
 		replaceCache.Store(cname, cacheItem{addr: addrs, time: time.Now()})
-		log.Printf("[CACHE] Stored: %s -> %v (TTL: %v)", cname, addrs, replaceExpire)
+		//log.Printf("[CACHE] Stored: %s -> %v (TTL: %v)", cname, addrs, replaceExpire)
 	} else {
 		log.Printf("[WARN] No addresses found for %s", cname)
 	}
@@ -495,10 +498,12 @@ func isCloudflareResponse(msg *dns.Msg) bool {
 		switch v := rr.(type) {
 		case *dns.A:
 			if ip, err := netip.ParseAddr(v.A.String()); err == nil && cfNetSet4.Contains(ip) {
+				log.Printf("[INFO] IP %s is in Cloudflare IPv4 range", ip)
 				return true
 			}
 		case *dns.AAAA:
 			if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && cfNetSet6.Contains(ip) {
+				log.Printf("[INFO] IP %s is in Cloudflare IPv6 range", ip)
 				return true
 			}
 		}
@@ -552,19 +557,29 @@ func getUpstreamResponse(req *dns.Msg, upstream []string) *dns.Msg {
 			Net:     "udp", // 显式指定协议
 		}
 		resp, _, err := c.Exchange(req, server)
-		if err == nil && resp != nil && len(resp.Answer) > 0 {
+		if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
 			return resp
 		}
 	}
 	return nil
 }
 
-func shouldReplace(resp *dns.Msg) bool {
-	// 可根据实际需求添加更复杂的判断逻辑
-	return len(resp.Answer) > 0
+func sanitizeDomainName(name string) string {
+	if idx := strings.Index(name, `\`); idx != -1 {
+		log.Printf("[WARN] Trimming malformed domain %q", name)
+		return name[:idx]
+	}
+	return name
 }
 
 func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("[PANIC] Recovered from panic: %v", err)
+			_ = w.WriteMsg(new(dns.Msg).SetRcode(r, dns.RcodeServerFailure))
+		}
+	}()
+
 	start := time.Now()
 	defer func() {
 		log.Printf("[STAT] Request processed in %v", time.Since(start))
@@ -575,29 +590,30 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		if qtype != dns.TypeA && qtype != dns.TypeAAAA {
 			continue
 		}
+		// 做兼容处理
+		domain := sanitizeDomainName(q.Name)
 
-		domain := q.Name
-		//log.Printf(LOG_UPSTREAM_QUERY, domain, qtype)
+		log.Printf(LOG_UPSTREAM_QUERY, domain, qtype)
 		queriesTotal.WithLabelValues(dns.TypeToString[qtype], "received").Inc()
 
 		// 检查是否命中定向域名
 		if rule, matched := matchDesignatedDomain(domain); matched {
 			designatedHits.Inc()
 			resp, err := resolveViaDesignatedDNS(r, rule.DNS) // 传入整个req消息
-			if err != nil {
+			if err != nil || resp == nil {
 				log.Printf("[ERROR] 定向查询失败 %s via %s: %v", domain, rule.DNS, err)
-				// 这里可以fallback，或者返回SERVFAIL
-			} else {
-				_ = w.WriteMsg(resp)
-				log.Printf("[DESIGNATED] %s -> %s", domain, rule.DNS)
+				// 回退到普通查询
+				proxyQuery(w, r, config.Upstream)
 				return
 			}
+			_ = w.WriteMsg(resp)
+			return
 		}
 
 		// 白名单检查
 		if isWhitelisted(domain) {
 			log.Printf("[DEBUG] 域名 %s 匹配白名单模式: %v", domain, whitelistPatterns)
-			//log.Printf(LOG_HIT_WHITELIST, domain)
+			log.Printf(LOG_HIT_WHITELIST, domain)
 			whitelistHits.Inc()
 			proxyQuery(w, r, config.Upstream)
 			return // 确保这里执行了return
@@ -606,7 +622,6 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		// 上游查询
 		upstreamResp := getUpstreamResponse(r, config.Upstream)
 		if upstreamResp == nil {
-			log.Printf("[ERROR] Upstream query failed for %s", domain)
 			queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 			_ = w.WriteMsg(new(dns.Msg).SetRcode(r, dns.RcodeServerFailure))
 			return
@@ -619,33 +634,30 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 				case *dns.A:
 					if ip, err := netip.ParseAddr(v.A.String()); err == nil && cfNetSet4.Contains(ip) {
 						// 替换逻辑
-						if shouldReplace(upstreamResp) {
-							replaceAddrs := resolveReplaceCNAME(config.REplaceDomain, config.Upstream)
-							if len(replaceAddrs) > 0 {
-								resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
-								//log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
-								replacedCount.Inc()
-								_ = w.WriteMsg(resp)
-								queriesTotal.WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
-								//log.Printf(LOG_HIT_CFNET, domain, ip)
-								return
-							}
+						log.Printf("请求的域名和服务器 %s %s", config.ReplaceDomain, config.Upstream)
+						replaceAddrs := resolveReplaceCNAME(config.ReplaceDomain, config.Upstream)
+						if len(replaceAddrs) > 0 {
+							resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
+							log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
+							replacedCount.Inc()
+							_ = w.WriteMsg(resp)
+							queriesTotal.WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
+							log.Printf(LOG_HIT_CFNET, domain, ip)
+							return
 						}
 					}
 				case *dns.AAAA:
 					if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && cfNetSet6.Contains(ip) {
 						// 替换逻辑
-						if shouldReplace(upstreamResp) {
-							replaceAddrs := resolveReplaceCNAME(config.REplaceDomain, config.Upstream)
-							if len(replaceAddrs) > 0 {
-								resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
-								//log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
-								replacedCount.Inc()
-								_ = w.WriteMsg(resp)
-								queriesTotal.WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
-								//log.Printf(LOG_HIT_CFNET, domain, ip)
-								return
-							}
+						replaceAddrs := resolveReplaceCNAME(config.ReplaceDomain, config.Upstream)
+						if len(replaceAddrs) > 0 {
+							resp := buildReplacedResponse(r, upstreamResp, replaceAddrs, qtype)
+							log.Printf(LOG_REPLACE_CNAME, domain, replaceAddrs)
+							replacedCount.Inc()
+							_ = w.WriteMsg(resp)
+							queriesTotal.WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
+							log.Printf(LOG_HIT_CFNET, domain, ip)
+							return
 						}
 					}
 				}
@@ -742,7 +754,10 @@ func main() {
 	log.Printf("[INFO] Using upstreams: %v", config.Upstream)
 	log.Printf("[INFO] Whitelist file: %s", config.WhitelistFile)
 	log.Printf("[INFO] DesignatedDomain file: %s", config.DesignatedDomain)
-	log.Printf("[INFO] Replace CNAME: %s", config.REplaceDomain)
+	log.Printf("[INFO] Replace CNAME: %s", config.ReplaceDomain)
+	if config.ReplaceDomain == "" {
+		log.Fatal("[FATAL] 配置项 replace_cname (REplaceDomain) 未设置，程序无法正常运行")
+	}
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("[FATAL] Server failed: %v", err)
