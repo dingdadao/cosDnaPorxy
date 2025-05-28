@@ -34,7 +34,7 @@ upstream:                      # 上游 DNS 服务列表（支持多个）
 cf_mrs_url4: "https://example.com/cf_ipv4.mrs"    # Cloudflare IPv4 列表
 cf_mrs_url6: "https://example.com/cf_ipv6.mrs"    # Cloudflare IPv6 列表
 cf_mrs_cache: "./cf.mrs"                          # 缓存文件路径
-replace_cname: "proxy.example.com"                # 匹配命中时替换的域名解析后的IP
+replace_domain: "proxy.example.com"                # 匹配命中时替换的域名解析后的IP
 cf_cache_time: "12h"                              # 刷新间隔（支持 1h、12h、24h 等）
 replace_cache_time: "30m"                         # 域名替换的域名解析后的IP缓存时间，就不会重复询问上游了
 whitelist_file: "./whitelist.txt"                 # 白名单域名一行一条支持通配符*.domain.*
