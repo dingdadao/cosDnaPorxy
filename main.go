@@ -648,7 +648,13 @@ func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 	// 域名前处理：空值、无效跳过
 	cname = strings.TrimSpace(cname)
 	if cname == "" {
-		h.logger.Warn("resolveReplaceCNAME received empty cname")
+		h.logger.Info("优选域名不能为空，需要检查")
+		return nil
+	}
+	_, ok := dns.IsDomainName(cname)
+	if !ok {
+		// 处理非法域名
+		h.logger.Info("不是一个合法域名: %s", cname)
 		return nil
 	}
 	cname = dns.Fqdn(cname) // 确保结尾带 "."
@@ -936,6 +942,11 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	for _, q := range req.Question {
 		qtype := q.Qtype
 		if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+			continue
+		}
+		_, ok := dns.IsDomainName(q.Name)
+		if !ok {
+			h.logger.Info("请求查询的是非法域名: %s", q.Name)
 			continue
 		}
 		rule, matched := h.matchDesignatedDomain(q.Name)
