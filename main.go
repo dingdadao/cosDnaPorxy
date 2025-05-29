@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -644,6 +645,14 @@ func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 		return val.([]netip.Addr)
 	}
 
+	// 域名前处理：空值、无效跳过
+	cname = strings.TrimSpace(cname)
+	if cname == "" {
+		h.logger.Warn("resolveReplaceCNAME received empty cname")
+		return nil
+	}
+	cname = dns.Fqdn(cname) // 确保结尾带 "."
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -657,8 +666,16 @@ func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 			wg.Add(1)
 			go func(server string, qtype uint16) {
 				defer wg.Done()
+
+				// 加 recover 防止 panic 让服务挂掉
+				defer func() {
+					if r := recover(); r != nil {
+						h.logger.Warn("panic recovered in resolveReplaceCNAME: %v\n%s", r, debug.Stack())
+					}
+				}()
+
 				m := new(dns.Msg)
-				m.SetQuestion(dns.Fqdn(cname), qtype)
+				m.SetQuestion(cname, qtype) // 仍可能panic，加了recover保护
 				c := new(dns.Client)
 				resp, _, err := c.ExchangeContext(ctx, m, server)
 				if err != nil || resp == nil || len(resp.Answer) == 0 {
