@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"github.com/miekg/dns"
@@ -45,6 +47,10 @@ type Config struct {
 	DesignatedDomain string   `yaml:"designated_domain"`
 	LogLevel         string   `yaml:"log_level"`
 	MetricsPort      int      `yaml:"metrics_port"`
+	DoTPort          int      `yaml:"dot_port"`
+	DoHPort          int      `yaml:"doh_port"`
+	TLSCertFile      string   `yaml:"tls_cert_file"`
+	TLSKeyFile       string   `yaml:"tls_key_file"`
 }
 
 // DesignatedDomain 定向域名配置
@@ -53,6 +59,32 @@ type DesignatedDomain struct {
 	DNS    string `yaml:"dns"`
 	Regex  *regexp.Regexp
 }
+
+type dnsResponseWriter struct {
+	w http.ResponseWriter
+}
+
+func (d *dnsResponseWriter) LocalAddr() net.Addr  { return dummyAddr{} }
+func (d *dnsResponseWriter) RemoteAddr() net.Addr { return dummyAddr{} }
+func (d *dnsResponseWriter) WriteMsg(m *dns.Msg) error {
+	data, err := m.Pack()
+	if err != nil {
+		return err
+	}
+	d.w.Header().Set("Content-Type", "application/dns-message")
+	_, err = d.w.Write(data)
+	return err
+}
+func (d *dnsResponseWriter) Write([]byte) (int, error) { return 0, nil }
+func (d *dnsResponseWriter) Close() error              { return nil }
+func (d *dnsResponseWriter) TsigStatus() error         { return nil }
+func (d *dnsResponseWriter) TsigTimersOnly(bool)       {}
+func (d *dnsResponseWriter) Hijack()                   {}
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "127.0.0.1:0" }
 
 // DNSError 自定义错误类型
 type DNSError struct {
@@ -891,6 +923,37 @@ func (h *DNSHandler) handleNormalQuery(w dns.ResponseWriter, req *dns.Msg, q dns
 	h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
 }
 
+// 主入口
+func handleDoHRequest(w http.ResponseWriter, r *http.Request, handler dns.Handler) {
+	var dnsQuery []byte
+	var err error
+
+	switch r.Method {
+	case http.MethodGet:
+		dnsParam := r.URL.Query().Get("dns")
+		dnsQuery, err = base64.RawURLEncoding.DecodeString(dnsParam)
+	case http.MethodPost:
+		dnsQuery, err = io.ReadAll(r.Body)
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, "Invalid DNS query", http.StatusBadRequest)
+		return
+	}
+
+	req := &dns.Msg{}
+	if err := req.Unpack(dnsQuery); err != nil {
+		http.Error(w, "Failed to parse DNS query", http.StatusBadRequest)
+		return
+	}
+
+	rw := &dnsResponseWriter{w: w}
+	handler.ServeDNS(rw, req)
+}
+
 // handleCFReplacement 处理Cloudflare替换
 func (h *DNSHandler) handleCFReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg, qtype uint16, domain string, ip netip.Addr) {
 	replaceAddrs := h.resolveReplaceCNAME(h.config.ReplaceDomain)
@@ -974,12 +1037,83 @@ func startMetricsServer(port int) {
 	}
 }
 
-// main 主函数
-func main() {
+// udp 启动
+func startUDPServer(config *Config, handler dns.Handler) {
+	server := &dns.Server{
+		Addr:    fmt.Sprintf(":%d", config.ListenPort),
+		Net:     "udp",
+		Handler: handler,
+		UDPSize: 65535,
+	}
+	log.Printf("Starting UDP DNS server on :%d", config.ListenPort)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("UDP DNS server failed: %v", err)
+	}
+}
+
+// dot 启动
+func startDoTServer(config *Config, handler dns.Handler) {
+	if config.TLSCertFile == "" || config.TLSKeyFile == "" || config.DoTPort == 0 {
+		log.Println("DoT not configured. Skipping.")
+		return
+	}
+
+	cert, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile)
+	if err != nil {
+		log.Fatalf("Failed to load TLS certificate: %v", err)
+	}
+
+	server := &dns.Server{
+		Addr:      fmt.Sprintf(":%d", config.DoTPort),
+		Net:       "tcp-tls",
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		Handler:   handler,
+	}
+
+	log.Printf("Starting DoT server on :%d", config.DoTPort)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("DoT server failed: %v", err)
+	}
+}
+
+// doh 启动
+func startDoHServer(config *Config, handler dns.Handler) {
+	if config.TLSCertFile == "" || config.TLSKeyFile == "" || config.DoHPort == 0 {
+		log.Println("DoH not configured. Skipping.")
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+		handleDoHRequest(w, r, handler)
+	})
+
+	server := &http.Server{
+		Addr:      fmt.Sprintf(":%d", config.DoHPort),
+		Handler:   mux,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{loadTLSCert(config)}},
+	}
+
+	log.Printf("Starting DoH server on :%d", config.DoHPort)
+	if err := server.ListenAndServeTLS(config.TLSCertFile, config.TLSKeyFile); err != nil {
+		log.Fatalf("DoH server failed: %v", err)
+	}
+}
+
+// 加载证书
+func loadTLSCert(cfg *Config) tls.Certificate {
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		log.Fatalf("Failed to load TLS cert/key: %v", err)
+	}
+	return cert
+}
+
+// 加载配置
+func loadAndValidateConfig() *Config {
 	configPath := flag.String("c", defaultConfigPath, "Path to config file")
 	flag.Parse()
 
-	// 加载和验证配置
 	config, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -989,29 +1123,18 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
-	// 初始化DNS处理器
+	return config
+}
+
+// main 主函数
+func main() {
+	config := loadAndValidateConfig()
 	handler := NewDNSHandler(config)
 
-	// 启动指标服务器
-	if config.MetricsPort > 0 {
-		go startMetricsServer(config.MetricsPort)
-	}
+	go startMetricsServer(config.MetricsPort)
+	go startUDPServer(config, handler)
+	go startDoTServer(config, handler)
+	go startDoHServer(config, handler)
 
-	// 启动DNS服务器
-	server := &dns.Server{
-		Addr:    fmt.Sprintf(":%d", config.ListenPort),
-		Net:     "udp",
-		Handler: handler,
-		UDPSize: 65535,
-	}
-
-	log.Printf("Starting DNS server on :%d", config.ListenPort)
-	log.Printf("Using upstreams: %v", config.Upstream)
-	log.Printf("Whitelist file: %s", config.WhitelistFile)
-	log.Printf("DesignatedDomain file: %s", config.DesignatedDomain)
-	log.Printf("Replace CNAME: %s", config.ReplaceDomain)
-
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Server failed: %v", err)
-	}
+	select {} // 保持主线程活着
 }
