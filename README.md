@@ -8,7 +8,7 @@
 - 🔁 **使用优选域名解析的IP去处理替换其他托管在cf的域名对应IP**
 - 📦 **自带缓存机制，节省带宽**
 - 🔄 **定时刷新 Cloudflare 节点列表**
-- ⚡ **超轻量部署，适用于边缘设备**
+- ⚡  **超轻量部署，适用于边缘设备**
 - 📜 **兼容 / CIDR 格式 IP 列表**
 
 ---
@@ -34,8 +34,13 @@ upstream:                      # 上游 DNS 服务列表（支持多个）
 cf_mrs_url4: "https://example.com/cf_ipv4.mrs"    # Cloudflare IPv4 列表
 cf_mrs_url6: "https://example.com/cf_ipv6.mrs"    # Cloudflare IPv6 列表
 cf_mrs_cache: "./cf.mrs"                          # 缓存文件路径
-replace_domain: "proxy.example.com"                # 匹配命中时替换的域名解析后的IP
+replace_domain: "proxy.example.com"               # 匹配命中时替换的域名解析后的IP
 cf_cache_time: "12h"                              # 刷新间隔（支持 1h、12h、24h 等）
 replace_cache_time: "30m"                         # 域名替换的域名解析后的IP缓存时间，就不会重复询问上游了
 whitelist_file: "./whitelist.txt"                 # 白名单域名一行一条支持通配符*.domain.*
 designated_domain: "./designated.txt"             # 指定域名走指定dns 如wx 在旅游环境的时候dns解析不是最优IP，那么通配符*.xx.com 119.29.29.29 就可以解决这个问题
+log_level: "debug"                                # 开启日志
+doh_port: 443                                     # 开启doh 0关闭
+dot_port: 853                                     # 开启dot 0关闭
+tls_cert_file: "./cert.pem"                       # 证书路径，注意权限
+tls_key_file: "./privkey.pem"                     # 证书key
