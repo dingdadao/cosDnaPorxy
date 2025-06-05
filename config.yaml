@@ -15,5 +15,5 @@ designated_domain: "./designated.txt" #指定域名走dns解析
 log_level: "debug"
 doh_port: 443
 dot_port: 853
-tls_cert_file: "./cert.pem"
+tls_cert_file: "./fullchain.pem"
 tls_key_file: "./privkey.pem"

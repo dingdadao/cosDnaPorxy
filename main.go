@@ -305,7 +305,7 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("replace_domain must be set")
 	}
 	if cfg.CFMrsURL4 == "" || cfg.CFMrsURL6 == "" {
-		return fmt.Errorf("Cloudflare IP ranges URLs must be configured")
+		return fmt.Errorf("cloudflare Ip ranges URLs must be configured")
 	}
 	return nil
 }
@@ -383,7 +383,12 @@ func (h *DNSHandler) loadWhitelist() {
 		h.logger.Error("Failed to open whitelist: %v", err)
 		return
 	}
-	defer f.Close()
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			h.logger.Error("Failed to close whitelist file: %v", err)
+		}
+	}(f)
 
 	scanner := bufio.NewScanner(f)
 	var patterns []string
@@ -421,7 +426,12 @@ func (h *DNSHandler) loadDesignatedDomains() {
 		h.logger.Error("Failed to open designated domains file: %v", err)
 		return
 	}
-	defer f.Close()
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			h.logger.Error("Failed to close designated domains file: %v", err)
+		}
+	}(f)
 
 	var rules []DesignatedDomain
 	scanner := bufio.NewScanner(f)
@@ -466,7 +476,12 @@ func (h *DNSHandler) downloadToFile(url, path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			h.logger.Error("Failed to close response body: %v", err)
+		}
+	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
@@ -476,7 +491,12 @@ func (h *DNSHandler) downloadToFile(url, path string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func(out *os.File) {
+		err := out.Close()
+		if err != nil {
+			h.logger.Error("Failed to close file: %v", err)
+		}
+	}(out)
 
 	_, err = io.Copy(out, resp.Body)
 	return err
@@ -808,7 +828,7 @@ func (h *DNSHandler) buildReplacedResponse(req *dns.Msg, original *dns.Msg, addr
 	return resp
 }
 
-// 构建aws成为IP段
+// LoadAWSIPRanges 构建aws成为IP段
 func LoadAWSIPRanges(path string, set4, set6 *netipx) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -866,7 +886,7 @@ func (h *DNSHandler) resolveViaDesignatedDNS(req *dns.Msg, dnsServer string) (*d
 }
 
 // proxyQuery 代理查询
-func (h *DNSHandler) proxyQuery(w dns.ResponseWriter, req *dns.Msg, upstream []string) (*dns.Msg, error) {
+func (h *DNSHandler) proxyQuery(req *dns.Msg, upstream []string) (*dns.Msg, error) {
 	for _, server := range upstream {
 		c := &dns.Client{
 			Timeout: 2 * time.Second,
@@ -907,7 +927,7 @@ func (h *DNSHandler) handleSpecialQuery(w dns.ResponseWriter, req *dns.Msg, q dn
 // handleWhitelistedQuery 处理白名单查询
 func (h *DNSHandler) handleWhitelistedQuery(w dns.ResponseWriter, req *dns.Msg) {
 	h.metrics.whitelistHits.Inc()
-	resp, err := h.proxyQuery(w, req, h.config.Upstream)
+	resp, err := h.proxyQuery(req, h.config.Upstream)
 	if err != nil {
 		h.logger.Error("Failed to proxy whitelisted query: %v", err)
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -921,7 +941,7 @@ func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Quest
 	var ipd *netipx
 	domain := sanitizeDomainName(q.Name)
 	qtype := q.Qtype
-	resp, err := h.proxyQuery(w, req, h.config.Upstream)
+	resp, err := h.proxyQuery(req, h.config.Upstream)
 	if err != nil || resp == nil {
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -1016,7 +1036,7 @@ func (h *DNSHandler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp 
 
 // handleNormalQueryFallback 普通查询回退处理
 func (h *DNSHandler) handleNormalQueryFallback(w dns.ResponseWriter, req *dns.Msg, q dns.Question) {
-	resp, err := h.proxyQuery(w, req, h.config.Upstream)
+	resp, err := h.proxyQuery(req, h.config.Upstream)
 	if err != nil {
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[q.Qtype], "failed").Inc()
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -1058,7 +1078,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 		// ✅ 非白名单与定向域名时，统一上游查询一次
-		resp, err := h.proxyQuery(w, req, h.config.Upstream)
+		resp, err := h.proxyQuery(req, h.config.Upstream)
 		if err != nil || resp == nil {
 			h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
