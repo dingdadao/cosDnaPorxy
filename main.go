@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/dgraph-io/ristretto"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,6 +33,8 @@ const (
 	defaultReplaceCacheTTL = "30m"
 	defaultLogLevel        = "info"
 	defaultMetricsPort     = 0
+	cftype                 = 1
+	awstype                = 2
 )
 
 // Config 配置结构体
@@ -39,8 +43,10 @@ type Config struct {
 	Upstream         []string `yaml:"upstream"`
 	CFMrsURL4        string   `yaml:"cf_mrs_url4"`
 	CFMrsURL6        string   `yaml:"cf_mrs_url6"`
+	AWSJsonURL       string   `yaml:"aws_json_url"`
 	CFMrsCache       string   `yaml:"cf_mrs_cache"`
-	ReplaceDomain    string   `yaml:"replace_domain"`
+	ReplaceCFDomain  string   `yaml:"replace_cf_domain"`
+	ReplaceAWSDomain string   `yaml:"replace_aws_domain"`
 	CFCacheTime      string   `yaml:"cf_cache_time"`
 	ReplaceCacheTime string   `yaml:"replace_cache_time"`
 	WhitelistFile    string   `yaml:"whitelist_file"`
@@ -120,85 +126,38 @@ func (l *Logger) Error(format string, v ...interface{}) {
 	log.Printf("[ERROR] "+format, v...)
 }
 
-// CacheItem 缓存项
-type CacheItem struct {
-	value interface{}
-	time  time.Time
-}
-
-// SizedCache 带大小限制的缓存
-type SizedCache struct {
-	sync.RWMutex
-	items   map[string]CacheItem
-	maxSize int
-	ttl     time.Duration
-	keys    []string // LRU队列
-}
-
-func NewSizedCache(maxSize int, ttl time.Duration) *SizedCache {
-	return &SizedCache{
-		items:   make(map[string]CacheItem),
-		maxSize: maxSize,
-		ttl:     ttl,
-	}
-}
-
-func (c *SizedCache) Get(key string) (interface{}, bool) {
-	c.RLock()
-	defer c.RUnlock()
-
-	item, ok := c.items[key]
-	if !ok {
-		return nil, false
-	}
-
-	if time.Since(item.time) > c.ttl {
-		delete(c.items, key)
-		return nil, false
-	}
-
-	return item.value, true
-}
-
-func (c *SizedCache) Set(key string, value interface{}) {
-	c.Lock()
-	defer c.Unlock()
-
-	// 清理过期项
-	for k, item := range c.items {
-		if time.Since(item.time) > c.ttl {
-			delete(c.items, k)
-		}
-	}
-
-	// 如果达到最大大小，移除最旧项
-	if len(c.keys) >= c.maxSize {
-		oldest := c.keys[0]
-		delete(c.items, oldest)
-		c.keys = c.keys[1:]
-	}
-
-	c.items[key] = CacheItem{
-		value: value,
-		time:  time.Now(),
-	}
-	c.keys = append(c.keys, key)
-}
-
 // DNSHandler DNS请求处理器
 type DNSHandler struct {
 	config           *Config
 	logger           *Logger
 	metrics          *MetricsCollector
-	cache            *SizedCache
+	cache            *ristretto.Cache
 	cfNetSet4        *netipx
 	cfNetSet6        *netipx
+	aWSNetSet4       *netipx
+	aWSNetSet6       *netipx
 	whitelistPattern []string
 	designatedRules  []DesignatedDomain
 	lastCFUpdate     time.Time
 	cfExpire         time.Duration
 	replaceExpire    time.Duration
 	sync.RWMutex
+}
+
+type AWSIPRanges struct {
+	Prefixes     []AWSPrefix `json:"prefixes"`
+	IPv6Prefixes []AWSPrefix `json:"ipv6_prefixes"`
+}
+
+type AWSPrefix struct {
+	IPPrefix   string `json:"ip_prefix,omitempty"`
+	IPv6Prefix string `json:"ipv6_prefix,omitempty"`
+	Service    string `json:"service"`
+	Region     string `json:"region"`
+}
+
+func (n *netipx) AddPrefix(p netip.Prefix) {
+	n.list = append(n.list, p)
 }
 
 // MetricsCollector 指标收集器
@@ -342,7 +301,7 @@ func validateConfig(cfg *Config) error {
 	if len(cfg.Upstream) == 0 {
 		return fmt.Errorf("no upstream servers configured")
 	}
-	if cfg.ReplaceDomain == "" {
+	if cfg.ReplaceCFDomain == "" {
 		return fmt.Errorf("replace_domain must be set")
 	}
 	if cfg.CFMrsURL4 == "" || cfg.CFMrsURL6 == "" {
@@ -362,14 +321,23 @@ func NewDNSHandler(cfg *Config) *DNSHandler {
 	if err != nil {
 		log.Fatalf("Invalid replace cache time: %v", err)
 	}
-
+	cache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 10_000,  // key 总量 * 10
+		MaxCost:     1 << 20, // 总体成本，单位是逻辑 cost（此处设为 1MB）
+		BufferItems: 64,      // 写缓冲
+	})
+	if err != nil {
+		log.Fatalf("Failed to create cache: %v", err)
+	}
 	handler := &DNSHandler{
 		config:        cfg,
 		logger:        &Logger{level: cfg.LogLevel},
 		metrics:       NewMetricsCollector(),
-		cache:         NewSizedCache(1000, replaceExpire),
+		cache:         cache,
 		cfNetSet4:     &netipx{},
 		cfNetSet6:     &netipx{},
+		aWSNetSet4:    &netipx{},
+		aWSNetSet6:    &netipx{},
 		cfExpire:      cfExpire,
 		replaceExpire: replaceExpire,
 	}
@@ -386,7 +354,7 @@ func NewDNSHandler(cfg *Config) *DNSHandler {
 	// 初始化加载数据
 	handler.loadWhitelist()
 	handler.loadDesignatedDomains()
-	handler.updateCloudflareNetworks()
+	handler.updateNetworks()
 
 	// 启动后台更新任务
 	go handler.runBackgroundTasks()
@@ -515,7 +483,7 @@ func (h *DNSHandler) downloadToFile(url, path string) error {
 }
 
 // updateCloudflareNetworks 更新Cloudflare网络列表
-func (h *DNSHandler) updateCloudflareNetworks() {
+func (h *DNSHandler) updateNetworks() {
 	h.Lock()
 	defer h.Unlock()
 
@@ -527,6 +495,7 @@ func (h *DNSHandler) updateCloudflareNetworks() {
 
 	cfCachePath4 := "./cloudflare-v4.txt"
 	cfCachePath6 := "./cloudflare-v6.txt"
+	aWSCachePath := "./aws.txt"
 
 	// 原子下载模式
 	download := func(url, path string) bool {
@@ -544,7 +513,7 @@ func (h *DNSHandler) updateCloudflareNetworks() {
 
 	// 并行下载
 	var wg sync.WaitGroup
-	success4, success6 := false, false
+	success4, success6, successaws := false, false, false
 
 	wg.Add(1)
 	go func() {
@@ -556,6 +525,13 @@ func (h *DNSHandler) updateCloudflareNetworks() {
 	go func() {
 		defer wg.Done()
 		success6 = download(h.config.CFMrsURL6, cfCachePath6)
+	}()
+	wg.Wait()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		successaws = download(h.config.AWSJsonURL, aWSCachePath)
 	}()
 	wg.Wait()
 
@@ -576,6 +552,16 @@ func (h *DNSHandler) updateCloudflareNetworks() {
 		}
 	}
 
+	if successaws {
+		err := LoadAWSIPRanges(aWSCachePath, h.aWSNetSet4, h.aWSNetSet6)
+		if err != nil {
+			h.logger.Error("Failed to load AWS IP ranges: %v", err)
+		} else {
+			h.logger.Info("Loaded %d IPv4 prefixes and %d IPv6 prefixes from AWS",
+				len(h.aWSNetSet4.list), len(h.aWSNetSet6.list))
+		}
+	}
+
 	h.lastCFUpdate = time.Now()
 }
 
@@ -592,7 +578,7 @@ func (h *DNSHandler) runBackgroundTasks() {
 	for {
 		select {
 		case <-cfTicker.C:
-			h.updateCloudflareNetworks()
+			h.updateNetworks()
 		case <-reloadTicker.C:
 			h.loadWhitelist()
 			h.loadDesignatedDomains()
@@ -634,7 +620,7 @@ func (h *DNSHandler) isWhitelisted(qname string) bool {
 }
 
 // matchDesignatedDomain 匹配定向域名
-func (h *DNSHandler) matchDesignatedDomain(qname string) (DesignatedDomain, bool) {
+func (h *DNSHandler) matchDesignatedDomain(qname string) (*DesignatedDomain, bool) {
 	domain := strings.ToLower(strings.TrimSuffix(qname, "."))
 	h.RLock()
 	defer h.RUnlock()
@@ -642,27 +628,40 @@ func (h *DNSHandler) matchDesignatedDomain(qname string) (DesignatedDomain, bool
 	for _, rule := range h.designatedRules {
 		if rule.Regex.MatchString(domain) {
 			h.logger.Debug("Match designated domain: %s via pattern %s", domain, rule.Domain)
-			return rule, true
+			return &rule, true
 		}
 	}
-
-	h.logger.Debug("Designated domain not found: %s", domain)
-	return DesignatedDomain{}, false
+	return nil, false
 }
 
-// isCloudflareResponse 检查响应是否来自Cloudflare
-func (h *DNSHandler) isCloudflareResponse(msg *dns.Msg) bool {
+// 检查是不是云
+func (h *DNSHandler) isCloudResponse(msg *dns.Msg, iptype int) bool {
+	var ipd *netipx
 	for _, rr := range msg.Answer {
 		switch v := rr.(type) {
 		case *dns.A:
-			if ip, err := netip.ParseAddr(v.A.String()); err == nil && h.cfNetSet4.Contains(ip) {
-				h.logger.Debug("IP %s is in Cloudflare IPv4 range", ip)
-				return true
+			if iptype == cftype {
+				ipd = h.cfNetSet4
+			} else if iptype == awstype {
+				ipd = h.aWSNetSet4
+			}
+			if ipd != nil {
+				if ip, err := netip.ParseAddr(v.A.String()); err == nil && ipd.Contains(ip) {
+					h.logger.Debug("IPv4 %s is in known IP range", ip)
+					return true
+				}
 			}
 		case *dns.AAAA:
-			if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && h.cfNetSet6.Contains(ip) {
-				h.logger.Debug("IP %s is in Cloudflare IPv6 range", ip)
-				return true
+			if iptype == cftype {
+				ipd = h.cfNetSet6
+			} else if iptype == awstype {
+				ipd = h.aWSNetSet6
+			}
+			if ipd != nil {
+				if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && ipd.Contains(ip) {
+					h.logger.Debug("IPv6 %s is in known IP range", ip)
+					return true
+				}
 			}
 		}
 	}
@@ -673,8 +672,10 @@ func (h *DNSHandler) isCloudflareResponse(msg *dns.Msg) bool {
 func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 	// 检查缓存
 	if val, ok := h.cache.Get(cname); ok {
-		h.metrics.cacheHits.WithLabelValues("replace").Inc()
-		return val.([]netip.Addr)
+		if addrs, ok := val.([]netip.Addr); ok {
+			h.metrics.cacheHits.WithLabelValues("replace").Inc()
+			return addrs
+		}
 	}
 
 	// 域名前处理：空值、无效跳过
@@ -742,7 +743,11 @@ func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 
 	addrs = h.uniqueAddrs(addrs)
 	if len(addrs) > 0 {
-		h.cache.Set(cname, addrs)
+		// 写入缓存，cost 简单用 1，TTL 使用 replaceExpire 配置
+		ok := h.cache.SetWithTTL(cname, addrs, 1, h.replaceExpire)
+		if !ok {
+			h.logger.Warn("Failed to set cache for %s", cname)
+		}
 	} else {
 		h.logger.Warn("No addresses found for %s", cname)
 	}
@@ -803,6 +808,45 @@ func (h *DNSHandler) buildReplacedResponse(req *dns.Msg, original *dns.Msg, addr
 	return resp
 }
 
+// 构建aws成为IP段
+func LoadAWSIPRanges(path string, set4, set6 *netipx) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file failed: %w", err)
+	}
+
+	var ranges AWSIPRanges
+	if err := json.Unmarshal(data, &ranges); err != nil {
+		return fmt.Errorf("unmarshal failed: %w", err)
+	}
+
+	for _, p := range ranges.Prefixes {
+		if p.IPPrefix == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(p.IPPrefix)
+		if err != nil {
+			log.Printf("Invalid IPv4 prefix: %s", p.IPPrefix)
+			continue
+		}
+		set4.AddPrefix(prefix)
+	}
+
+	for _, p := range ranges.IPv6Prefixes {
+		if p.IPv6Prefix == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(p.IPv6Prefix)
+		if err != nil {
+			log.Printf("Invalid IPv6 prefix: %s", p.IPv6Prefix)
+			continue
+		}
+		set6.AddPrefix(prefix)
+	}
+
+	return nil
+}
+
 // resolveViaDesignatedDNS 通过指定DNS解析
 func (h *DNSHandler) resolveViaDesignatedDNS(req *dns.Msg, dnsServer string) (*dns.Msg, error) {
 	c := &dns.Client{
@@ -843,28 +887,21 @@ func (h *DNSHandler) proxyQuery(w dns.ResponseWriter, req *dns.Msg, upstream []s
 }
 
 // handleSpecialQuery 处理特殊查询
-func (h *DNSHandler) handleSpecialQuery(rule DesignatedDomain, w dns.ResponseWriter, req *dns.Msg, q dns.Question) bool {
+func (h *DNSHandler) handleSpecialQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question, rule *DesignatedDomain) {
 	domain := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 
-	h.logger.Debug("matchDesignatedDomain: domain=%s matched=%v ruleDNS=%s", domain, rule.DNS)
-
 	h.metrics.designatedHits.Inc()
+
 	resp, err := h.resolveViaDesignatedDNS(req, rule.DNS)
-	if err != nil {
+	if err != nil || resp == nil {
 		h.logger.Error("Designated query failed for %s via %s: %v", domain, rule.DNS, err)
 		h.handleNormalQueryFallback(w, req, q)
-		return true
+		return
 	}
 
-	if resp == nil {
-		h.logger.Warn("Designated query returned nil response for %s via %s", domain, rule.DNS)
-		h.handleNormalQueryFallback(w, req, q)
-		return true
-	}
-
-	h.logger.Debug("Designated query success for %s via %s", domain, rule.DNS)
+	h.logger.Debug("designated query success: domain=%s dns=%s", domain, rule.DNS)
 	_ = w.WriteMsg(resp)
-	return true
+	return
 }
 
 // handleWhitelistedQuery 处理白名单查询
@@ -879,48 +916,45 @@ func (h *DNSHandler) handleWhitelistedQuery(w dns.ResponseWriter, req *dns.Msg) 
 	_ = w.WriteMsg(resp)
 }
 
-// handleNormalQuery 处理普通查询
-func (h *DNSHandler) handleNormalQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question) {
-	start := time.Now()
-	defer func() {
-		h.metrics.responseLatency.Observe(time.Since(start).Seconds())
-	}()
-
+// ip替换
+func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question, iptype int) {
+	var ipd *netipx
 	domain := sanitizeDomainName(q.Name)
 	qtype := q.Qtype
-
-	h.logger.Debug("Processing query for %s (type %d)", domain, qtype)
-	h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "received").Inc()
-
-	// 上游查询
 	resp, err := h.proxyQuery(w, req, h.config.Upstream)
 	if err != nil || resp == nil {
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
 		return
 	}
-
-	// Cloudflare检测和替换
-	if h.isCloudflareResponse(resp) {
-		for _, rr := range resp.Answer {
-			switch v := rr.(type) {
-			case *dns.A:
-				if ip, err := netip.ParseAddr(v.A.String()); err == nil && h.cfNetSet4.Contains(ip) {
-					h.handleCFReplacement(w, req, resp, qtype, domain, ip)
-					return
-				}
-			case *dns.AAAA:
-				if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && h.cfNetSet6.Contains(ip) {
-					h.handleCFReplacement(w, req, resp, qtype, domain, ip)
-					return
-				}
+	for _, rr := range resp.Answer {
+		switch v := rr.(type) {
+		case *dns.A:
+			if iptype == cftype {
+				ipd = h.cfNetSet4
+			}
+			if iptype == awstype {
+				ipd = h.aWSNetSet4
+			}
+			if ip, err := netip.ParseAddr(v.A.String()); err == nil && ipd.Contains(ip) {
+				h.handleReplacement(w, req, resp, qtype, domain, ip, iptype)
+				return
+			}
+		case *dns.AAAA:
+			if iptype == cftype {
+				ipd = h.cfNetSet6
+			}
+			if iptype == awstype {
+				ipd = h.aWSNetSet6
+			}
+			if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && ipd.Contains(ip) {
+				h.handleReplacement(w, req, resp, qtype, domain, ip, iptype)
+				return
 			}
 		}
 	}
-
 	// 默认返回
 	_ = w.WriteMsg(resp)
-	h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
 }
 
 // 主入口
@@ -954,16 +988,26 @@ func handleDoHRequest(w http.ResponseWriter, r *http.Request, handler dns.Handle
 	handler.ServeDNS(rw, req)
 }
 
-// handleCFReplacement 处理Cloudflare替换
-func (h *DNSHandler) handleCFReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg, qtype uint16, domain string, ip netip.Addr) {
-	replaceAddrs := h.resolveReplaceCNAME(h.config.ReplaceDomain)
+// handleCFReplacement 处理命中IP替换替换
+func (h *DNSHandler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg, qtype uint16, domain string, ip netip.Addr, iptype int) {
+	var replaceDomain string
+
+	switch iptype {
+	case cftype:
+		replaceDomain = h.config.ReplaceCFDomain
+	case awstype:
+		replaceDomain = h.config.ReplaceAWSDomain
+	}
+
+	replaceAddrs := h.resolveReplaceCNAME(replaceDomain)
+
 	if len(replaceAddrs) > 0 {
 		newResp := h.buildReplacedResponse(req, resp, replaceAddrs, qtype)
 		h.logger.Debug("Replaced CNAME: %s -> %v", domain, replaceAddrs)
 		h.metrics.replacedCount.Inc()
 		_ = w.WriteMsg(newResp)
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
-		h.logger.Debug("Cloudflare network matched: %s -> %s", domain, ip)
+		h.logger.Debug("handleReplacement matched: %s -> %s", domain, ip)
 	} else {
 		_ = w.WriteMsg(resp)
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
@@ -1003,26 +1047,48 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	defer recoverPanic(w, req)
 
 	for _, q := range req.Question {
-		qtype := q.Qtype
-		if qtype != dns.TypeA && qtype != dns.TypeAAAA {
-			continue
-		}
+		// 判断查询域名是否合法
 		_, ok := dns.IsDomainName(q.Name)
 		if !ok {
 			h.logger.Info("请求查询的是非法域名: %s", q.Name)
 			continue
 		}
+		qtype := q.Qtype
+		if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+			continue
+		}
+		// ✅ 非白名单与定向域名时，统一上游查询一次
+		resp, err := h.proxyQuery(w, req, h.config.Upstream)
+		if err != nil || resp == nil {
+			h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
+			return
+		}
 		rule, matched := h.matchDesignatedDomain(q.Name)
 		switch {
+		// 如果是白名单，直接返回
 		case h.isWhitelisted(q.Name):
-			h.handleWhitelistedQuery(w, req)
+			h.metrics.whitelistHits.Inc()
+			_ = w.WriteMsg(resp)
 			return
+		// 如果是匹配域名
 		case matched:
-			h.handleSpecialQuery(rule, w, req, q)
+			h.handleSpecialQuery(w, req, q, rule)
+			return
+		// 如果是cf
+		case h.isCloudResponse(resp, cftype):
+			h.handleQuery(w, req, q, cftype)
+			return
+		// 如果是aws
+		case h.isCloudResponse(resp, awstype):
+			h.handleQuery(w, req, q, awstype)
 			return
 		default:
-			h.handleNormalQuery(w, req, q)
-			return
+			err = w.WriteMsg(resp)
+			if err != nil {
+				h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+				_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
+			}
 		}
 	}
 }
