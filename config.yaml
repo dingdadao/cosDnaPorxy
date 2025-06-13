@@ -1,10 +1,10 @@
 listen_port: 5354
 metrics_port: 0
 upstream:
-  - "10.0.0.1:1053"
-cf_mrs_url4: "https://www.cloudflare-cn.com/ips-v4"
-cf_mrs_url6: "https://www.cloudflare-cn.com/ips-v6"
-aws_json_url: "https://ip-ranges.amazonaws.com/ip-ranges.json"
+  - "119.29.29.29:53"
+cf_mrs_file4: "./cloudflare-v4.txt"
+cf_mrs_file6: "./cloudflare-v6.txt"
+aws_mrs_file64: "./aws.txt"
 cf_mrs_cache: "./cloudflare.txt"
 replace_cf_domain: "cc.cloudflare.182682.xyz" # 找一个好用的cf域名被替换
 replace_aws_domain: "cc.cloudfront.182682.xyz"

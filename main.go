@@ -41,9 +41,9 @@ const (
 type Config struct {
 	ListenPort       int      `yaml:"listen_port"`
 	Upstream         []string `yaml:"upstream"`
-	CFMrsURL4        string   `yaml:"cf_mrs_url4"`
-	CFMrsURL6        string   `yaml:"cf_mrs_url6"`
-	AWSJsonURL       string   `yaml:"aws_json_url"`
+	CFMrsFile4       string   `yaml:"cf_mrs_file4"`
+	CFMrsFile6       string   `yaml:"cf_mrs_file6"`
+	AWSMrsFile46     string   `yaml:"aws_mrs_file64"`
 	CFMrsCache       string   `yaml:"cf_mrs_cache"`
 	ReplaceCFDomain  string   `yaml:"replace_cf_domain"`
 	ReplaceAWSDomain string   `yaml:"replace_aws_domain"`
@@ -304,8 +304,8 @@ func validateConfig(cfg *Config) error {
 	if cfg.ReplaceCFDomain == "" {
 		return fmt.Errorf("replace_domain must be set")
 	}
-	if cfg.CFMrsURL4 == "" || cfg.CFMrsURL6 == "" {
-		return fmt.Errorf("cloudflare Ip ranges URLs must be configured")
+	if cfg.CFMrsFile4 == "" || cfg.AWSMrsFile46 == "" || cfg.AWSMrsFile46 == "" {
+		return fmt.Errorf("Ip ranges URLs must be configured")
 	}
 	return nil
 }
@@ -354,10 +354,10 @@ func NewDNSHandler(cfg *Config) *DNSHandler {
 	// 初始化加载数据
 	handler.loadWhitelist()
 	handler.loadDesignatedDomains()
-	handler.updateNetworks()
+	handler.updateNetworks(cfg)
 
 	// 启动后台更新任务
-	go handler.runBackgroundTasks()
+	go handler.runBackgroundTasks(cfg)
 
 	return handler
 }
@@ -503,7 +503,7 @@ func (h *DNSHandler) downloadToFile(url, path string) error {
 }
 
 // updateCloudflareNetworks 更新Cloudflare网络列表
-func (h *DNSHandler) updateNetworks() {
+func (h *DNSHandler) updateNetworks(cfg *Config) {
 	h.Lock()
 	defer h.Unlock()
 
@@ -511,68 +511,38 @@ func (h *DNSHandler) updateNetworks() {
 		return
 	}
 
-	h.logger.Info("Updating Cloudflare IP ranges...")
+	h.logger.Info("Loading Cloudflare and AWS IP ranges from local cache...")
 
-	cfCachePath4 := "./cloudflare-v4.txt"
-	cfCachePath6 := "./cloudflare-v6.txt"
-	aWSCachePath := "./aws.txt"
+	cfCachePath4 := cfg.CFMrsFile4
+	cfCachePath6 := cfg.CFMrsFile6
+	aWSCachePath := cfg.AWSMrsFile46
 
-	// 原子下载模式
-	download := func(url, path string) bool {
-		tmpPath := path + ".tmp"
-		if err := h.downloadToFile(url, tmpPath); err != nil {
-			h.logger.Warn("Download failed %s: %v", url, err)
-			return false
-		}
-		if err := os.Rename(tmpPath, path); err != nil {
-			h.logger.Warn("File replace failed %s: %v", path, err)
-			return false
-		}
-		return true
-	}
-
-	// 并行下载
-	var wg sync.WaitGroup
-	success4, success6, successaws := false, false, false
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		success4 = download(h.config.CFMrsURL4, cfCachePath4)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		success6 = download(h.config.CFMrsURL6, cfCachePath6)
-	}()
-	wg.Wait()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		successaws = download(h.config.AWSJsonURL, aWSCachePath)
-	}()
-	wg.Wait()
-
-	// 加载成功的数据
-	if success4 {
+	// 加载 Cloudflare IPv4
+	if _, err := os.Stat(cfCachePath4); err == nil {
 		if err := h.cfNetSet4.LoadFromFile(cfCachePath4); err != nil {
 			h.logger.Error("Failed to load IPv4 ranges: %v", err)
 		} else {
 			h.logger.Info("Loaded %d IPv4 prefixes", len(h.cfNetSet4.list))
 		}
+	} else {
+		h.logger.Warn("IPv4 cache file not found: %s", cfCachePath4)
+		//h.cfNetSet4.Clear()
 	}
 
-	if success6 {
+	// 加载 Cloudflare IPv6
+	if _, err := os.Stat(cfCachePath6); err == nil {
 		if err := h.cfNetSet6.LoadFromFile(cfCachePath6); err != nil {
 			h.logger.Error("Failed to load IPv6 ranges: %v", err)
 		} else {
 			h.logger.Info("Loaded %d IPv6 prefixes", len(h.cfNetSet6.list))
 		}
+	} else {
+		h.logger.Warn("IPv6 cache file not found: %s", cfCachePath6)
+		//h.cfNetSet6.Clear()
 	}
 
-	if successaws {
+	// 加载 AWS IP 段
+	if _, err := os.Stat(aWSCachePath); err == nil {
 		err := LoadAWSIPRanges(aWSCachePath, h.aWSNetSet4, h.aWSNetSet6)
 		if err != nil {
 			h.logger.Error("Failed to load AWS IP ranges: %v", err)
@@ -580,13 +550,17 @@ func (h *DNSHandler) updateNetworks() {
 			h.logger.Info("Loaded %d IPv4 prefixes and %d IPv6 prefixes from AWS",
 				len(h.aWSNetSet4.list), len(h.aWSNetSet6.list))
 		}
+	} else {
+		h.logger.Warn("AWS cache file not found: %s", aWSCachePath)
+		//h.aWSNetSet4.Clear()
+		//h.aWSNetSet6.Clear()
 	}
 
 	h.lastCFUpdate = time.Now()
 }
 
 // runBackgroundTasks 运行后台任务
-func (h *DNSHandler) runBackgroundTasks() {
+func (h *DNSHandler) runBackgroundTasks(cfg *Config) {
 	// 定时更新Cloudflare网络列表
 	cfTicker := time.NewTicker(5 * time.Minute)
 	defer cfTicker.Stop()
@@ -598,7 +572,7 @@ func (h *DNSHandler) runBackgroundTasks() {
 	for {
 		select {
 		case <-cfTicker.C:
-			h.updateNetworks()
+			h.updateNetworks(cfg)
 		case <-reloadTicker.C:
 			h.loadWhitelist()
 			h.loadDesignatedDomains()
@@ -660,9 +634,10 @@ func (h *DNSHandler) isCloudResponse(msg *dns.Msg, iptype int) bool {
 	for _, rr := range msg.Answer {
 		switch v := rr.(type) {
 		case *dns.A:
-			if iptype == cftype {
+			switch iptype {
+			case cftype:
 				ipd = h.cfNetSet4
-			} else if iptype == awstype {
+			case awstype:
 				ipd = h.aWSNetSet4
 			}
 			if ipd != nil {
@@ -672,9 +647,10 @@ func (h *DNSHandler) isCloudResponse(msg *dns.Msg, iptype int) bool {
 				}
 			}
 		case *dns.AAAA:
-			if iptype == cftype {
+			switch iptype {
+			case cftype:
 				ipd = h.cfNetSet6
-			} else if iptype == awstype {
+			case awstype:
 				ipd = h.aWSNetSet6
 			}
 			if ipd != nil {
@@ -950,10 +926,10 @@ func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Quest
 	for _, rr := range resp.Answer {
 		switch v := rr.(type) {
 		case *dns.A:
-			if iptype == cftype {
+			switch iptype {
+			case cftype:
 				ipd = h.cfNetSet4
-			}
-			if iptype == awstype {
+			case awstype:
 				ipd = h.aWSNetSet4
 			}
 			if ip, err := netip.ParseAddr(v.A.String()); err == nil && ipd.Contains(ip) {
@@ -961,10 +937,10 @@ func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Quest
 				return
 			}
 		case *dns.AAAA:
-			if iptype == cftype {
+			switch iptype {
+			case cftype:
 				ipd = h.cfNetSet6
-			}
-			if iptype == awstype {
+			case awstype:
 				ipd = h.aWSNetSet6
 			}
 			if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && ipd.Contains(ip) {

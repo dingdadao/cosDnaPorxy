@@ -31,10 +31,12 @@ listen_port: 5353               # 本地监听端口
 upstream:                      # 上游 DNS 服务列表（支持多个）
   - "udp://1.1.1.1:53"
   - "udp://8.8.8.8:53"
-cf_mrs_url4: "https://example.com/cf_ipv4.mrs"    # Cloudflare IPv4 列表
-cf_mrs_url6: "https://example.com/cf_ipv6.mrs"    # Cloudflare IPv6 列表
+cf_mrs_file4: "./cloudflare-v4.txt"               # 自定义cf文件，可以直接创建就好
+cf_mrs_file6: "./cloudflare-v6.txt"               # 自定义cf文件，可以直接创建就好
+aws_mrs_file64: "./aws.txt"                       # 自定义aws路径 自己写网段就行
 cf_mrs_cache: "./cf.mrs"                          # 缓存文件路径
 replace_domain: "proxy.example.com"               # 匹配命中时替换的域名解析后的IP
+replace_aws_domain: "aws.example.com"             # 匹配命中时替换的域名解析后的IP
 cf_cache_time: "12h"                              # 刷新间隔（支持 1h、12h、24h 等）
 replace_cache_time: "30m"                         # 域名替换的域名解析后的IP缓存时间，就不会重复询问上游了
 whitelist_file: "./whitelist.txt"                 # 白名单域名一行一条支持通配符*.domain.*
