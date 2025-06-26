@@ -559,6 +559,41 @@ func (h *DNSHandler) updateNetworks(cfg *Config) {
 	h.lastCFUpdate = time.Now()
 }
 
+// MatchDomain 判断给定的 pattern 是否匹配指定的域名
+// 支持以下三种匹配：
+// 1. 完全匹配：qq.com
+// 2. 通配符开头：*.qq.com 匹配 qq.com 和 a.qq.com
+// 3. 模糊通配符：如 *qpic.cn*，内部使用正则匹配
+func MatchDomain(pattern, domain string) bool {
+	domain = strings.ToLower(strings.TrimSuffix(domain, ".")) // 统一格式化域名
+	pattern = strings.ToLower(pattern)
+
+	// 完全匹配
+	if pattern == domain {
+		return true
+	}
+
+	// 通配符前缀：*.qq.com
+	if strings.HasPrefix(pattern, "*.") {
+		base := pattern[2:]
+		if domain == base || strings.HasSuffix(domain, "."+base) {
+			return true
+		}
+	}
+
+	// 模糊通配符（如 *xx*）
+	if strings.Contains(pattern, "*") {
+		// 转为正则表达式
+		regexPattern := "^" + regexp.QuoteMeta(pattern) + "$"
+		regexPattern = strings.ReplaceAll(regexPattern, `\*`, ".*")
+		if matched, err := regexp.MatchString(regexPattern, domain); err == nil && matched {
+			return true
+		}
+	}
+
+	return false
+}
+
 // runBackgroundTasks 运行后台任务
 func (h *DNSHandler) runBackgroundTasks(cfg *Config) {
 	// 定时更新Cloudflare网络列表
@@ -588,27 +623,10 @@ func (h *DNSHandler) isWhitelisted(qname string) bool {
 
 	for _, pattern := range h.whitelistPattern {
 		pattern = strings.ToLower(pattern)
-
-		// 精确匹配
-		if pattern == domain {
+		if MatchDomain(pattern, domain) {
 			return true
 		}
 
-		// 通配符 *.example.com
-		if strings.HasPrefix(pattern, "*.") {
-			if strings.HasSuffix(domain, pattern[1:]) || domain == pattern[2:] {
-				return true
-			}
-		}
-
-		// 复杂通配符 *aa11*
-		if strings.Contains(pattern, "*") {
-			regexPattern := "^" + strings.ReplaceAll(pattern, ".", `\.`) + "$"
-			regexPattern = strings.ReplaceAll(regexPattern, "*", ".*")
-			if matched, _ := regexp.MatchString(regexPattern, domain); matched {
-				return true
-			}
-		}
 	}
 	return false
 }
@@ -620,7 +638,8 @@ func (h *DNSHandler) matchDesignatedDomain(qname string) (*DesignatedDomain, boo
 	defer h.RUnlock()
 
 	for _, rule := range h.designatedRules {
-		if rule.Regex.MatchString(domain) {
+		pattern := strings.ToLower(rule.Domain)
+		if MatchDomain(pattern, domain) {
 			h.logger.Debug("Match designated domain: %s via pattern %s", domain, rule.Domain)
 			return &rule, true
 		}
@@ -901,16 +920,16 @@ func (h *DNSHandler) handleSpecialQuery(w dns.ResponseWriter, req *dns.Msg, q dn
 }
 
 // handleWhitelistedQuery 处理白名单查询
-func (h *DNSHandler) handleWhitelistedQuery(w dns.ResponseWriter, req *dns.Msg) {
-	h.metrics.whitelistHits.Inc()
-	resp, err := h.proxyQuery(req, h.config.Upstream)
-	if err != nil {
-		h.logger.Error("Failed to proxy whitelisted query: %v", err)
-		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
-		return
-	}
-	_ = w.WriteMsg(resp)
-}
+//func (h *DNSHandler) handleWhitelistedQuery(w dns.ResponseWriter, req *dns.Msg) {
+//	h.metrics.whitelistHits.Inc()
+//	resp, err := h.proxyQuery(req, h.config.Upstream)
+//	if err != nil {
+//		h.logger.Error("Failed to proxy whitelisted query: %v", err)
+//		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
+//		return
+//	}
+//	_ = w.WriteMsg(resp)
+//}
 
 // ip替换
 func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question, iptype int) {
