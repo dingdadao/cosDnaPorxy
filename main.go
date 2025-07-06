@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"cosDnaPorxy/v2ray.com/core/common/protocol"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 	"io"
 	"log"
@@ -40,7 +42,9 @@ const (
 // Config 配置结构体
 type Config struct {
 	ListenPort       int      `yaml:"listen_port"`
-	Upstream         []string `yaml:"upstream"`
+	CNUpstream       []string `yaml:"cn_upstream"`
+	NotCNUpstream    []string `yaml:"not_cn_upstream"`
+	GeositeGroup     string   `yaml:"geosite_group"`
 	CFMrsFile4       string   `yaml:"cf_mrs_file4"`
 	CFMrsFile6       string   `yaml:"cf_mrs_file6"`
 	AWSMrsFile46     string   `yaml:"aws_mrs_file64"`
@@ -57,6 +61,8 @@ type Config struct {
 	DoHPort          int      `yaml:"doh_port"`
 	TLSCertFile      string   `yaml:"tls_cert_file"`
 	TLSKeyFile       string   `yaml:"tls_key_file"`
+	GeositeURL       string   `yaml:"geosite_url"`     // geosite.dat 下载地址
+	GeositeRefresh   string   `yaml:"geosite_refresh"` // 多久刷新一次
 }
 
 // DesignatedDomain 定向域名配置
@@ -64,6 +70,16 @@ type DesignatedDomain struct {
 	Domain string `yaml:"domain"`
 	DNS    string `yaml:"dns"`
 	Regex  *regexp.Regexp
+}
+
+// geosite 加载缓存结构（带锁）
+type GeositeManager struct {
+	sync.RWMutex
+	lastUpdate time.Time
+	data       *protocol.GeoSiteList
+	url        string
+	refresh    time.Duration
+	client     *http.Client
 }
 
 type dnsResponseWriter struct {
@@ -130,6 +146,7 @@ func (l *Logger) Error(format string, v ...interface{}) {
 type DNSHandler struct {
 	config           *Config
 	logger           *Logger
+	geositeManager   *GeositeManager
 	metrics          *MetricsCollector
 	cache            *ristretto.Cache
 	cfNetSet4        *netipx
@@ -264,6 +281,75 @@ func (n *netipx) LoadFromFile(path string) error {
 	return nil
 }
 
+// 加载geosite_url
+func NewGeositeManager(url string, gtime string) (*GeositeManager, error) {
+	refreshDur, err := time.ParseDuration(gtime)
+	if err != nil {
+		return nil, fmt.Errorf("解析刷新时间失败: %w", err)
+	}
+
+	return &GeositeManager{
+		url:     url,
+		refresh: refreshDur,
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}, nil
+}
+
+func (g *GeositeManager) updateGeoSite() {
+	const cacheFile = "./geosite.dat"
+
+	// 先尝试从本地文件加载
+	data, err := os.ReadFile(cacheFile)
+	if err == nil {
+		list := &protocol.GeoSiteList{}
+		if err := proto.Unmarshal(data, list); err == nil {
+			g.Lock()
+			g.data = list
+			g.lastUpdate = time.Now()
+			g.Unlock()
+			log.Printf("[geosite] 从本地缓存加载成功，标签数: %d", len(list.Entry))
+			return
+		}
+		log.Printf("[geosite] 本地缓存文件解码失败: %v", err)
+	} else {
+		log.Printf("[geosite] 本地缓存文件不存在或读取失败: %v", err)
+	}
+
+	// 本地加载失败，则尝试网络下载
+	resp, err := g.client.Get(g.url)
+	if err != nil {
+		log.Printf("[geosite] 下载失败: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[geosite] 读取响应失败: %v", err)
+		return
+	}
+
+	list := &protocol.GeoSiteList{}
+	if err := proto.Unmarshal(body, list); err != nil {
+		log.Printf("[geosite] 远程数据解码失败: %v", err)
+		return
+	}
+
+	// 下载成功才写本地缓存
+	if err := os.WriteFile(cacheFile, body, 0644); err != nil {
+		log.Printf("[geosite] 本地缓存保存失败: %v", err)
+	}
+
+	g.Lock()
+	g.data = list
+	g.lastUpdate = time.Now()
+	g.Unlock()
+
+	log.Printf("[geosite] 成功下载并更新 geosite.dat，标签数: %d", len(list.Entry))
+}
+
 // loadConfig 加载配置文件
 func loadConfig(path string) (*Config, error) {
 	cfgData, err := os.ReadFile(path)
@@ -298,7 +384,7 @@ func validateConfig(cfg *Config) error {
 	if cfg.ListenPort <= 0 || cfg.ListenPort > 65535 {
 		return fmt.Errorf("invalid listen port: %d", cfg.ListenPort)
 	}
-	if len(cfg.Upstream) == 0 {
+	if len(cfg.CNUpstream) == 0 || len(cfg.NotCNUpstream) == 0 {
 		return fmt.Errorf("no upstream servers configured")
 	}
 	if cfg.ReplaceCFDomain == "" {
@@ -355,6 +441,12 @@ func NewDNSHandler(cfg *Config) *DNSHandler {
 	handler.loadWhitelist()
 	handler.loadDesignatedDomains()
 	handler.updateNetworks(cfg)
+	geositeMgr, err := NewGeositeManager(cfg.GeositeURL, cfg.GeositeRefresh)
+	if err != nil {
+		log.Fatalf("初始化 GeositeManager 失败: %v", err)
+	}
+	geositeMgr.updateGeoSite()
+	handler.geositeManager = geositeMgr // ✅ 关键补充
 
 	// 启动后台更新任务
 	go handler.runBackgroundTasks(cfg)
@@ -372,7 +464,8 @@ func (h *DNSHandler) loadWhitelist() {
 	// 尝试创建文件（如果不存在）
 	if _, err := os.Stat(h.config.WhitelistFile); os.IsNotExist(err) {
 		h.logger.Warn("Whitelist file does not exist, creating: %s", h.config.WhitelistFile)
-		if err := os.WriteFile(h.config.WhitelistFile, []byte("# Whitelist domains\nexample.com\n"), 0644); err != nil {
+		err := os.WriteFile(h.config.WhitelistFile, []byte("# Whitelist domains\nexample.com\n"), 0644)
+		if err != nil {
 			h.logger.Error("Failed to create whitelist file: %v", err)
 			return
 		}
@@ -383,37 +476,41 @@ func (h *DNSHandler) loadWhitelist() {
 		h.logger.Error("Failed to open whitelist: %v", err)
 		return
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-			h.logger.Error("Failed to close whitelist file: %v", err)
-		}
-	}(f)
+	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	var patterns []string
+	var newList []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" && !strings.HasPrefix(line, "#") {
-			patterns = append(patterns, line)
+			newList = append(newList, line)
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		h.logger.Error("Error reading whitelist file: %v", err)
+		return
+	}
+
+	// ✅ 成功才更新，不影响旧数据
 	h.Lock()
-	h.whitelistPattern = patterns
+	h.whitelistPattern = newList
 	h.Unlock()
-	h.logger.Info("Whitelist loaded: %d entries", len(patterns))
+
+	h.logger.Info("✅ Whitelist updated successfully: %d entries", len(newList))
 }
 
 // loadDesignatedDomains 加载定向域名规则
+// 异步加载定向域名规则
 func (h *DNSHandler) loadDesignatedDomains() {
 	if h.config.DesignatedDomain == "" {
 		h.logger.Warn("Designated domains file not configured")
 		return
 	}
 
+	// 文件不存在则创建默认
 	if _, err := os.Stat(h.config.DesignatedDomain); os.IsNotExist(err) {
-		h.logger.Warn("Designated domains file does not exist, creating: %s", h.config.DesignatedDomain)
+		h.logger.Warn("Designated domains file not found, creating: %s", h.config.DesignatedDomain)
 		defaultContent := []byte("# Format: domain dns_server\n*.example.com 8.8.8.8\n")
 		if err := os.WriteFile(h.config.DesignatedDomain, defaultContent, 0644); err != nil {
 			h.logger.Error("Failed to create designated domains file: %v", err)
@@ -426,15 +523,11 @@ func (h *DNSHandler) loadDesignatedDomains() {
 		h.logger.Error("Failed to open designated domains file: %v", err)
 		return
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-			h.logger.Error("Failed to close designated domains file: %v", err)
-		}
-	}(f)
+	defer f.Close()
 
-	var rules []DesignatedDomain
+	var newRules []DesignatedDomain
 	scanner := bufio.NewScanner(f)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -447,7 +540,8 @@ func (h *DNSHandler) loadDesignatedDomains() {
 		}
 
 		rawPattern := strings.ToLower(parts[0])
-		// 转换为正则表达式
+
+		// 将通配符 *.example.com 转换为正则表达式
 		regexPattern := "^" + regexp.QuoteMeta(rawPattern) + "$"
 		regexPattern = strings.ReplaceAll(regexPattern, `\*`, ".*")
 
@@ -457,17 +551,24 @@ func (h *DNSHandler) loadDesignatedDomains() {
 			continue
 		}
 
-		rules = append(rules, DesignatedDomain{
+		newRules = append(newRules, DesignatedDomain{
 			Domain: rawPattern,
 			DNS:    parts[1],
 			Regex:  re,
 		})
 	}
 
+	if err := scanner.Err(); err != nil {
+		h.logger.Error("Error reading designated domains file: %v", err)
+		return
+	}
+
+	// ✅ 成功才替换原规则
 	h.Lock()
-	h.designatedRules = rules
+	h.designatedRules = newRules
 	h.Unlock()
-	h.logger.Info("Designated domains loaded: %d entries", len(rules))
+
+	h.logger.Info("✅ Designated domains updated successfully: %d entries", len(newRules))
 }
 
 // downloadToFile 下载文件
@@ -604,6 +705,9 @@ func (h *DNSHandler) runBackgroundTasks(cfg *Config) {
 	reloadTicker := time.NewTicker(1 * time.Minute)
 	defer reloadTicker.Stop()
 
+	geositeTicker := time.NewTicker(h.geositeManager.refresh)
+	defer geositeTicker.Stop()
+
 	for {
 		select {
 		case <-cfTicker.C:
@@ -611,6 +715,8 @@ func (h *DNSHandler) runBackgroundTasks(cfg *Config) {
 		case <-reloadTicker.C:
 			h.loadWhitelist()
 			h.loadDesignatedDomains()
+		case <-geositeTicker.C:
+			h.geositeManager.updateGeoSite()
 		}
 	}
 }
@@ -645,6 +751,51 @@ func (h *DNSHandler) matchDesignatedDomain(qname string) (*DesignatedDomain, boo
 		}
 	}
 	return nil, false
+}
+
+// 检查在不在CheckDomainInTag
+func (g *GeositeManager) CheckDomainInTag(domain, tag string) bool {
+	g.RLock()
+	defer g.RUnlock()
+
+	if g.data == nil {
+		log.Println("[geosite] data为空")
+		return false
+	}
+
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	tag = strings.ToLower(tag)
+
+	for _, entry := range g.data.Entry {
+		if strings.ToLower(entry.CountryCode) != tag {
+			continue
+		}
+		for _, rule := range entry.Domain {
+			ruleVal := strings.ToLower(rule.Value)
+			switch rule.Type {
+			case protocol.Domain_Plain:
+				// 完全匹配
+				return domain == ruleVal
+
+			case protocol.Domain_Domain:
+				// domain == rule 或 .rule 结尾
+				return domain == ruleVal || strings.HasSuffix(domain, "."+ruleVal)
+
+			case protocol.Domain_RootDomain:
+				// DOMAIN-SUFFIX: 后缀匹配
+				return strings.HasSuffix(domain, ruleVal)
+
+			case protocol.Domain_Regex:
+				// 正则匹配
+				matched, err := regexp.MatchString(ruleVal, domain)
+				return err == nil && matched
+
+			default:
+				return false
+			}
+		}
+	}
+	return false
 }
 
 // 检查是不是云
@@ -716,7 +867,7 @@ func (h *DNSHandler) resolveReplaceCNAME(cname string) []netip.Addr {
 
 	queryTypes := []uint16{dns.TypeA, dns.TypeAAAA}
 	for _, qtype := range queryTypes {
-		for _, server := range h.config.Upstream {
+		for _, server := range h.config.CNUpstream {
 			wg.Add(1)
 			go func(server string, qtype uint16) {
 				defer wg.Done()
@@ -919,24 +1070,12 @@ func (h *DNSHandler) handleSpecialQuery(w dns.ResponseWriter, req *dns.Msg, q dn
 	return
 }
 
-// handleWhitelistedQuery 处理白名单查询
-//func (h *DNSHandler) handleWhitelistedQuery(w dns.ResponseWriter, req *dns.Msg) {
-//	h.metrics.whitelistHits.Inc()
-//	resp, err := h.proxyQuery(req, h.config.Upstream)
-//	if err != nil {
-//		h.logger.Error("Failed to proxy whitelisted query: %v", err)
-//		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
-//		return
-//	}
-//	_ = w.WriteMsg(resp)
-//}
-
 // ip替换
-func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question, iptype int) {
+func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question, iptype int, Upstream []string) {
 	var ipd *netipx
 	domain := sanitizeDomainName(q.Name)
 	qtype := q.Qtype
-	resp, err := h.proxyQuery(req, h.config.Upstream)
+	resp, err := h.proxyQuery(req, Upstream)
 	if err != nil || resp == nil {
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -973,7 +1112,7 @@ func (h *DNSHandler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Quest
 }
 
 // 主入口
-func handleDoHRequest(w http.ResponseWriter, r *http.Request, handler dns.Handler) {
+func handleDoHRequest(w http.ResponseWriter, r *http.Request, handler dns.Handler, config *Config) {
 	var dnsQuery []byte
 	var err error
 
@@ -1031,7 +1170,7 @@ func (h *DNSHandler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp 
 
 // handleNormalQueryFallback 普通查询回退处理
 func (h *DNSHandler) handleNormalQueryFallback(w dns.ResponseWriter, req *dns.Msg, q dns.Question) {
-	resp, err := h.proxyQuery(req, h.config.Upstream)
+	resp, err := h.proxyQuery(req, h.config.CNUpstream)
 	if err != nil {
 		h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[q.Qtype], "failed").Inc()
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -1061,46 +1200,57 @@ func recoverPanic(w dns.ResponseWriter, req *dns.Msg) {
 func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	defer recoverPanic(w, req)
 
+	cfg := h.config // ✅ 获取配置
+
 	for _, q := range req.Question {
-		// 判断查询域名是否合法
-		_, ok := dns.IsDomainName(q.Name)
-		if !ok {
-			h.logger.Info("请求查询的是非法域名: %s", q.Name)
+		domain := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+		if _, ok := dns.IsDomainName(domain); !ok {
+			h.logger.Info("请求查询的是非法域名: %s", domain)
 			continue
 		}
+
 		qtype := q.Qtype
 		if qtype != dns.TypeA && qtype != dns.TypeAAAA {
 			continue
 		}
-		// ✅ 非白名单与定向域名时，统一上游查询一次
-		resp, err := h.proxyQuery(req, h.config.Upstream)
+
+		// 匹配 geosite
+		isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+		var upstream []string
+		if isCN {
+			upstream = cfg.CNUpstream
+		} else {
+			upstream = cfg.NotCNUpstream
+		}
+		// 查询上游
+		resp, err := h.proxyQuery(req, upstream)
+
 		if err != nil || resp == nil {
 			h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
 			return
 		}
-		rule, matched := h.matchDesignatedDomain(q.Name)
-		switch {
-		// 如果是白名单，直接返回
-		case h.isWhitelisted(q.Name):
-			h.metrics.whitelistHits.Inc()
-			_ = w.WriteMsg(resp)
-			return
-		// 如果是匹配域名
-		case matched:
+
+		// 定向域名处理
+		if rule, matched := h.matchDesignatedDomain(domain); matched {
+			h.metrics.designatedHits.Inc()
 			h.handleSpecialQuery(w, req, q, rule)
 			return
-		// 如果是cf
-		case h.isCloudResponse(resp, cftype):
-			h.handleQuery(w, req, q, cftype)
+		}
+
+		// 云服务识别处理（如 Cloudflare、AWS）
+		switch {
+		case h.isWhitelisted(domain):
+			_ = w.WriteMsg(resp)
 			return
-		// 如果是aws
+		case h.isCloudResponse(resp, cftype):
+			h.handleQuery(w, req, q, cftype, upstream)
+			return
 		case h.isCloudResponse(resp, awstype):
-			h.handleQuery(w, req, q, awstype)
+			h.handleQuery(w, req, q, awstype, upstream)
 			return
 		default:
-			err = w.WriteMsg(resp)
-			if err != nil {
+			if err := w.WriteMsg(resp); err != nil {
 				h.metrics.queriesTotal.WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 				_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
 			}
@@ -1166,7 +1316,7 @@ func startDoHServer(config *Config, handler dns.Handler) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
-		handleDoHRequest(w, r, handler)
+		handleDoHRequest(w, r, handler, config)
 	})
 
 	server := &http.Server{
@@ -1211,7 +1361,6 @@ func loadAndValidateConfig() *Config {
 func main() {
 	config := loadAndValidateConfig()
 	handler := NewDNSHandler(config)
-
 	go startMetricsServer(config.MetricsPort)
 	go startUDPServer(config, handler)
 	go startDoTServer(config, handler)

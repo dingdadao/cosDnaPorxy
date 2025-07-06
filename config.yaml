@@ -1,7 +1,9 @@
 listen_port: 5354
 metrics_port: 0
-upstream:
+cn_upstream:
   - "119.29.29.29:53"
+not_cn_upstream:
+  - "10.0.0.1:1053"
 cf_mrs_file4: "./cloudflare-v4.txt"
 cf_mrs_file6: "./cloudflare-v6.txt"
 aws_mrs_file64: "./aws.txt"
@@ -13,7 +15,10 @@ replace_cache_time: "30m"
 whitelist_file: "./whitelist.txt"
 designated_domain: "./designated.txt" #指定域名走dns解析
 log_level: "debug"
-doh_port: 443
-dot_port: 853
+doh_port: 0
+dot_port: 0
 tls_cert_file: "./fullchain.pem"
 tls_key_file: "./privkey.pem"
+geosite_url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat"
+geosite_refresh: 72h
+geosite_group: "GEOLOCATION-CN"
