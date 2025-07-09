@@ -1,24 +1,52 @@
 listen_port: 5354
 metrics_port: 0
+
+# 上游DNS服务器配置 - 直接使用DoH
 cn_upstream:
-  - "119.29.29.29:53"
+  - "https://doh.pub/dns-query"
+  - "https://dns.alidns.com/dns-query"
 not_cn_upstream:
-  - "10.0.0.1:1053"
-cf_mrs_file4: "./cloudflare-v4.txt"
-cf_mrs_file6: "./cloudflare-v6.txt"
-aws_mrs_file64: "./aws.txt"
-cf_mrs_cache: "./cloudflare.txt"
-replace_cf_domain: "cc.cloudflare.182682.xyz" # 找一个好用的cf域名被替换
-replace_aws_domain: "cc.cloudfront.182682.xyz"
-cf_cache_time: 23h59m # 控制cf_mrs_cache文件在内存缓存的时间
-replace_cache_time: "30m"
-whitelist_file: "./whitelist.txt"
-designated_domain: "./designated.txt" #指定域名走dns解析
-log_level: "debug"
-doh_port: 0
-dot_port: 0
-tls_cert_file: "./fullchain.pem"
-tls_key_file: "./privkey.pem"
+  - "https://dns.google/dns-query"
+  - "https://cloudflare-dns.com/dns-query"
+
+doh:
+  cn:
+    enabled: true
+    timeout: "5s"
+    resolver: "119.29.29.29:53"
+  not_cn:
+    enabled: true
+    timeout: "5s"
+    resolver: "8.210.15.152:53"
+
+# Cloudflare和AWS IP范围文件
+cf_mrs_file4: "./data/cloudflare-v4.txt"
+cf_mrs_file6: "./data/cloudflare-v6.txt"
+aws_mrs_file64: "./data/aws.txt"
+cf_mrs_cache: "./data/cloudflare.txt"
+
+# 替换域名配置
+replace_cf_domain: "cc.cloudflare.182682.xyz" # Cloudflare域名替换
+replace_aws_domain: "cc.cloudfront.182682.xyz" # AWS域名替换
+
+# 缓存时间配置
+cf_cache_time: 23h59m # Cloudflare IP列表缓存时间
+replace_cache_time: "30m" # 替换域名解析缓存时间
+
+# 域名规则文件
+whitelist_file: "./configs/whitelist.txt" # 白名单域名（不进行任何处理）
+designated_domain: "./configs/designated.txt" # 指定域名走特定DNS
+
+# 日志和监控
+log_level: "debug" # 日志级别：debug, info, warn, error
+
+# TLS配置（DoH/DoT）
+doh_port: 0 # DoH端口，0表示禁用
+dot_port: 0 # DoT端口，0表示禁用
+tls_cert_file: "./configs/fullchain.pem"
+tls_key_file: "./configs/privkey.pem"
+
+# Geosite配置
 geosite_url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat"
-geosite_refresh: 72h
-geosite_group: "GEOLOCATION-CN"
+geosite_refresh: 72h # Geosite数据刷新间隔
+geosite_group: "GEOLOCATION-CN" # 中国地理位置分组
