@@ -92,3 +92,4 @@ whitelist.txt
 fullchain.pem
 privkey.pem
 build/dnsproxy
+data

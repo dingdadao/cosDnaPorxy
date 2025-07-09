@@ -36,8 +36,11 @@ type Config struct {
 	NotCNUpstream    []string   `yaml:"not_cn_upstream"`
 	GeositeGroup     string     `yaml:"geosite_group"`
 	CFMrsFile4       string     `yaml:"cf_mrs_file4"`
+	CFMrsFile4URL    string     `yaml:"cf_mrs_file4_url"`
 	CFMrsFile6       string     `yaml:"cf_mrs_file6"`
+	CFMrsFile6URL    string     `yaml:"cf_mrs_file6_url"`
 	AWSMrsFile46     string     `yaml:"aws_mrs_file64"`
+	AWSMrsFile46URL  string     `yaml:"aws_mrs_file64_url"`
 	CFMrsCache       string     `yaml:"cf_mrs_cache"`
 	ReplaceCFDomain  string     `yaml:"replace_cf_domain"`
 	ReplaceAWSDomain string     `yaml:"replace_aws_domain"`
@@ -51,9 +54,10 @@ type Config struct {
 	DoHPort          int        `yaml:"doh_port"`
 	TLSCertFile      string     `yaml:"tls_cert_file"`
 	TLSKeyFile       string     `yaml:"tls_key_file"`
-	GeositeURL       string     `yaml:"geosite_url"`     // geosite.dat 下载地址
-	GeositeRefresh   string     `yaml:"geosite_refresh"` // 多久刷新一次
-	DoH              DoHGroupConfig  `yaml:"doh"`             // DoH配置
+	GeositeFile      string     `yaml:"geosite_file"`
+	GeositeURL       string     `yaml:"geosite_url"`
+	GeositeRefresh   string     `yaml:"geosite_refresh"`
+	DoH              DoHGroupConfig  `yaml:"doh"`
 }
 
 // LoadConfig 加载配置文件

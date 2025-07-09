@@ -4,12 +4,18 @@ import (
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/dns"
 	"cosDnaPorxy/internal/metrics"
+	"cosDnaPorxy/internal/utils"
 	"log"
 )
 
 func main() {
 	// 加载配置
 	cfg := config.LoadAndValidateConfig()
+
+	// 自动初始化资源文件和目录
+	if err := utils.InitResourceFiles(cfg); err != nil {
+		log.Printf("资源初始化失败: %v", err)
+	}
 	
 	// 创建DNS处理器
 	handler := dns.NewHandler(cfg)

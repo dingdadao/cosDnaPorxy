@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -329,36 +328,36 @@ func (h *Handler) checkServerHealth(server string) bool {
 	h.RLock()
 	health, exists := h.serverHealth[server]
 	h.RUnlock()
-	
+
 	if !exists {
 		health = &ServerHealth{}
 		h.Lock()
 		h.serverHealth[server] = health
 		h.Unlock()
 	}
-	
+
 	health.Lock()
 	defer health.Unlock()
-	
+
 	// 如果最近检查过且健康，直接返回
 	if time.Since(health.LastCheck) < 30*time.Second && health.IsHealthy {
 		return true
 	}
-	
+
 	// 执行健康检查
 	req := new(dns.Msg)
 	req.SetQuestion("google.com.", dns.TypeA)
-	
+
 	var c *dns.Client
 	var resp *dns.Msg
 	var err error
-	
+
 	start := time.Now()
-	
+
 	// 根据服务器地址判断协议类型
 	network, timeout := h.getNetworkAndTimeout(server)
 	serverAddr := h.getServerAddress(server)
-	
+
 	// 对于DoH协议，使用DoH健康检查
 	if strings.HasPrefix(server, "https://") {
 		resp, err = h.queryDoH(req, server, h.isCNUpstream(server))
@@ -367,15 +366,15 @@ func (h *Handler) checkServerHealth(server string) bool {
 			Timeout: timeout,
 			Net:     network,
 		}
-		
+
 		resp, _, err = c.Exchange(req, serverAddr)
 	}
-	
+
 	latency := time.Since(start)
-	
+
 	health.LastCheck = time.Now()
 	health.Latency = latency
-	
+
 	if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
 		health.IsHealthy = true
 		health.SuccessCount++
@@ -398,13 +397,13 @@ func (h *Handler) getHealthyServers(servers []string) []string {
 			healthy = append(healthy, server)
 		}
 	}
-	
+
 	// 如果没有健康的服务器，返回原始列表
 	if len(healthy) == 0 {
 		h.logger.Warn("没有健康的DNS服务器，使用原始列表")
 		return servers
 	}
-	
+
 	return healthy
 }
 
@@ -528,26 +527,23 @@ func (h *Handler) querySingleServer(req *dns.Msg, server string) (*dns.Msg, erro
 	var c *dns.Client
 	var resp *dns.Msg
 	var err error
-	
+
 	start := time.Now()
-	
-	// 根据服务器地址判断协议类型
-	network, timeout := h.getNetworkAndTimeout(server)
-	serverAddr := h.getServerAddress(server)
-	
-	// 对于DoH协议，使用DoH查询，isCN由上游分流决定
-	isCN := h.isCNUpstream(server)
+
 	if strings.HasPrefix(server, "https://") {
+		// DoH 查询
+		isCN := h.isCNUpstream(server)
 		resp, err = h.queryDoH(req, server, isCN)
 	} else {
+		network, timeout := h.getNetworkAndTimeout(server)
 		c = &dns.Client{
 			Timeout: timeout,
 			Net:     network,
 		}
-		
+		serverAddr := h.getServerAddress(server)
 		resp, _, err = c.Exchange(req, serverAddr)
 	}
-	
+
 	latency := time.Since(start)
 	h.metrics.GetUpstreamLatency().Observe(latency.Seconds())
 
@@ -555,17 +551,17 @@ func (h *Handler) querySingleServer(req *dns.Msg, server string) (*dns.Msg, erro
 		h.logger.Debug("DNS查询失败 %s: %v (耗时: %v)", server, err, latency)
 		return nil, err
 	}
-	
+
 	if resp == nil {
 		h.logger.Debug("DNS服务器 %s 返回空响应 (耗时: %v)", server, latency)
 		return nil, utils.NewDNSError(dns.RcodeServerFailure, "empty response from server", nil)
 	}
-	
+
 	if resp.Rcode != dns.RcodeSuccess {
 		h.logger.Debug("DNS服务器 %s 返回错误码: %s (耗时: %v)", 
 			server, dns.RcodeToString[resp.Rcode], latency)
 	}
-	
+
 	h.logger.Debug("DNS查询成功 %s: %s (耗时: %v)", 
 		server, dns.RcodeToString[resp.Rcode], latency)
 	return resp, nil
@@ -575,19 +571,14 @@ func (h *Handler) querySingleServer(req *dns.Msg, server string) (*dns.Msg, erro
 func (h *Handler) getNetworkAndTimeout(server string) (network string, timeout time.Duration) {
 	switch {
 	case strings.HasPrefix(server, "https://"):
-		// DoH (DNS over HTTPS) - 需要特殊处理
 		return "https", 5 * time.Second
 	case strings.HasPrefix(server, "tls://"):
-		// DoT (DNS over TLS)
 		return "tcp-tls", 4 * time.Second
 	case strings.HasPrefix(server, "tcp://"):
-		// TCP DNS
 		return "tcp", 3 * time.Second
 	case strings.HasPrefix(server, "udp://"):
-		// UDP DNS (显式指定)
 		return "udp", 3 * time.Second
 	default:
-		// 默认UDP DNS
 		return "udp", 3 * time.Second
 	}
 }
@@ -596,19 +587,14 @@ func (h *Handler) getNetworkAndTimeout(server string) (network string, timeout t
 func (h *Handler) getServerAddress(server string) string {
 	switch {
 	case strings.HasPrefix(server, "https://"):
-		// DoH地址保持不变
-		return server
+		return server // DoH 保持原样
 	case strings.HasPrefix(server, "tls://"):
-		// 移除tls://前缀
 		return strings.TrimPrefix(server, "tls://")
 	case strings.HasPrefix(server, "tcp://"):
-		// 移除tcp://前缀
 		return strings.TrimPrefix(server, "tcp://")
 	case strings.HasPrefix(server, "udp://"):
-		// 移除udp://前缀
 		return strings.TrimPrefix(server, "udp://")
 	default:
-		// 默认地址保持不变
 		return server
 	}
 }
@@ -624,14 +610,14 @@ func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg
 
 	// 创建结果通道
 	resultChan := make(chan result, len(servers))
-	
+
 	// 并发查询所有服务器
 	for _, server := range servers {
 		go func(srv string) {
 			start := time.Now()
 			resp, err := h.querySingleServer(req, srv)
 			latency := time.Since(start)
-			
+
 			resultChan <- result{
 				resp:    resp,
 				err:     err,
@@ -644,7 +630,7 @@ func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg
 	// 等待第一个成功响应或所有服务器都失败
 	var lastError error
 	timeout := time.After(5 * time.Second)
-	
+
 	for i := 0; i < len(servers); i++ {
 		select {
 		case res := <-resultChan:
@@ -653,7 +639,7 @@ func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg
 				return res.resp, nil
 			}
 			lastError = res.err
-			
+
 		case <-timeout:
 			h.logger.Warn("DNS查询超时")
 			return nil, utils.NewDNSError(dns.RcodeServerFailure, "query timeout", nil)
@@ -664,7 +650,7 @@ func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg
 	if lastError != nil {
 		return nil, lastError
 	}
-	
+
 	return nil, utils.NewDNSError(dns.RcodeServerFailure, "all upstream servers failed", nil)
 }
 
@@ -676,7 +662,7 @@ func (h *Handler) proxyQuery(req *dns.Msg, upstream []string) (*dns.Msg, error) 
 
 	// 获取健康的服务器列表
 	healthyServers := h.getHealthyServers(upstream)
-	
+
 	// 如果只有一个上游服务器，直接使用
 	if len(healthyServers) == 1 {
 		return h.querySingleServer(req, healthyServers[0])
@@ -732,7 +718,6 @@ func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
 		}
 	}
 
-	// 域名前处理：空值、无效跳过
 	cname = strings.TrimSpace(cname)
 	if cname == "" {
 		h.logger.Info("优选域名不能为空，需要检查")
@@ -740,70 +725,38 @@ func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
 	}
 	_, ok := dns.IsDomainName(cname)
 	if !ok {
-		// 处理非法域名
 		h.logger.Info("不是一个合法域名: %s", cname)
 		return nil
 	}
-	cname = dns.Fqdn(cname) // 确保结尾带 "."
+	cname = dns.Fqdn(cname)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	var mu sync.Mutex
+	// 用proxyQuery并发查所有cn_upstream（支持udp/tcp/DoH）
 	var addrs []netip.Addr
-	var wg sync.WaitGroup
-
 	queryTypes := []uint16{dns.TypeA, dns.TypeAAAA}
 	for _, qtype := range queryTypes {
-		for _, server := range h.config.CNUpstream {
-			wg.Add(1)
-			go func(server string, qtype uint16) {
-				defer wg.Done()
-
-				// 加 recover 防止 panic 让服务挂掉
-				defer func() {
-					if r := recover(); r != nil {
-						h.logger.Warn("panic recovered in resolveReplaceCNAME: %v\n%s", r, debug.Stack())
-					}
-				}()
-
-				m := new(dns.Msg)
-				m.SetQuestion(cname, qtype)
-				
-				// 根据服务器地址判断协议类型
-				network, timeout := h.getNetworkAndTimeout(server)
-				c := &dns.Client{
-					Timeout: timeout,
-					Net:     network,
+		m := new(dns.Msg)
+		m.SetQuestion(cname, qtype)
+		resp, err := h.proxyQuery(m, h.config.CNUpstream)
+		if err != nil || resp == nil || len(resp.Answer) == 0 {
+			h.logger.Warn("Query failed for %s (type %d): %v", cname, qtype, err)
+			continue
+		}
+		for _, a := range resp.Answer {
+			switch rr := a.(type) {
+			case *dns.A:
+				if ip, err := netip.ParseAddr(rr.A.String()); err == nil {
+					addrs = append(addrs, ip)
 				}
-				resp, _, err := c.ExchangeContext(ctx, m, server)
-				if err != nil || resp == nil || len(resp.Answer) == 0 {
-					h.logger.Warn("Query failed for %s (type %d): %v", cname, qtype, err)
-					return
+			case *dns.AAAA:
+				if ip, err := netip.ParseAddr(rr.AAAA.String()); err == nil {
+					addrs = append(addrs, ip)
 				}
-
-				mu.Lock()
-				defer mu.Unlock()
-				for _, a := range resp.Answer {
-					switch rr := a.(type) {
-					case *dns.A:
-						if ip, err := netip.ParseAddr(rr.A.String()); err == nil {
-							addrs = append(addrs, ip)
-						}
-					case *dns.AAAA:
-						if ip, err := netip.ParseAddr(rr.AAAA.String()); err == nil {
-							addrs = append(addrs, ip)
-						}
-					}
-				}
-			}(server, qtype)
+			}
 		}
 	}
-	wg.Wait()
 
 	addrs = h.uniqueAddrs(addrs)
 	if len(addrs) > 0 {
-		// 写入缓存，cost 简单用 1，TTL 使用 replaceExpire 配置
 		ok := h.cache.SetWithTTL(cname, addrs, 1, h.replaceExpire)
 		if !ok {
 			h.logger.Warn("Failed to set cache for %s", cname)
@@ -956,13 +909,26 @@ func (h *Handler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dn
 
 	replaceAddrs := h.resolveReplaceCNAME(replaceDomain)
 
+	// 新增：收集原始IP
+	var originalIPs []string
+	if resp != nil {
+		for _, rr := range resp.Answer {
+			switch v := rr.(type) {
+			case *dns.A:
+				originalIPs = append(originalIPs, v.A.String())
+			case *dns.AAAA:
+				originalIPs = append(originalIPs, v.AAAA.String())
+			}
+		}
+	}
+
 	if len(replaceAddrs) > 0 {
 		newResp := h.buildReplacedResponse(req, resp, replaceAddrs, qtype)
-		h.logger.Debug("Replaced CNAME: %s -> %v", domain, replaceAddrs)
+		h.logger.Info("【Cloudflare命中】%s，原IP: %v，替换为: %v", domain, originalIPs, replaceAddrs)
 		h.metrics.GetReplacedCount().Inc()
 		_ = w.WriteMsg(newResp)
 		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
-		h.logger.Debug("handleReplacement matched: %s -> %s", domain, ip)
+		h.logger.Debug("handleReplacement matched: %s -> %v", domain, originalIPs)
 	} else {
 		_ = w.WriteMsg(resp)
 		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
@@ -989,6 +955,16 @@ func recoverPanic(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
+// 判断是否为Cloudflare域名
+func (h *Handler) isCloudflareDomain(domain string) bool {
+	return strings.HasSuffix(domain, ".cloudflare.com") || strings.HasSuffix(domain, ".cf.cloudflare.com")
+}
+
+// 判断是否为AWS域名
+func (h *Handler) isAWSDomain(domain string) bool {
+	return strings.HasSuffix(domain, ".amazonaws.com") || strings.HasSuffix(domain, ".cloudfront.net")
+}
+
 // ServeDNS 实现dns.Handler接口
 func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	defer recoverPanic(w, req)
@@ -1007,10 +983,18 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 
-		// 1. 首先检查白名单 - 最高优先级
+		// 1. 白名单优先
 		if h.isWhitelisted(domain) {
-			h.logger.Debug("域名在白名单中: %s", domain)
-			resp, err := h.proxyQuery(req, cfg.CNUpstream)
+			isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+			var upstream []string
+			if isCN {
+				upstream = cfg.CNUpstream
+				h.logger.Info("【白名单命中-国内】%s，走国内上游", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Info("【白名单命中-国外】%s，走国外上游", domain)
+			}
+			resp, err := h.proxyQuery(req, upstream)
 			if err != nil || resp == nil {
 				h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 				_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
@@ -1021,15 +1005,34 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 
-		// 2. 检查定向域名 - 次高优先级
+		// 2. 定向域名优先
 		if rule, matched := h.matchDesignatedDomain(domain); matched {
-			h.logger.Debug("匹配定向域名: %s -> %s", domain, rule.DNS)
+			h.logger.Info("【定向域名命中】%s，使用指定DNS: %s", domain, rule.DNS)
 			h.metrics.GetDesignatedHits().Inc()
 			h.handleSpecialQuery(w, req, q, rule)
 			return
 		}
 
-		// 3. 根据地理位置选择上游DNS
+		// 3. 先用所有上游查IP，判断是否命中cf/aws网段
+		allUpstreams := append(cfg.CNUpstream, cfg.NotCNUpstream...)
+		resp, err := h.proxyQuery(req, allUpstreams)
+		if err != nil || resp == nil {
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
+			return
+		}
+		switch {
+		case h.isCloudResponse(resp, CFType):
+			h.logger.Info("【Cloudflare IP命中】%s，优选节点替换", domain)
+			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, CFType)
+			return
+		case h.isCloudResponse(resp, AWSType):
+			h.logger.Info("【AWS IP命中】%s，优选节点替换", domain)
+			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, AWSType)
+			return
+		}
+
+		// 4. geosite国内外分流
 		isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
 		var upstream []string
 		if isCN {
@@ -1039,34 +1042,18 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			upstream = cfg.NotCNUpstream
 			h.logger.Debug("使用国外DNS解析: %s", domain)
 		}
-
-		// 4. 查询上游DNS
-		resp, err := h.proxyQuery(req, upstream)
+		resp, err = h.proxyQuery(req, upstream)
 		if err != nil || resp == nil {
 			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
 			return
 		}
-
-		// 5. 检查是否为云服务响应并处理替换
-		switch {
-		case h.isCloudResponse(resp, CFType):
-			h.logger.Debug("检测到Cloudflare响应: %s", domain)
-			h.handleQuery(w, req, q, CFType, upstream)
-			return
-		case h.isCloudResponse(resp, AWSType):
-			h.logger.Debug("检测到AWS响应: %s", domain)
-			h.handleQuery(w, req, q, AWSType, upstream)
-			return
-		default:
-			// 6. 正常响应
-			if err := w.WriteMsg(resp); err != nil {
-				h.logger.Error("写入响应失败: %v", err)
-				h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
-				_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
-			} else {
-				h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
-			}
+		if err := w.WriteMsg(resp); err != nil {
+			h.logger.Error("写入响应失败: %v", err)
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+			_ = w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure))
+		} else {
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
 		}
 	}
 }
@@ -1079,4 +1066,5 @@ func (h *Handler) isCNUpstream(server string) bool {
 		}
 	}
 	return false
-} 
+}
+ 
