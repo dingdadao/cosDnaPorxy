@@ -2,11 +2,14 @@ package dns
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/geosite"
 	"cosDnaPorxy/internal/metrics"
 	"cosDnaPorxy/internal/utils"
+	"crypto/tls"
 	"fmt"
 	"github.com/dgraph-io/ristretto"
 	"github.com/miekg/dns"
@@ -431,26 +434,42 @@ func (h *Handler) queryDoH(req *dns.Msg, dohURL string, isCN bool) (*dns.Msg, er
 
 	resolverIP, err := h.resolveDoHHostname(host, isCN)
 	if err != nil {
-		h.logger.Warn("无法解析DoH域名 %s: %v", host, err)
+		h.logger.Warn("无法解析DoH域名", "host", host, "err", err)
 		return nil, err
 	}
 
+	// IPv6 地址加中括号处理
+	if ip := net.ParseIP(resolverIP); ip != nil && ip.To4() == nil {
+		resolverIP = "[" + resolverIP + "]"
+	}
+
+	// 提取端口或使用默认 443
+	port := parsedURL.Port()
+	if port == "" {
+		port = "443"
+	}
+	dialAddr := net.JoinHostPort(resolverIP, port)
+
+	// 打包 DNS 查询
 	dnsQuery, err := req.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack DNS query: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", dohURL, strings.NewReader(string(dnsQuery)))
+	httpReq, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/dns-message")
 	httpReq.Header.Set("Accept", "application/dns-message")
-	httpReq.Header.Set("User-Agent", "cosDnaPorxy/1.0")
+	httpReq.Header.Set("User-Agent", "cosDnaProxy/1.0")
+	httpReq.Header.Set("Accept-Encoding", "gzip")
 
+	// 设置超时
 	timeout, err := time.ParseDuration(dohConf.Timeout)
 	if err != nil {
+		h.logger.Warn("DoH 超时时间格式无效，使用默认值", "raw", dohConf.Timeout, "default", "5s")
 		timeout = 5 * time.Second
 	}
 
@@ -458,28 +477,44 @@ func (h *Handler) queryDoH(req *dns.Msg, dohURL string, isCN bool) (*dns.Msg, er
 		Timeout: timeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if strings.Contains(addr, host) {
-					addr = strings.Replace(addr, host, resolverIP, 1)
-				}
-				return net.Dial(network, addr)
+				// 所有 DoH 请求都定向到解析出的 IP 和端口
+				return net.Dial(network, dialAddr)
+			},
+			TLSClientConfig: &tls.Config{
+				ServerName: host, // 保证 TLS 证书校验通过
 			},
 		},
 	}
 
+	start := time.Now()
 	resp, err := client.Do(httpReq)
+	duration := time.Since(start)
+
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, fmt.Errorf("HTTP request failed: %w (耗时: %v)", err, duration)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP error: %d (耗时: %v)", resp.StatusCode, duration)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 是否是 gzip 响应
+	var reader io.Reader = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
+
 	dnsResp := new(dns.Msg)
 	if err := dnsResp.Unpack(body); err != nil {
 		return nil, fmt.Errorf("failed to unpack DNS response: %w", err)
@@ -558,11 +593,11 @@ func (h *Handler) querySingleServer(req *dns.Msg, server string) (*dns.Msg, erro
 	}
 
 	if resp.Rcode != dns.RcodeSuccess {
-		h.logger.Debug("DNS服务器 %s 返回错误码: %s (耗时: %v)", 
+		h.logger.Debug("DNS服务器 %s 返回错误码: %s (耗时: %v)",
 			server, dns.RcodeToString[resp.Rcode], latency)
 	}
 
-	h.logger.Debug("DNS查询成功 %s: %s (耗时: %v)", 
+	h.logger.Debug("DNS查询成功 %s: %s (耗时: %v)",
 		server, dns.RcodeToString[resp.Rcode], latency)
 	return resp, nil
 }
@@ -1067,4 +1102,3 @@ func (h *Handler) isCNUpstream(server string) bool {
 	}
 	return false
 }
- 

@@ -6,17 +6,18 @@ cn_upstream:
   # - "https://doh.pub/dns-query"
   - "https://dns.alidns.com/dns-query"
 not_cn_upstream:
+  - "https://doh.090227.xyz/CMLiussss"
   - "udp://10.0.0.1:1053"
 
 doh:
   cn:
     enabled: true
-    timeout: "5s"
+    timeout: "2s"
     resolver: "119.29.29.29:53"
   not_cn:
-    enabled: false
-    timeout: "5s"
-    resolver: "8.210.15.152:53"
+    enabled: true
+    timeout: "3s"
+    resolver: "119.29.29.29:53"
 
 # Cloudflare和AWS IP范围文件
 cf_mrs_file4: "./data/cloudflare-v4.txt"
@@ -28,9 +29,10 @@ aws_mrs_file64_url: "https://ip-ranges.amazonaws.com/ip-ranges.json"
 cf_mrs_cache: "./data/cloudflare.txt"
 
 # 替换域名配置
-replace_cf_domain: "cc.cloudflare.182682.xyz"
+replace_cf_domain: "cf-cname.xingpingcn.top"
 replace_aws_domain: "cc.cloudfront.182682.xyz"
 
+# cname 比较优秀的域名cf-cname.xingpingcn.top  cf.090227.xyz
 # 缓存时间配置
 cf_cache_time: 23h59m
 replace_cache_time: "30m"
@@ -40,7 +42,7 @@ whitelist_file: "./data/whitelist.txt"
 designated_domain: "./data/designated.txt"
 
 # 日志和监控
-log_level: "info"
+log_level: "debug"
 
 # TLS配置（DoH/DoT）
 doh_port: 0
