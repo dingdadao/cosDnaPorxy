@@ -15,8 +15,8 @@ import (
 func CreateRequiredDirectories() error {
 	// 只创建最必要的目录
 	requiredDirs := []string{
-		"data",              // 数据文件目录（存放下载的资源）
-		"logs",              // 日志文件目录（可选）
+		"data", // 数据文件目录（存放下载的资源）
+		"logs", // 日志文件目录（可选）
 	}
 
 	// 检查并创建每个目录（如果不存在）
@@ -86,7 +86,6 @@ cf_cache_time: 23h59m
 replace_cache_time: "30m"
 
 # 域名规则文件
-whitelist_file: "./configs/whitelist.txt"
 designated_domain: "./configs/designated.txt"
 
 # 日志和监控
@@ -114,23 +113,7 @@ geosite_group: "GEOLOCATION-CN"
 	} else {
 		fmt.Printf("✅ 配置文件已存在: %s\n", configPath)
 	}
-
-	// 创建默认白名单文件
-	whitelistPath := "configs/whitelist.txt"
-	if _, err := os.Stat(whitelistPath); os.IsNotExist(err) {
-		defaultWhitelist := `# 白名单域名（不进行任何处理）
-# 每行一个域名
-example.com
-localhost
-`
-		if err := os.WriteFile(whitelistPath, []byte(defaultWhitelist), 0644); err != nil {
-			return fmt.Errorf("failed to create whitelist file: %w", err)
-		}
-		fmt.Printf("📄 创建白名单文件: %s\n", whitelistPath)
-	} else {
-		fmt.Printf("✅ 白名单文件已存在: %s\n", whitelistPath)
-	}
-
+	
 	// 创建默认定向域名文件
 	designatedPath := "configs/designated.txt"
 	if _, err := os.Stat(designatedPath); os.IsNotExist(err) {
@@ -154,7 +137,7 @@ wechat.com 119.29.29.29:53
 // CreateTestScripts 创建基本的测试脚本
 func CreateTestScripts() error {
 	testDir := "scripts/test"
-	
+
 	// 基础DNS测试脚本
 	basicTestScript := `#!/bin/bash
 echo "=== 基础DNS测试 ==="
@@ -201,8 +184,8 @@ func InitResourceFiles(cfg *config.Config) error {
 
 	// 2. 资源文件列表（路径+URL）
 	resourceList := []struct {
-		File string
-		URL  string
+		File  string
+		URL   string
 		IsAWS bool
 	}{
 		{cfg.GeositeFile, cfg.GeositeURL, false},
@@ -290,8 +273,12 @@ func downloadAndParseAWSIPRangesToFile(url, filePath string) error {
 		return fmt.Errorf("failed to read JSON data: %w", err)
 	}
 	var awsData struct {
-		Prefixes []struct{ IPPrefix string `json:"ip_prefix"` }
-		IPv6Prefixes []struct{ IPv6Prefix string `json:"ipv6_prefix"` }
+		Prefixes []struct {
+			IPPrefix string `json:"ip_prefix"`
+		}
+		IPv6Prefixes []struct {
+			IPv6Prefix string `json:"ipv6_prefix"`
+		}
 	}
 	if err := json.Unmarshal(jsonData, &awsData); err != nil {
 		return fmt.Errorf("failed to parse JSON: %w", err)
@@ -312,4 +299,4 @@ func downloadAndParseAWSIPRangesToFile(url, filePath string) error {
 		}
 	}
 	return nil
-} 
+}

@@ -47,7 +47,6 @@ cache:
 # 域名规则文件（统一到data目录）
 # 后续版本会移除白名单，目前已经修改逻辑了，全部用指定designated，可以指定dns 也可以直接使用cn_upstream/not_cn_upstream，
 #优化匹配 *.aaa.* 可以写成aaa cn_upstream
-whitelist_file: "./data/whitelist.txt"
 designated_domain: "./data/designated.txt"
 
 # 日志和监控

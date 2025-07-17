@@ -88,7 +88,6 @@ dnsproxy
 cloudflare-v4.txt
 cloudflare-v6.txt
 designated.txt
-whitelist.txt
 fullchain.pem
 privkey.pem
 build/dnsproxy

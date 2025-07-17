@@ -92,7 +92,7 @@ func NewHandler(cfg *config.Config) *Handler {
 	handler.metrics.Register()
 
 	// 初始化加载数据
-	handler.loadWhitelist()
+	//handler.loadWhitelist()
 	handler.loadDesignatedDomains()
 	handler.updateNetworks(cfg)
 
@@ -200,7 +200,7 @@ func (h *Handler) loadDesignatedDomains() {
 			regexPattern = strings.ReplaceAll(regexPattern, `\\*`, ".*")
 		} else if strings.HasPrefix(rawPattern, "/") && strings.HasSuffix(rawPattern, "/") && len(rawPattern) > 2 {
 			// 允许用户直接写正则，如 /mgstage.*/
-			regexPattern = rawPattern[1:len(rawPattern)-1]
+			regexPattern = rawPattern[1 : len(rawPattern)-1]
 		} else {
 			// 关键词自动模糊匹配
 			regexPattern = ".*" + regexp.QuoteMeta(rawPattern) + ".*"
@@ -309,8 +309,8 @@ func (h *Handler) runBackgroundTasks(cfg *config.Config) {
 		case <-cfTicker.C:
 			h.updateNetworks(cfg)
 		case <-reloadTicker.C:
-			h.loadWhitelist()
 			h.loadDesignatedDomains()
+			//h.loadWhitelist()
 		case <-geositeTicker.C:
 			h.geositeManager.UpdateGeoSite()
 		}
