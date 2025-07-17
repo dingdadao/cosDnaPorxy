@@ -3,11 +3,10 @@ metrics_port: 0
 
 # 上游DNS服务器配置 - 直接使用DoH
 cn_upstream:
-  # - "https://doh.pub/dns-query"
-  - "https://dns.alidns.com/dns-query"
+  - "https://doh.pub/dns-query"
+  - "udp://223.5.5.5:53"
 not_cn_upstream:
-  - "https://doh.090227.xyz/CMLiussss"
-  - "udp://10.0.0.1:1053"
+  - "https://dns.alidns.com/dns-query"
 
 doh:
   cn:
@@ -37,7 +36,17 @@ replace_aws_domain: "cc.cloudfront.182682.xyz"
 cf_cache_time: 23h59m
 replace_cache_time: "30m"
 
+# 缓存配置
+cache:
+  max_size: 100MB # 最大缓存大小
+  dns_ttl_min: 30s # DNS缓存最小TTL
+  dns_ttl_max: 1h # DNS缓存最大TTL
+  health_check_ttl: 15m # 健康检查缓存TTL
+  replace_cname_ttl: 30m
+
 # 域名规则文件（统一到data目录）
+# 后续版本会移除白名单，目前已经修改逻辑了，全部用指定designated，可以指定dns 也可以直接使用cn_upstream/not_cn_upstream，
+#优化匹配 *.aaa.* 可以写成aaa cn_upstream
 whitelist_file: "./data/whitelist.txt"
 designated_domain: "./data/designated.txt"
 

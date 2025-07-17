@@ -16,10 +16,12 @@ const (
 )
 
 // DesignatedDomain 定向域名配置
+// UpstreamType: "cn_upstream"/"not_cn_upstream"/""(具体IP)
 type DesignatedDomain struct {
-	Domain string
-	DNS    string
-	Regex  interface{} // *regexp.Regexp
+	Domain       string
+	DNS          string
+	Regex        interface{} // *regexp.Regexp
+	UpstreamType string      // "cn_upstream"/"not_cn_upstream"/""
 }
 
 // ServerHealth DNS服务器健康状态

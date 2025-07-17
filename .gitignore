@@ -92,4 +92,4 @@ whitelist.txt
 fullchain.pem
 privkey.pem
 build/dnsproxy
-data
+/scripts/shell/updatecartv2.1.sh

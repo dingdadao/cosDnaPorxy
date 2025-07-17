@@ -29,35 +29,45 @@ type DoHGroupConfig struct {
 	NotCN DoHConfig `yaml:"not_cn"`
 }
 
+// CacheConfig 缓存配置
+type CacheConfig struct {
+	MaxSize          string `yaml:"max_size"`
+	DNSTTLMin        string `yaml:"dns_ttl_min"`
+	DNSTTLMax        string `yaml:"dns_ttl_max"`
+	HealthCheckTTL   string `yaml:"health_check_ttl"`
+	ReplaceCNameTTL  string `yaml:"replace_cname_ttl"`
+}
+
 // Config 配置结构体
 type Config struct {
-	ListenPort       int        `yaml:"listen_port"`
-	CNUpstream       []string   `yaml:"cn_upstream"`
-	NotCNUpstream    []string   `yaml:"not_cn_upstream"`
-	GeositeGroup     string     `yaml:"geosite_group"`
-	CFMrsFile4       string     `yaml:"cf_mrs_file4"`
-	CFMrsFile4URL    string     `yaml:"cf_mrs_file4_url"`
-	CFMrsFile6       string     `yaml:"cf_mrs_file6"`
-	CFMrsFile6URL    string     `yaml:"cf_mrs_file6_url"`
-	AWSMrsFile46     string     `yaml:"aws_mrs_file64"`
-	AWSMrsFile46URL  string     `yaml:"aws_mrs_file64_url"`
-	CFMrsCache       string     `yaml:"cf_mrs_cache"`
-	ReplaceCFDomain  string     `yaml:"replace_cf_domain"`
-	ReplaceAWSDomain string     `yaml:"replace_aws_domain"`
-	CFCacheTime      string     `yaml:"cf_cache_time"`
-	ReplaceCacheTime string     `yaml:"replace_cache_time"`
-	WhitelistFile    string     `yaml:"whitelist_file"`
-	DesignatedDomain string     `yaml:"designated_domain"`
-	LogLevel         string     `yaml:"log_level"`
-	MetricsPort      int        `yaml:"metrics_port"`
-	DoTPort          int        `yaml:"dot_port"`
-	DoHPort          int        `yaml:"doh_port"`
-	TLSCertFile      string     `yaml:"tls_cert_file"`
-	TLSKeyFile       string     `yaml:"tls_key_file"`
-	GeositeFile      string     `yaml:"geosite_file"`
-	GeositeURL       string     `yaml:"geosite_url"`
-	GeositeRefresh   string     `yaml:"geosite_refresh"`
-	DoH              DoHGroupConfig  `yaml:"doh"`
+	ListenPort       int           `yaml:"listen_port"`
+	CNUpstream       []string      `yaml:"cn_upstream"`
+	NotCNUpstream    []string      `yaml:"not_cn_upstream"`
+	GeositeGroup     string        `yaml:"geosite_group"`
+	CFMrsFile4       string        `yaml:"cf_mrs_file4"`
+	CFMrsFile4URL    string        `yaml:"cf_mrs_file4_url"`
+	CFMrsFile6       string        `yaml:"cf_mrs_file6"`
+	CFMrsFile6URL    string        `yaml:"cf_mrs_file6_url"`
+	AWSMrsFile46     string        `yaml:"aws_mrs_file64"`
+	AWSMrsFile46URL  string        `yaml:"aws_mrs_file64_url"`
+	CFMrsCache       string        `yaml:"cf_mrs_cache"`
+	ReplaceCFDomain  string        `yaml:"replace_cf_domain"`
+	ReplaceAWSDomain string        `yaml:"replace_aws_domain"`
+	CFCacheTime      string        `yaml:"cf_cache_time"`
+	ReplaceCacheTime string        `yaml:"replace_cache_time"`
+	WhitelistFile    string        `yaml:"whitelist_file"`
+	DesignatedDomain string        `yaml:"designated_domain"`
+	LogLevel         string        `yaml:"log_level"`
+	MetricsPort      int           `yaml:"metrics_port"`
+	DoTPort          int           `yaml:"dot_port"`
+	DoHPort          int           `yaml:"doh_port"`
+	TLSCertFile      string        `yaml:"tls_cert_file"`
+	TLSKeyFile       string        `yaml:"tls_key_file"`
+	GeositeFile      string        `yaml:"geosite_file"`
+	GeositeURL       string        `yaml:"geosite_url"`
+	GeositeRefresh   string        `yaml:"geosite_refresh"`
+	DoH              DoHGroupConfig `yaml:"doh"`
+	Cache            CacheConfig   `yaml:"cache"`
 }
 
 // LoadConfig 加载配置文件
