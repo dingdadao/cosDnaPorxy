@@ -1,9 +1,11 @@
 package dns
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,7 +13,7 @@ import (
 
 // 常量定义
 const (
-	CFType = 1
+	CFType  = 1
 	AWSType = 2
 )
 
@@ -132,4 +134,118 @@ func LoadAWSIPRanges(path string, set4, set6 *NetIPX) error {
 	}
 
 	return nil
-} 
+}
+
+// 域名标签结构体
+// Tag: 标签（如designated, cn, not_cn, cloudflare, aws, unknown等）
+// Upstream: 分流策略
+// Updated: 更新时间戳
+type DomainTag struct {
+	Tag      string
+	Upstream string
+	Updated  int64
+}
+
+// 标签系统全局变量
+var (
+	TagMap   = make(map[string]*DomainTag) // 域名->标签
+	TagMapMu sync.RWMutex
+	TagDirty = make(map[string]struct{}) // 本次运行新增/变更的域名
+)
+
+// 极简标签常量
+const (
+	TAG_UNKNOWN   = 0
+	TAG_DINGXIANG = 1
+	TAG_CN        = 2
+	TAG_NOT_CN    = 3
+	TAG_CF        = 4
+	TAG_AWS       = 5
+)
+
+// 极简标签map
+var (
+	TagMapSimple   = make(map[string]int) // 域名->标签
+	TagDirtySimple = make(map[string]struct{})
+)
+
+const (
+	tagSimpleCSVFile    = "data/domain_tags_simple.csv"
+	tagSimpleFlushBatch = 1
+)
+
+// 冷加载极简标签
+func LoadDomainTagsSimple() error {
+	f, err := os.Open(tagSimpleCSVFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	reader := csv.NewReader(f)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if len(rec) < 2 {
+			continue
+		}
+		tag := TAG_UNKNOWN
+		if v, err := strconv.Atoi(rec[1]); err == nil {
+			tag = v
+		}
+		TagMapSimple[rec[0]] = tag
+	}
+	return nil
+}
+
+// 追加标签并标记为dirty
+func AddOrUpdateDomainTagSimple(domain string, tag int) {
+	TagMapSimple[domain] = tag
+	TagDirtySimple[domain] = struct{}{}
+	if len(TagDirtySimple) >= tagSimpleFlushBatch {
+		go FlushDomainTagsSimpleToFile()
+	}
+}
+
+// 批量写入并释放map
+func FlushDomainTagsSimpleToFile() {
+	if len(TagDirtySimple) == 0 {
+		return
+	}
+	// 先读出原有数据，合并写回
+	existing := make(map[string]string)
+	if f, err := os.Open(tagSimpleCSVFile); err == nil {
+		reader := csv.NewReader(f)
+		records, _ := reader.ReadAll()
+		for _, rec := range records {
+			if len(rec) < 2 {
+				continue
+			}
+			existing[rec[0]] = rec[1]
+		}
+		f.Close()
+	}
+	// 更新dirty部分
+	for domain := range TagDirtySimple {
+		tag := TagMapSimple[domain]
+		existing[domain] = strconv.Itoa(tag)
+	}
+	// 写回全部
+	f, err := os.Create(tagSimpleCSVFile)
+	if err != nil {
+		return
+	}
+	writer := csv.NewWriter(f)
+	for domain, tag := range existing {
+		_ = writer.Write([]string{domain, tag})
+	}
+	writer.Flush()
+	f.Close()
+	// 清空map
+	TagMapSimple = make(map[string]int)
+	TagDirtySimple = make(map[string]struct{})
+}

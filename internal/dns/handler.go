@@ -10,6 +10,7 @@ import (
 	"cosDnaPorxy/internal/metrics"
 	"cosDnaPorxy/internal/utils"
 	"crypto/tls"
+	"encoding/csv"
 	"fmt"
 	"github.com/dgraph-io/ristretto"
 	"github.com/miekg/dns"
@@ -92,7 +93,7 @@ func NewHandler(cfg *config.Config) *Handler {
 	handler.metrics.Register()
 
 	// 初始化加载数据
-	//handler.loadWhitelist()
+	handler.loadWhitelist()
 	handler.loadDesignatedDomains()
 	handler.updateNetworks(cfg)
 
@@ -309,8 +310,8 @@ func (h *Handler) runBackgroundTasks(cfg *config.Config) {
 		case <-cfTicker.C:
 			h.updateNetworks(cfg)
 		case <-reloadTicker.C:
+			h.loadWhitelist()
 			h.loadDesignatedDomains()
-			//h.loadWhitelist()
 		case <-geositeTicker.C:
 			h.geositeManager.UpdateGeoSite()
 		}
@@ -1187,37 +1188,11 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 
-		// 1 白名单优先（已注释）
-		// if h.isWhitelisted(domain) {
-		// 	isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
-		// 	var upstream []string
-		// 	if isCN {
-		// 		upstream = cfg.CNUpstream
-		// 		h.logger.Info("【白名单命中-国内】%s，走国内上游", domain)
-		// 	} else {
-		// 		upstream = cfg.NotCNUpstream
-		// 		h.logger.Info("【白名单命中-国外】%s，走国外上游", domain)
-		// 	}
-		// 	resp, err := h.proxyQuery(req, upstream)
-		// 	if err != nil || resp == nil {
-		// 		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
-		// 		if err := w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure)); err != nil {
-		// 			h.logger.Error("WriteMsg失败: %v", err)
-		// 		}
-		// 		return
-		// 	}
-		// 	// 设置缓存
-		// 	h.setCachedResponse(req, resp)
-		// 	if err := w.WriteMsg(resp); err != nil {
-		// 		h.logger.Error("WriteMsg失败: %v", err)
-		// 	}
-		// 	h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "whitelist").Inc()
-		// 	return
-		// }
-
 		// 2. 定向域名优先
 		if rule, matched := h.matchDesignatedDomain(domain); matched {
 			h.logger.Info("【定向域名命中】%s，使用指定DNS: %s", domain, rule.DNS)
+			AddOrUpdateDomainTagSimple(domain, TAG_DINGXIANG)
+			h.logger.Info("标签系统：%s 标记为定向域名", domain)
 			h.metrics.GetDesignatedHits().Inc()
 			h.handleSpecialQuery(w, req, q, rule)
 			return
@@ -1233,13 +1208,15 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 			return
 		}
-		switch {
-		case h.isCloudResponse(resp, CFType):
-			h.logger.Info("【Cloudflare IP命中】%s，优选节点替换", domain)
+		if h.isCloudResponse(resp, CFType) {
+			AddOrUpdateDomainTagSimple(domain, TAG_CF)
+			h.logger.Info("标签系统：%s 标记为Cloudflare", domain)
 			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, CFType)
 			return
-		case h.isCloudResponse(resp, AWSType):
-			h.logger.Info("【AWS IP命中】%s，优选节点替换", domain)
+		}
+		if h.isCloudResponse(resp, AWSType) {
+			AddOrUpdateDomainTagSimple(domain, TAG_AWS)
+			h.logger.Info("标签系统：%s 标记为AWS", domain)
 			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, AWSType)
 			return
 		}
@@ -1250,9 +1227,13 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		if isCN {
 			upstream = cfg.CNUpstream
 			h.logger.Debug("使用国内DNS解析: %s", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_CN)
+			h.logger.Info("标签系统：%s 标记为国内", domain)
 		} else {
 			upstream = cfg.NotCNUpstream
 			h.logger.Debug("使用国外DNS解析: %s", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
+			h.logger.Info("标签系统：%s 标记为国外", domain)
 		}
 		resp, err = h.proxyQuery(req, upstream)
 		if err != nil || resp == nil {
@@ -1320,4 +1301,104 @@ func (h *Handler) isCNUpstream(server string) bool {
 		}
 	}
 	return false
+}
+
+// 标签系统相关常量
+const (
+	tagCSVFile    = "data/domain_tags.csv"
+	tagFlushBatch = 200
+)
+
+// 冷加载标签系统
+func LoadDomainTags() error {
+	f, err := os.Open(tagCSVFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 文件不存在视为无标签
+		}
+		return err
+	}
+	defer f.Close()
+	reader := csv.NewReader(f)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return err
+	}
+	TagMapMu.Lock()
+	defer TagMapMu.Unlock()
+	for _, rec := range records {
+		if len(rec) < 3 {
+			continue
+		}
+		TagMap[rec[0]] = &DomainTag{
+			Tag:      rec[1],
+			Upstream: rec[2],
+			Updated:  time.Now().Unix(),
+		}
+	}
+	return nil
+}
+
+// 查询标签系统
+func QueryDomainTag(domain string) (*DomainTag, bool) {
+	TagMapMu.RLock()
+	tag, ok := TagMap[domain]
+	TagMapMu.RUnlock()
+	return tag, ok
+}
+
+// 追加标签并标记为dirty
+func AddOrUpdateDomainTag(domain, tag, upstream string) {
+	TagMapMu.Lock()
+	TagMap[domain] = &DomainTag{
+		Tag:      tag,
+		Upstream: upstream,
+		Updated:  time.Now().Unix(),
+	}
+	TagDirty[domain] = struct{}{}
+	TagMapMu.Unlock()
+	// 异步批量写入
+	if len(TagDirty) >= tagFlushBatch {
+		go FlushDomainTagsToFile()
+	}
+}
+
+// 异步批量写入标签到CSV
+func FlushDomainTagsToFile() {
+	TagMapMu.Lock()
+	defer TagMapMu.Unlock()
+	if len(TagDirty) == 0 {
+		return
+	}
+	// 先读出原有数据，合并写回
+	existing := make(map[string][]string)
+	if f, err := os.Open(tagCSVFile); err == nil {
+		reader := csv.NewReader(f)
+		records, _ := reader.ReadAll()
+		for _, rec := range records {
+			if len(rec) < 3 {
+				continue
+			}
+			existing[rec[0]] = rec
+		}
+		f.Close()
+	}
+	// 更新dirty部分
+	for domain := range TagDirty {
+		tag := TagMap[domain]
+		existing[domain] = []string{domain, tag.Tag, tag.Upstream}
+	}
+	// 写回全部
+	f, err := os.Create(tagCSVFile)
+	if err != nil {
+		return
+	}
+	writer := csv.NewWriter(f)
+	for _, rec := range existing {
+		_ = writer.Write(rec)
+	}
+	writer.Flush()
+	f.Close()
+	// 清空dirty
+	TagDirty = make(map[string]struct{})
 }
