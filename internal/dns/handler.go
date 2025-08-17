@@ -1,29 +1,19 @@
 package dns
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/geosite"
 	"cosDnaPorxy/internal/metrics"
 	"cosDnaPorxy/internal/utils"
-	"crypto/tls"
-	"encoding/csv"
 	"fmt"
-	"github.com/dgraph-io/ristretto"
 	"github.com/miekg/dns"
-	"io"
 	"log"
-	"net"
-	"net/http"
 	"net/netip"
-	"net/url"
-	"os"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +23,7 @@ type Handler struct {
 	logger            *utils.Logger
 	geositeManager    *geosite.Manager
 	metrics           *metrics.Collector
-	cache             *ristretto.Cache
+	hotCache          *HotCache              // 使用热点缓存替换原来的ristretto缓存
 	cfNetSet4         *NetIPX
 	cfNetSet6         *NetIPX
 	aWSNetSet4        *NetIPX
@@ -45,7 +35,25 @@ type Handler struct {
 	replaceExpire     time.Duration
 	serverHealth      map[string]*ServerHealth
 	cacheStatsCounter int // 缓存统计计数器
+
+	// 连接池
+	dotPool *DoTConnPool
+	dohPool *DoHConnPool
+
+	// 异步缓存刷新
+	asyncRefreshChan chan *AsyncRefreshTask
+	asyncWorkers     int32 // 当前活跃的异步工作线程数
+
 	sync.RWMutex
+}
+
+// AsyncRefreshTask 异步刷新任务
+type AsyncRefreshTask struct {
+	Domain      string
+	QType       uint16
+	OriginalTTL time.Duration
+	ExpireTime  time.Time
+	Handler     *Handler
 }
 
 // NewHandler 创建新的DNS处理器
@@ -60,25 +68,33 @@ func NewHandler(cfg *config.Config) *Handler {
 		log.Fatalf("Invalid replace cache time: %v", err)
 	}
 
-	// 优化缓存配置 - 增加缓存大小和性能
-	cache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 100,      // 增加计数器数量 (10x 预期缓存项数)
-		MaxCost:     10 << 20, // 增加最大成本到100MB
-		BufferItems: 64,       // 保持默认值
-		Metrics:     true,     // 启用指标收集
-		OnEvict: func(item *ristretto.Item) {
-			log.Printf("[缓存] 项目被驱逐: key=%v, cost=%d", item.Key, item.Cost)
-		},
-	})
-	if err != nil {
-		log.Fatalf("Failed to create cache: %v", err)
+	// 创建热点缓存 - 固定大小，只保留最热门的域名
+	var maxCacheSize int
+	if cfg.Cache.MaxSize != "" {
+		// 解析配置中的缓存大小，如 "50MB" -> 5000个域名（更保守的估算）
+		if size, err := parseCacheSize(cfg.Cache.MaxSize); err == nil {
+			// 假设每个域名平均占用10KB内存，更保守的估算
+			maxCacheSize = int(size / (10 * 1024)) // 每10KB对应1个域名
+		}
 	}
+	if maxCacheSize <= 0 {
+		maxCacheSize = 5000 // 默认5000个域名，更保守
+	}
+	
+	// 限制最大缓存大小，防止内存爆炸
+	if maxCacheSize > 10000 {
+		maxCacheSize = 10000
+		log.Printf("缓存大小超过限制，已调整为: %d 个域名", maxCacheSize)
+	}
+	
+	hotCache := NewHotCache(maxCacheSize)
+	log.Printf("创建热点缓存，最大容量: %d 个域名", maxCacheSize)
 
 	handler := &Handler{
 		config:            cfg,
 		logger:            utils.NewLogger(cfg.LogLevel),
 		metrics:           metrics.NewCollector(),
-		cache:             cache,
+		hotCache:          hotCache,
 		cfNetSet4:         &NetIPX{},
 		cfNetSet6:         &NetIPX{},
 		aWSNetSet4:        &NetIPX{},
@@ -87,6 +103,14 @@ func NewHandler(cfg *config.Config) *Handler {
 		replaceExpire:     replaceExpire,
 		serverHealth:      make(map[string]*ServerHealth),
 		cacheStatsCounter: 10000, // 初始化缓存统计计数器
+
+		// 初始化连接池
+		dotPool: NewDoTConnPool(),
+		dohPool: NewDoHConnPool(),
+
+		// 初始化异步刷新 - 增加缓冲区大小，防止阻塞
+		asyncRefreshChan: make(chan *AsyncRefreshTask, 5000), // 增加缓冲到5000个任务
+		asyncWorkers:     0,
 	}
 
 	// 注册Prometheus指标
@@ -107,898 +131,54 @@ func NewHandler(cfg *config.Config) *Handler {
 	// 启动后台更新任务
 	go handler.runBackgroundTasks(cfg)
 
+	// 启动异步健康检查（不影响查询性能）
+	go handler.runAsyncHealthCheck()
+
+	// 启动异步缓存刷新工作线程
+	if cfg.Cache.EnableAsyncRefresh {
+		handler.startAsyncRefreshWorkers(cfg.Cache.MaxAsyncWorkers)
+	}
+
+	// 启动标签系统清理
+	go handler.periodicTagCleanup()
+	
+	// 启动内存监控
+	handler.StartMemoryMonitor()
+	
+	// 启动主动缓存清理
+	go handler.aggressiveCacheCleanup()
+
 	return handler
 }
 
-// loadWhitelist 加载白名单
-func (h *Handler) loadWhitelist() {
-	if h.config.WhitelistFile == "" {
-		h.logger.Warn("Whitelist file not configured")
-		return
+// parseCacheSize 解析缓存大小配置，如 "100MB" -> 100*1024*1024
+func parseCacheSize(sizeStr string) (int64, error) {
+	// 这里简化处理，实际可以根据需要支持更多单位
+	if len(sizeStr) < 2 {
+		return 0, fmt.Errorf("invalid cache size format")
 	}
-
-	// 尝试创建文件（如果不存在）
-	if _, err := os.Stat(h.config.WhitelistFile); os.IsNotExist(err) {
-		h.logger.Warn("Whitelist file does not exist, creating: %s", h.config.WhitelistFile)
-		err := os.WriteFile(h.config.WhitelistFile, []byte("# Whitelist domains\nexample.com\n"), 0644)
-		if err != nil {
-			h.logger.Error("Failed to create whitelist file: %v", err)
-			return
-		}
-	}
-
-	f, err := os.Open(h.config.WhitelistFile)
-	if err != nil {
-		h.logger.Error("Failed to open whitelist: %v", err)
-		return
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	var newList []string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			newList = append(newList, line)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		h.logger.Error("Error reading whitelist file: %v", err)
-		return
-	}
-
-	h.Lock()
-	h.whitelistPattern = newList
-	h.Unlock()
-
-	h.logger.Info("✅ Whitelist updated successfully: %d entries", len(newList))
-}
-
-// loadDesignatedDomains 加载定向域名规则
-func (h *Handler) loadDesignatedDomains() {
-	if h.config.DesignatedDomain == "" {
-		h.logger.Warn("Designated domains file not configured")
-		return
-	}
-
-	// 文件不存在则创建默认
-	if _, err := os.Stat(h.config.DesignatedDomain); os.IsNotExist(err) {
-		h.logger.Warn("Designated domains file not found, creating: %s", h.config.DesignatedDomain)
-		defaultContent := []byte("# Format: domain dns_server\n*.example.com 8.8.8.8\n")
-		if err := os.WriteFile(h.config.DesignatedDomain, defaultContent, 0644); err != nil {
-			h.logger.Error("Failed to create designated domains file: %v", err)
-			return
-		}
-	}
-
-	f, err := os.Open(h.config.DesignatedDomain)
-	if err != nil {
-		h.logger.Error("Failed to open designated domains file: %v", err)
-		return
-	}
-	defer f.Close()
-
-	var newRules []DesignatedDomain
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			h.logger.Warn("Invalid line format, skipping: %s", line)
-			continue
-		}
-
-		rawPattern := strings.ToLower(parts[0])
-		var regexPattern string
-		if strings.Contains(rawPattern, "*") {
-			// 通配符转正则
-			regexPattern = "^" + regexp.QuoteMeta(rawPattern) + "$"
-			regexPattern = strings.ReplaceAll(regexPattern, `\\*`, ".*")
-		} else if strings.HasPrefix(rawPattern, "/") && strings.HasSuffix(rawPattern, "/") && len(rawPattern) > 2 {
-			// 允许用户直接写正则，如 /mgstage.*/
-			regexPattern = rawPattern[1 : len(rawPattern)-1]
-		} else {
-			// 关键词自动模糊匹配
-			regexPattern = ".*" + regexp.QuoteMeta(rawPattern) + ".*"
-		}
-
-		re, err := regexp.Compile(regexPattern)
-		if err != nil {
-			h.logger.Warn("Invalid regex for pattern: %s (%v)", rawPattern, err)
-			continue
-		}
-
-		upstreamType := ""
-		upstreamVal := strings.ToLower(parts[1])
-		if upstreamVal == "cn_upstream" || upstreamVal == "not_cn_upstream" {
-			upstreamType = upstreamVal
-		}
-
-		newRules = append(newRules, DesignatedDomain{
-			Domain:       rawPattern,
-			DNS:          parts[1],
-			Regex:        re,
-			UpstreamType: upstreamType,
-		})
-	}
-
-	if err := scanner.Err(); err != nil {
-		h.logger.Error("Error reading designated domains file: %v", err)
-		return
-	}
-
-	h.Lock()
-	h.designatedRules = newRules
-	h.Unlock()
-
-	h.logger.Info("✅ Designated domains updated successfully: %d entries", len(newRules))
-}
-
-// updateNetworks 更新网络列表
-func (h *Handler) updateNetworks(cfg *config.Config) {
-	h.Lock()
-	defer h.Unlock()
-
-	if time.Since(h.lastCFUpdate) < h.cfExpire {
-		return
-	}
-
-	h.logger.Info("Loading Cloudflare and AWS IP ranges from local cache...")
-
-	cfCachePath4 := cfg.CFMrsFile4
-	cfCachePath6 := cfg.CFMrsFile6
-	aWSCachePath := cfg.AWSMrsFile46
-
-	// 加载 Cloudflare IPv4
-	if _, err := os.Stat(cfCachePath4); err == nil {
-		if err := h.cfNetSet4.LoadFromFile(cfCachePath4); err != nil {
-			h.logger.Error("Failed to load IPv4 ranges: %v", err)
-		} else {
-			h.logger.Info("Loaded %d IPv4 prefixes", len(h.cfNetSet4.list))
-		}
-	} else {
-		h.logger.Warn("IPv4 cache file not found: %s", cfCachePath4)
-	}
-
-	// 加载 Cloudflare IPv6
-	if _, err := os.Stat(cfCachePath6); err == nil {
-		if err := h.cfNetSet6.LoadFromFile(cfCachePath6); err != nil {
-			h.logger.Error("Failed to load IPv6 ranges: %v", err)
-		} else {
-			h.logger.Info("Loaded %d IPv6 prefixes", len(h.cfNetSet6.list))
-		}
-	} else {
-		h.logger.Warn("IPv6 cache file not found: %s", cfCachePath6)
-	}
-
-	// 加载 AWS IP 段
-	if _, err := os.Stat(aWSCachePath); err == nil {
-		err := LoadAWSIPRanges(aWSCachePath, h.aWSNetSet4, h.aWSNetSet6)
-		if err != nil {
-			h.logger.Error("Failed to load AWS IP ranges: %v", err)
-		} else {
-			h.logger.Info("Loaded %d IPv4 prefixes and %d IPv6 prefixes from AWS",
-				len(h.aWSNetSet4.list), len(h.aWSNetSet6.list))
-		}
-	} else {
-		h.logger.Warn("AWS cache file not found: %s", aWSCachePath)
-	}
-
-	h.lastCFUpdate = time.Now()
-}
-
-// runBackgroundTasks 运行后台任务
-func (h *Handler) runBackgroundTasks(cfg *config.Config) {
-	// 定时更新Cloudflare网络列表
-	cfTicker := time.NewTicker(5 * time.Minute)
-	defer cfTicker.Stop()
-
-	// 定时重新加载白名单和定向域名
-	reloadTicker := time.NewTicker(1 * time.Minute)
-	defer reloadTicker.Stop()
-
-	geositeTicker := time.NewTicker(h.geositeManager.GetRefreshDuration())
-	defer geositeTicker.Stop()
-
-	for {
-		select {
-		case <-cfTicker.C:
-			h.updateNetworks(cfg)
-		case <-reloadTicker.C:
-			h.loadWhitelist()
-			h.loadDesignatedDomains()
-		case <-geositeTicker.C:
-			h.geositeManager.UpdateGeoSite()
-		}
-	}
-}
-
-// isWhitelisted 检查域名是否在白名单中
-func (h *Handler) isWhitelisted(qname string) bool {
-	domain := strings.ToLower(strings.TrimSuffix(qname, "."))
-	h.RLock()
-	defer h.RUnlock()
-
-	for _, pattern := range h.whitelistPattern {
-		pattern = strings.ToLower(pattern)
-		if utils.MatchDomain(pattern, domain) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchDesignatedDomain 匹配定向域名
-func (h *Handler) matchDesignatedDomain(qname string) (*DesignatedDomain, bool) {
-	domain := strings.ToLower(strings.TrimSuffix(qname, "."))
-	h.RLock()
-	defer h.RUnlock()
-
-	for _, rule := range h.designatedRules {
-		if rule.Regex != nil {
-			if rule.Regex.(*regexp.Regexp).MatchString(domain) {
-				h.logger.Debug("Match designated domain: %s via pattern %s", domain, rule.Domain)
-				return &rule, true
-			}
-		} else {
-			pattern := strings.ToLower(rule.Domain)
-			if utils.MatchDomain(pattern, domain) {
-				h.logger.Debug("Match designated domain: %s via pattern %s", domain, rule.Domain)
-				return &rule, true
-			}
-		}
-	}
-	return nil, false
-}
-
-// checkServerHealth 检查服务器健康状态
-func (h *Handler) checkServerHealth(server string) bool {
-	// 生成缓存键
-	cacheKey := fmt.Sprintf("health:%s", server)
-
-	// 尝试从缓存获取健康状态
-	if cached, found := h.cache.Get(cacheKey); found {
-		if health, ok := cached.(bool); ok {
-			h.logger.Debug("健康状态缓存命中: %s -> %v", server, health)
-			return health
-		}
-	}
-
-	// 缓存未命中，执行健康检查
-	h.logger.Debug("健康状态缓存未命中，执行检查: %s", server)
-
-	h.Lock()
-	health, exists := h.serverHealth[server]
-	if !exists {
-		health = &ServerHealth{}
-		h.serverHealth[server] = health
-	}
-	h.Unlock()
-
-	health.Lock()
-	defer health.Unlock()
-
-	// 如果距离上次检查时间太短，直接返回上次结果
-	if time.Since(health.LastCheck) < 5*time.Second {
-		return health.IsHealthy
-	}
-
-	// 执行健康检查
-	isHealthy := h.performHealthCheck(server)
-
-	// 更新健康状态
-	health.LastCheck = time.Now()
-	health.IsHealthy = isHealthy
-
-	if isHealthy {
-		health.SuccessCount++
-		health.FailureCount = 0
-	} else {
-		health.FailureCount++
-		health.SuccessCount = 0
-	}
-
-	// 缓存健康状态（短期缓存，5秒）
-	h.cache.SetWithTTL(cacheKey, isHealthy, 1, 15*time.Second)
-
-	return isHealthy
-}
-
-// performHealthCheck 执行实际的健康检查
-func (h *Handler) performHealthCheck(server string) bool {
-	// 创建测试查询
-	req := &dns.Msg{}
-	req.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
-
-	// 设置超时
-	_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// 根据服务器类型选择查询方法
-	if strings.HasPrefix(server, "https://") {
-		// DoH查询
-		resp, err := h.queryDoH(req, server, false)
-		return err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess
-	} else {
-		// UDP/TCP查询
-		resp, err := h.querySingleServer(req, server)
-		return err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess
-	}
-}
-
-// getHealthyServers 获取健康的DNS服务器列表
-func (h *Handler) getHealthyServers(servers []string) []string {
-	var healthy []string
-	for _, server := range servers {
-		if h.checkServerHealth(server) {
-			healthy = append(healthy, server)
-		}
-	}
-
-	// 如果没有健康的服务器，返回原始列表
-	if len(healthy) == 0 {
-		h.logger.Warn("没有健康的DNS服务器，使用原始列表")
-		return servers
-	}
-
-	return healthy
-}
-
-// queryDoH 通过DoH协议查询DNS
-// 增加参数: isCN，true表示国内分流，false表示国外分流
-func (h *Handler) queryDoH(req *dns.Msg, dohURL string, isCN bool) (*dns.Msg, error) {
-	var dohConf config.DoHConfig
-	if isCN {
-		dohConf = h.config.DoH.CN
-	} else {
-		dohConf = h.config.DoH.NotCN
-	}
-	if !dohConf.Enabled {
-		return nil, utils.NewDNSError(dns.RcodeServerFailure, "DoH not enabled", nil)
-	}
-
-	parsedURL, err := url.Parse(dohURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid DoH URL: %w", err)
-	}
-	host := parsedURL.Hostname()
-	if host == "" {
-		return nil, fmt.Errorf("invalid DoH URL hostname")
-	}
-
-	resolverIP, err := h.resolveDoHHostname(host, isCN)
-	if err != nil {
-		h.logger.Warn("无法解析DoH域名", "host", host, "err", err)
-		return nil, err
-	}
-
-	// IPv6 地址加中括号处理
-	if ip := net.ParseIP(resolverIP); ip != nil && ip.To4() == nil {
-		resolverIP = "[" + resolverIP + "]"
-	}
-
-	// 提取端口或使用默认 443
-	port := parsedURL.Port()
-	if port == "" {
-		port = "443"
-	}
-	dialAddr := net.JoinHostPort(resolverIP, port)
-
-	// 打包 DNS 查询
-	dnsQuery, err := req.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("failed to pack DNS query: %w", err)
-	}
-
-	httpReq, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/dns-message")
-	httpReq.Header.Set("Accept", "application/dns-message")
-	httpReq.Header.Set("User-Agent", "cosDnaProxy/1.0")
-	httpReq.Header.Set("Accept-Encoding", "gzip")
-
-	// 设置超时
-	timeout, err := time.ParseDuration(dohConf.Timeout)
-	if err != nil {
-		h.logger.Warn("DoH 超时时间格式无效，使用默认值", "raw", dohConf.Timeout, "default", "5s")
-		timeout = 5 * time.Second
-	}
-
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// 所有 DoH 请求都定向到解析出的 IP 和端口
-				return net.Dial(network, dialAddr)
-			},
-			TLSClientConfig: &tls.Config{
-				ServerName: host, // 保证 TLS 证书校验通过
-			},
-		},
-	}
-
-	start := time.Now()
-	resp, err := client.Do(httpReq)
-	duration := time.Since(start)
-
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w (耗时: %v)", err, duration)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d (耗时: %v)", resp.StatusCode, duration)
-	}
-
-	// 是否是 gzip 响应
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer gz.Close()
-		reader = gz
-	}
-
-	body, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	dnsResp := new(dns.Msg)
-	if err := dnsResp.Unpack(body); err != nil {
-		return nil, fmt.Errorf("failed to unpack DNS response: %w", err)
-	}
-
-	return dnsResp, nil
-}
-
-// resolveDoHHostname 解析DoH域名，isCN区分国内/国外
-func (h *Handler) resolveDoHHostname(hostname string, isCN bool) (string, error) {
-	var dohConf config.DoHConfig
-	if isCN {
-		dohConf = h.config.DoH.CN
-	} else {
-		dohConf = h.config.DoH.NotCN
-	}
-	// 创建DNS查询
-	req := new(dns.Msg)
-	req.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
-
-	c := &dns.Client{
-		Timeout: 3 * time.Second,
-		Net:     "udp",
-	}
-
-	resp, _, err := c.Exchange(req, dohConf.Resolver)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve DoH hostname: %w", err)
-	}
-
-	if resp == nil || len(resp.Answer) == 0 {
-		return "", fmt.Errorf("no answer for DoH hostname")
-	}
-
-	for _, rr := range resp.Answer {
-		if a, ok := rr.(*dns.A); ok {
-			return a.A.String(), nil
-		}
-	}
-	return "", fmt.Errorf("no A record found for DoH hostname")
-}
-
-// querySingleServer 查询单个DNS服务器
-func (h *Handler) querySingleServer(req *dns.Msg, server string) (*dns.Msg, error) {
-	var c *dns.Client
-	var resp *dns.Msg
-	var err error
-
-	start := time.Now()
-
-	if strings.HasPrefix(server, "https://") {
-		// DoH 查询
-		isCN := h.isCNUpstream(server)
-		resp, err = h.queryDoH(req, server, isCN)
-	} else {
-		network, timeout := h.getNetworkAndTimeout(server)
-		c = &dns.Client{
-			Timeout: timeout,
-			Net:     network,
-		}
-		serverAddr := h.getServerAddress(server)
-		resp, _, err = c.Exchange(req, serverAddr)
-	}
-
-	latency := time.Since(start)
-	h.metrics.GetUpstreamLatency().Observe(latency.Seconds())
-
-	if err != nil {
-		h.logger.Debug("DNS查询失败 %s: %v (耗时: %v)", server, err, latency)
-		return nil, err
-	}
-
-	if resp == nil {
-		h.logger.Debug("DNS服务器 %s 返回空响应 (耗时: %v)", server, latency)
-		return nil, utils.NewDNSError(dns.RcodeServerFailure, "empty response from server", nil)
-	}
-
-	if resp.Rcode != dns.RcodeSuccess {
-		h.logger.Debug("DNS服务器 %s 返回错误码: %s (耗时: %v)",
-			server, dns.RcodeToString[resp.Rcode], latency)
-	}
-
-	h.logger.Debug("DNS查询成功 %s: %s (耗时: %v)",
-		server, dns.RcodeToString[resp.Rcode], latency)
-	return resp, nil
-}
-
-// getNetworkAndTimeout 根据服务器地址获取网络协议和超时时间
-func (h *Handler) getNetworkAndTimeout(server string) (network string, timeout time.Duration) {
-	switch {
-	case strings.HasPrefix(server, "https://"):
-		return "https", 5 * time.Second
-	case strings.HasPrefix(server, "tls://"):
-		return "tcp-tls", 4 * time.Second
-	case strings.HasPrefix(server, "tcp://"):
-		return "tcp", 3 * time.Second
-	case strings.HasPrefix(server, "udp://"):
-		return "udp", 3 * time.Second
+	
+	unit := sizeStr[len(sizeStr)-2:]
+	valueStr := sizeStr[:len(sizeStr)-2]
+	
+	var multiplier int64
+	switch unit {
+	case "MB":
+		multiplier = 1024 * 1024
+	case "KB":
+		multiplier = 1024
+	case "GB":
+		multiplier = 1024 * 1024 * 1024
 	default:
-		return "udp", 3 * time.Second
+		return 0, fmt.Errorf("unsupported unit: %s", unit)
 	}
-}
-
-// getServerAddress 获取服务器地址（去除协议前缀）
-func (h *Handler) getServerAddress(server string) string {
-	switch {
-	case strings.HasPrefix(server, "https://"):
-		return server // DoH 保持原样
-	case strings.HasPrefix(server, "tls://"):
-		return strings.TrimPrefix(server, "tls://")
-	case strings.HasPrefix(server, "tcp://"):
-		return strings.TrimPrefix(server, "tcp://")
-	case strings.HasPrefix(server, "udp://"):
-		return strings.TrimPrefix(server, "udp://")
-	default:
-		return server
-	}
-}
-
-// queryMultipleServers 并发查询多个DNS服务器，选择最快的有效响应
-func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg, error) {
-	type result struct {
-		resp    *dns.Msg
-		err     error
-		server  string
-		latency time.Duration
-	}
-
-	// 创建结果通道
-	resultChan := make(chan result, len(servers))
-
-	// 并发查询所有服务器
-	for _, server := range servers {
-		go func(srv string) {
-			start := time.Now()
-			resp, err := h.querySingleServer(req, srv)
-			latency := time.Since(start)
-
-			resultChan <- result{
-				resp:    resp,
-				err:     err,
-				server:  srv,
-				latency: latency,
-			}
-		}(server)
-	}
-
-	// 等待第一个成功响应或所有服务器都失败
-	var lastError error
-	timeout := time.After(5 * time.Second)
-
-	for i := 0; i < len(servers); i++ {
-		select {
-		case res := <-resultChan:
-			if res.err == nil && res.resp != nil && res.resp.Rcode == dns.RcodeSuccess {
-				h.logger.Debug("选择最快的DNS响应: %s (耗时: %v)", res.server, res.latency)
-				return res.resp, nil
-			}
-			lastError = res.err
-
-		case <-timeout:
-			h.logger.Warn("DNS查询超时")
-			return nil, utils.NewDNSError(dns.RcodeServerFailure, "query timeout", nil)
-		}
-	}
-
-	// 所有服务器都失败了
-	if lastError != nil {
-		return nil, lastError
-	}
-
-	return nil, utils.NewDNSError(dns.RcodeServerFailure, "all upstream servers failed", nil)
-}
-
-// generateCacheKey 生成缓存键 - 只使用域名和查询类型
-func (h *Handler) generateCacheKey(req *dns.Msg) string {
-	var key strings.Builder
-	for _, q := range req.Question {
-		key.WriteString(q.Name)
-		key.WriteString(fmt.Sprintf(":%d", q.Qtype))
-	}
-	return key.String()
-}
-
-// getCachedResponse 获取缓存的DNS响应
-func (h *Handler) getCachedResponse(req *dns.Msg) (*dns.Msg, bool) {
-	cacheKey := h.generateCacheKey(req)
-
-	if cached, found := h.cache.Get(cacheKey); found {
-		if cachedResp, ok := cached.(*dns.Msg); ok {
-			h.logger.Debug("缓存命中: %s, Rcode=%d, Answer数=%d", cacheKey, cachedResp.Rcode, len(cachedResp.Answer))
-			if cachedResp != nil && len(cachedResp.Answer) > 0 {
-				h.metrics.GetCacheHits().WithLabelValues("dns_query").Inc()
-				// 创建响应副本以避免并发问题
-				resp := cachedResp.Copy()
-				resp.Id = req.Id // 保持请求ID一致
-				return resp, true
-			} else {
-				h.logger.Warn("缓存命中但内容无效: %s", cacheKey)
-			}
-		}
-	}
-
-	h.logger.Debug("缓存未命中: %s", cacheKey)
-	return nil, false
-}
-
-// setCachedResponse 设置DNS响应到缓存
-func (h *Handler) setCachedResponse(req *dns.Msg, resp *dns.Msg) {
-	if resp == nil {
-		return
-	}
-
-	cacheKey := h.generateCacheKey(req)
-	cacheCost := h.calculateCacheCost(resp)
-	cacheTTL := h.calculateCacheTTL(resp)
-
-	h.cache.SetWithTTL(cacheKey, resp, cacheCost, cacheTTL)
-	h.logger.Debug("缓存已设置: %s, TTL=%v", cacheKey, cacheTTL)
-}
-
-// proxyQuery 代理查询 - 重新设计版本
-func (h *Handler) proxyQuery(req *dns.Msg, upstream []string) (*dns.Msg, error) {
-	if len(upstream) == 0 {
-		return nil, utils.NewDNSError(dns.RcodeServerFailure, "no upstream servers configured", nil)
-	}
-
-	// 获取健康的上游服务器
-	healthyServers := h.getHealthyServers(upstream)
-	if len(healthyServers) == 0 {
-		return nil, fmt.Errorf("no healthy upstream servers available")
-	}
-
-	// 并发查询多个上游服务器
-	resp, err := h.queryMultipleServers(req, healthyServers)
+	
+	value, err := strconv.ParseInt(valueStr, 10, 64)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-
-	return resp, nil
-}
-
-// calculateCacheCost 计算缓存成本
-func (h *Handler) calculateCacheCost(resp *dns.Msg) int64 {
-	if resp == nil {
-		return 1
-	}
-	packed, err := resp.Pack()
-	if err != nil {
-		return 1
-	}
-	return int64(len(packed))
-}
-
-// calculateCacheTTL 计算缓存TTL
-func (h *Handler) calculateCacheTTL(resp *dns.Msg) time.Duration {
-	if resp == nil || len(resp.Answer) == 0 {
-		return 30 * time.Second // 默认30秒
-	}
-
-	// 找到最小的TTL
-	minTTL := uint32(600) // 默认1小时
-	for _, rr := range resp.Answer {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-		}
-	}
-
-	// 限制TTL范围
-	if minTTL < 30 {
-		minTTL = 30
-	} else if minTTL > 3600 {
-		minTTL = 3600
-	}
-
-	return time.Duration(minTTL) * time.Second
-}
-
-// isCloudResponse 检查是否为云服务响应
-func (h *Handler) isCloudResponse(msg *dns.Msg, iptype int) bool {
-	var ipd *NetIPX
-	for _, rr := range msg.Answer {
-		switch v := rr.(type) {
-		case *dns.A:
-			switch iptype {
-			case CFType:
-				ipd = h.cfNetSet4
-			case AWSType:
-				ipd = h.aWSNetSet4
-			}
-			if ipd != nil {
-				if ip, err := netip.ParseAddr(v.A.String()); err == nil && ipd.Contains(ip) {
-					h.logger.Debug("IPv4 %s is in known IP range", ip)
-					return true
-				}
-			}
-		case *dns.AAAA:
-			switch iptype {
-			case CFType:
-				ipd = h.cfNetSet6
-			case AWSType:
-				ipd = h.aWSNetSet6
-			}
-			if ipd != nil {
-				if ip, err := netip.ParseAddr(v.AAAA.String()); err == nil && ipd.Contains(ip) {
-					h.logger.Debug("IPv6 %s is in known IP range", ip)
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// resolveReplaceCNAME 解析替换CNAME
-func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
-	// 生成缓存键
-	cacheKey := fmt.Sprintf("replace_cname:%s", cname)
-
-	// 尝试从缓存获取
-	if cached, found := h.cache.Get(cacheKey); found {
-		if cachedAddrs, ok := cached.([]netip.Addr); ok {
-			h.logger.Debug("替换域名缓存命中: %s", cname)
-			h.metrics.GetCacheHits().WithLabelValues("replace_cname").Inc()
-			return cachedAddrs
-		}
-	}
-
-	// 缓存未命中，执行解析
-	h.logger.Debug("替换域名缓存未命中，执行解析: %s", cname)
-
-	var addrs []netip.Addr
-
-	// 使用所有上游解析
-	allUpstreams := append(h.config.CNUpstream, h.config.NotCNUpstream...)
-
-	// 创建A记录查询
-	req := &dns.Msg{}
-	req.SetQuestion(dns.Fqdn(cname), dns.TypeA)
-
-	resp, err := h.proxyQuery(req, allUpstreams)
-	if err == nil && resp != nil {
-		for _, rr := range resp.Answer {
-			if a, ok := rr.(*dns.A); ok {
-				if ip, err := netip.ParseAddr(a.A.String()); err == nil {
-					addrs = append(addrs, ip)
-				}
-			}
-		}
-	}
-
-	// 创建AAAA记录查询
-	reqAAAA := &dns.Msg{}
-	reqAAAA.SetQuestion(dns.Fqdn(cname), dns.TypeAAAA)
-
-	respAAAA, err := h.proxyQuery(reqAAAA, allUpstreams)
-	if err == nil && respAAAA != nil {
-		for _, rr := range respAAAA.Answer {
-			if aaaa, ok := rr.(*dns.AAAA); ok {
-				if ip, err := netip.ParseAddr(aaaa.AAAA.String()); err == nil {
-					addrs = append(addrs, ip)
-				}
-			}
-		}
-	}
-
-	// 去重
-	addrs = h.uniqueAddrs(addrs)
-
-	// 缓存结果（使用较长的TTL，因为替换域名相对稳定）
-	if len(addrs) > 0 {
-		h.cache.SetWithTTL(cacheKey, addrs, int64(len(addrs)*16), h.replaceExpire)
-		h.logger.Debug("替换域名解析结果已缓存: %s -> %v", cname, addrs)
-	}
-
-	return addrs
-}
-
-// uniqueAddrs 去重IP地址
-func (h *Handler) uniqueAddrs(addrs []netip.Addr) []netip.Addr {
-	seen := make(map[netip.Addr]struct{})
-	result := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		if _, exists := seen[a]; !exists {
-			seen[a] = struct{}{}
-			result = append(result, a)
-		}
-	}
-	return result
-}
-
-// buildReplacedResponse 构建替换后的响应
-func (h *Handler) buildReplacedResponse(req *dns.Msg, original *dns.Msg, addrs []netip.Addr, qtype uint16) *dns.Msg {
-	resp := new(dns.Msg)
-	resp.SetReply(req)
-	resp.Authoritative = original.Authoritative
-	resp.RecursionAvailable = original.RecursionAvailable
-	resp.Rcode = original.Rcode
-
-	// 保留非A/AAAA记录
-	for _, ans := range original.Answer {
-		if ans.Header().Rrtype != dns.TypeA && ans.Header().Rrtype != dns.TypeAAAA {
-			resp.Answer = append(resp.Answer, ans)
-		}
-	}
-
-	// 添加替换记录
-	for _, ip := range addrs {
-		if (qtype == dns.TypeA && ip.Is4()) || (qtype == dns.TypeAAAA && ip.Is6()) {
-			hdr := dns.RR_Header{
-				Name:   req.Question[0].Name,
-				Rrtype: qtype,
-				Class:  dns.ClassINET,
-				Ttl:    300,
-			}
-			if ip.Is4() {
-				resp.Answer = append(resp.Answer, &dns.A{
-					Hdr: hdr,
-					A:   net.ParseIP(ip.String()),
-				})
-			} else {
-				resp.Answer = append(resp.Answer, &dns.AAAA{
-					Hdr:  hdr,
-					AAAA: net.ParseIP(ip.String()),
-				})
-			}
-		}
-	}
-	return resp
-}
-
-// resolveViaDesignatedDNS 通过指定DNS解析
-func (h *Handler) resolveViaDesignatedDNS(req *dns.Msg, dnsServer string) (*dns.Msg, error) {
-	// 根据服务器地址判断协议类型
-	network, timeout := h.getNetworkAndTimeout(dnsServer)
-	c := &dns.Client{
-		Net:     network,
-		Timeout: timeout,
-	}
-
-	resp, _, err := c.Exchange(req, dnsServer)
-	if err != nil {
-		return nil, utils.NewDNSError(dns.RcodeServerFailure, "designated DNS query failed", err)
-	}
-	return resp, nil
+	
+	return value * multiplier, nil
 }
 
 // handleSpecialQuery 处理特殊查询
@@ -1077,53 +257,6 @@ func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg, q dns.Question
 	}
 }
 
-// handleReplacement 处理命中IP替换
-func (h *Handler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg, qtype uint16, domain string, ip netip.Addr, iptype int) {
-	var replaceDomain string
-
-	switch iptype {
-	case CFType:
-		replaceDomain = h.config.ReplaceCFDomain
-	case AWSType:
-		replaceDomain = h.config.ReplaceAWSDomain
-	}
-
-	replaceAddrs := h.resolveReplaceCNAME(replaceDomain)
-
-	// 新增：收集原始IP
-	var originalIPs []string
-	if resp != nil {
-		for _, rr := range resp.Answer {
-			switch v := rr.(type) {
-			case *dns.A:
-				originalIPs = append(originalIPs, v.A.String())
-			case *dns.AAAA:
-				originalIPs = append(originalIPs, v.AAAA.String())
-			}
-		}
-	}
-
-	if len(replaceAddrs) > 0 {
-		newResp := h.buildReplacedResponse(req, resp, replaceAddrs, qtype)
-		h.logger.Info("【Cloudflare命中】%s，原IP: %v，替换为: %v", domain, originalIPs, replaceAddrs)
-		h.metrics.GetReplacedCount().Inc()
-		// 设置缓存 - 缓存替换后的响应
-		h.setCachedResponse(req, newResp)
-		if err := w.WriteMsg(newResp); err != nil {
-			h.logger.Error("WriteMsg失败: %v", err)
-		}
-		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "replaced").Inc()
-		h.logger.Debug("handleReplacement matched: %s -> %v", domain, originalIPs)
-	} else {
-		// 设置缓存 - 缓存原始响应
-		h.setCachedResponse(req, resp)
-		if err := w.WriteMsg(resp); err != nil {
-			h.logger.Error("WriteMsg失败: %v", err)
-		}
-		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
-	}
-}
-
 // handleNormalQueryFallback 普通查询回退处理
 func (h *Handler) handleNormalQueryFallback(w dns.ResponseWriter, req *dns.Msg, q dns.Question) {
 	resp, err := h.proxyQuery(req, h.config.CNUpstream)
@@ -1150,16 +283,6 @@ func recoverPanic(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-// 判断是否为Cloudflare域名
-func (h *Handler) isCloudflareDomain(domain string) bool {
-	return strings.HasSuffix(domain, ".cloudflare.com") || strings.HasSuffix(domain, ".cf.cloudflare.com")
-}
-
-// 判断是否为AWS域名
-func (h *Handler) isAWSDomain(domain string) bool {
-	return strings.HasSuffix(domain, ".amazonaws.com") || strings.HasSuffix(domain, ".cloudfront.net")
-}
-
 // ServeDNS 实现dns.Handler接口
 func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	defer recoverPanic(w, req)
@@ -1179,7 +302,7 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 
-		// 0 首先检查缓存 - 缓存命中直接返回
+		// 1. 缓存检查 - 缓存命中直接返回
 		if cachedResp, hit := h.getCachedResponse(req); hit {
 			if err := w.WriteMsg(cachedResp); err != nil {
 				h.logger.Error("WriteMsg失败: %v", err)
@@ -1188,19 +311,97 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 
-		// 2. 定向域名优先
+		// 2. 域名查询检查 - 记录域名查询信息
+		h.logger.Debug("【域名查询】开始处理域名: %s, 类型: %s", domain, dns.TypeToString[qtype])
+
+		// 3. 定向域名检查 - 强制指定DNS策略
+		h.logger.Debug("【定向域名检查】开始检查域名: %s", domain)
 		if rule, matched := h.matchDesignatedDomain(domain); matched {
 			h.logger.Info("【定向域名命中】%s，使用指定DNS: %s", domain, rule.DNS)
-			AddOrUpdateDomainTagSimple(domain, TAG_DINGXIANG)
+			AddOrUpdateDomainTagSimple(domain, TAG_DINGXIANG) // TAG_DINGXIANG = 1
 			h.logger.Info("标签系统：%s 标记为定向域名", domain)
 			h.metrics.GetDesignatedHits().Inc()
 			h.handleSpecialQuery(w, req, q, rule)
 			return
 		}
+		h.logger.Debug("【定向域名检查】域名 %s 未匹配定向规则", domain)
 
-		//3. 先用所有上游查IP，判断是否命中cf/aws网段
-		allUpstreams := append(cfg.CNUpstream, cfg.NotCNUpstream...)
-		resp, err := h.proxyQuery(req, allUpstreams)
+		// 4. 白名单检查 - 白名单域名跳过云服务检查，不进行IP替换
+		if h.isWhitelisted(domain) {
+			h.logger.Info("【白名单命中】%s，跳过云服务检查，直接进行分流", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_WHITELIST) // TAG_WHITELIST = 6
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "whitelist").Inc()
+
+			// 白名单域名直接进行geosite分流，跳过Cloudflare/AWS检查
+			isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+			var upstream []string
+
+			// 检查是否已经标记过，避免重复标记
+			if existingTag, exists := QueryDomainTag(domain); exists {
+				// 使用已有标签
+				if existingTag.Tag == "2" { // TAG_CN = 2
+					upstream = cfg.CNUpstream
+					h.logger.Debug("白名单域名使用已有标签，国内DNS解析: %s", domain)
+				} else {
+					upstream = cfg.NotCNUpstream
+					h.logger.Debug("白名单域名使用已有标签，国外DNS解析: %s", domain)
+				}
+			} else {
+				// 首次标记
+				if isCN {
+					upstream = cfg.CNUpstream
+					h.logger.Debug("白名单域名使用国内DNS解析: %s", domain)
+					AddOrUpdateDomainTagSimple(domain, TAG_CN) // TAG_CN = 2
+					h.logger.Info("标签系统：%s 标记为国内", domain)
+				} else {
+					upstream = cfg.NotCNUpstream
+					h.logger.Debug("白名单域名使用国外DNS解析: %s", domain)
+					AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN) // TAG_NOT_CN = 3
+					h.logger.Info("标签系统：%s 标记为国外", domain)
+				}
+			}
+
+			resp, err := h.proxyQuery(req, upstream)
+			if err != nil || resp == nil {
+				h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+				if err := w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure)); err != nil {
+					h.logger.Error("WriteMsg失败: %v", err)
+				}
+				return
+			}
+			// 缓存已在proxyQuery内部设置，这里不需要重复设置
+			if err := w.WriteMsg(resp); err != nil {
+				h.logger.Error("WriteMsg失败: %v", err)
+			}
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
+			return
+		}
+
+		//5. 云服务检查 - 使用定向域名指定的DNS策略进行查询
+		h.logger.Debug("【云服务检查】开始检查域名: %s", domain)
+		// 检查是否有定向域名配置，如果有则使用指定的DNS，否则使用默认策略
+		var upstreamForCloudCheck []string
+		if designatedRule, exists := h.getDesignatedRuleForDomain(domain); exists {
+			// 使用定向域名指定的DNS策略
+			if designatedRule.UpstreamType == "cn_upstream" {
+				upstreamForCloudCheck = cfg.CNUpstream
+				h.logger.Debug("云服务检查使用定向域名指定的国内DNS: %s", domain)
+			} else if designatedRule.UpstreamType == "not_cn_upstream" {
+				upstreamForCloudCheck = cfg.NotCNUpstream
+				h.logger.Debug("云服务检查使用定向域名指定的国外DNS: %s", domain)
+			} else {
+				// 使用指定的具体DNS服务器
+				upstreamForCloudCheck = []string{designatedRule.DNS}
+				h.logger.Debug("云服务检查使用定向域名指定的DNS服务器: %s -> %s", domain, designatedRule.DNS)
+			}
+		} else {
+			// 没有定向域名配置，使用默认策略（所有上游）
+			upstreamForCloudCheck = append(cfg.CNUpstream, cfg.NotCNUpstream...)
+			h.logger.Debug("云服务检查使用默认DNS策略: %s", domain)
+		}
+
+		h.logger.Debug("【云服务检查】执行DNS查询，使用上游: %v", upstreamForCloudCheck)
+		resp, err := h.proxyQuery(req, upstreamForCloudCheck)
 		if err != nil || resp == nil {
 			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
 			if err := w.WriteMsg(new(dns.Msg).SetRcode(req, dns.RcodeServerFailure)); err != nil {
@@ -1209,32 +410,48 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 		if h.isCloudResponse(resp, CFType) {
-			AddOrUpdateDomainTagSimple(domain, TAG_CF)
+			AddOrUpdateDomainTagSimple(domain, TAG_CF) // TAG_CF = 4
 			h.logger.Info("标签系统：%s 标记为Cloudflare", domain)
 			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, CFType)
 			return
 		}
 		if h.isCloudResponse(resp, AWSType) {
-			AddOrUpdateDomainTagSimple(domain, TAG_AWS)
+			AddOrUpdateDomainTagSimple(domain, TAG_AWS) // TAG_AWS = 5
 			h.logger.Info("标签系统：%s 标记为AWS", domain)
 			h.handleReplacement(w, req, resp, qtype, domain, netip.Addr{}, AWSType)
 			return
 		}
 
-		//4 geosite国内外分流
+		//6. geosite国内外分流
+		h.logger.Debug("【标签分流】开始进行geosite分流: %s", domain)
 		isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
 		var upstream []string
-		if isCN {
-			upstream = cfg.CNUpstream
-			h.logger.Debug("使用国内DNS解析: %s", domain)
-			AddOrUpdateDomainTagSimple(domain, TAG_CN)
-			h.logger.Info("标签系统：%s 标记为国内", domain)
+
+		// 检查是否已经标记过，避免重复标记
+		if existingTag, exists := QueryDomainTag(domain); exists {
+			// 使用已有标签
+			if existingTag.Tag == "2" { // TAG_CN = 2
+				upstream = cfg.CNUpstream
+				h.logger.Debug("使用已有标签，国内DNS解析: %s", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("使用已有标签，国外DNS解析: %s", domain)
+			}
 		} else {
-			upstream = cfg.NotCNUpstream
-			h.logger.Debug("使用国外DNS解析: %s", domain)
-			AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
-			h.logger.Info("标签系统：%s 标记为国外", domain)
+			// 首次标记
+			if isCN {
+				upstream = cfg.CNUpstream
+				h.logger.Debug("使用国内DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_CN) // TAG_CN = 2
+				h.logger.Info("标签系统：%s 标记为国内", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("使用国外DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN) // TAG_NOT_CN = 3
+				h.logger.Info("标签系统：%s 标记为国外", domain)
+			}
 		}
+		h.logger.Debug("【标签分流】执行DNS查询，使用上游: %v", upstream)
 		resp, err = h.proxyQuery(req, upstream)
 		if err != nil || resp == nil {
 			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
@@ -1261,144 +478,332 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-// shouldLogCacheStats 判断是否应该输出缓存统计
-func (h *Handler) shouldLogCacheStats() bool {
-	// 每1000询输出一次统计
-	h.Lock()
-	defer h.Unlock()
-
-	// 使用简单的计数器
-	if h.cacheStatsCounter == 0 {
-		h.cacheStatsCounter = 1000
+// startAsyncRefreshWorkers 启动异步刷新工作线程
+func (h *Handler) startAsyncRefreshWorkers(maxWorkers int) {
+	if maxWorkers <= 0 {
+		maxWorkers = 10 // 增加默认工作线程数到10
 	}
-	h.cacheStatsCounter--
 
-	return h.cacheStatsCounter == 0
+	for i := 0; i < maxWorkers; i++ {
+		go h.asyncRefreshWorker()
+	}
+	h.logger.Info("启动 %d 个异步缓存刷新工作线程", maxWorkers)
 }
 
-// logCacheStats 输出缓存统计信息
-func (h *Handler) logCacheStats() {
-	if h.cache == nil {
-		return
-	}
-	// 获取缓存指标
-	metrics := h.cache.Metrics
-	if metrics == nil {
-		return
-	}
-	// 正确访问Hits和Misses方法，KeysEvicted和SetsRejected方法
-	h.logger.Info("【缓存统计】命中率: %0.2f%%, 驱逐: %d, 拒绝: %d",
-		float64(metrics.Hits())/float64(metrics.Hits()+metrics.Misses())*100,
-		metrics.KeysEvicted(),
-		metrics.SetsRejected())
-}
-
-// 新增：判断上游是否为国内分流
-func (h *Handler) isCNUpstream(server string) bool {
-	for _, s := range h.config.CNUpstream {
-		if s == server {
-			return true
+// asyncRefreshWorker 异步刷新工作线程
+func (h *Handler) asyncRefreshWorker() {
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Error("异步刷新工作线程panic: %v", r)
+			// 重新启动工作线程
+			go h.asyncRefreshWorker()
 		}
-	}
-	return false
-}
-
-// 标签系统相关常量
-const (
-	tagCSVFile    = "data/domain_tags.csv"
-	tagFlushBatch = 200
-)
-
-// 冷加载标签系统
-func LoadDomainTags() error {
-	f, err := os.Open(tagCSVFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // 文件不存在视为无标签
-		}
-		return err
-	}
-	defer f.Close()
-	reader := csv.NewReader(f)
-	records, err := reader.ReadAll()
-	if err != nil {
-		return err
-	}
-	TagMapMu.Lock()
-	defer TagMapMu.Unlock()
-	for _, rec := range records {
-		if len(rec) < 3 {
+	}()
+	
+	for task := range h.asyncRefreshChan {
+		// 检查任务是否仍然有效
+		if time.Now().After(task.ExpireTime) {
+			h.logger.Debug("异步刷新任务已过期，跳过: %s", task.Domain)
+			atomic.AddInt32(&h.asyncWorkers, -1)
 			continue
 		}
-		TagMap[rec[0]] = &DomainTag{
-			Tag:      rec[1],
-			Upstream: rec[2],
-			Updated:  time.Now().Unix(),
-		}
-	}
-	return nil
-}
-
-// 查询标签系统
-func QueryDomainTag(domain string) (*DomainTag, bool) {
-	TagMapMu.RLock()
-	tag, ok := TagMap[domain]
-	TagMapMu.RUnlock()
-	return tag, ok
-}
-
-// 追加标签并标记为dirty
-func AddOrUpdateDomainTag(domain, tag, upstream string) {
-	TagMapMu.Lock()
-	TagMap[domain] = &DomainTag{
-		Tag:      tag,
-		Upstream: upstream,
-		Updated:  time.Now().Unix(),
-	}
-	TagDirty[domain] = struct{}{}
-	TagMapMu.Unlock()
-	// 异步批量写入
-	if len(TagDirty) >= tagFlushBatch {
-		go FlushDomainTagsToFile()
+		
+		h.processAsyncRefresh(task)
 	}
 }
 
-// 异步批量写入标签到CSV
-func FlushDomainTagsToFile() {
-	TagMapMu.Lock()
-	defer TagMapMu.Unlock()
-	if len(TagDirty) == 0 {
+// processAsyncRefresh 处理异步刷新任务
+func (h *Handler) processAsyncRefresh(task *AsyncRefreshTask) {
+	// 检查是否已经过期
+	if time.Now().After(task.ExpireTime) {
+		h.logger.Debug("异步刷新任务已过期，跳过: %s", task.Domain)
 		return
 	}
-	// 先读出原有数据，合并写回
-	existing := make(map[string][]string)
-	if f, err := os.Open(tagCSVFile); err == nil {
-		reader := csv.NewReader(f)
-		records, _ := reader.ReadAll()
-		for _, rec := range records {
-			if len(rec) < 3 {
-				continue
-			}
-			existing[rec[0]] = rec
+
+	// 减少工作线程计数
+	atomic.AddInt32(&h.asyncWorkers, -1)
+
+	h.logger.Debug("【异步刷新】开始刷新域名: %s, 原始TTL: %v, 过期时间: %v",
+		task.Domain, task.OriginalTTL, task.ExpireTime)
+
+	// 创建DNS查询
+	req := &dns.Msg{}
+	req.SetQuestion(dns.Fqdn(task.Domain), task.QType)
+
+	// 根据域名类型选择上游
+	var upstream []string
+	if h.isWhitelisted(task.Domain) {
+		// 白名单域名使用geosite分流
+		isCN := h.geositeManager.CheckDomainInTag(task.Domain, h.config.GeositeGroup)
+		if isCN {
+			upstream = h.config.CNUpstream
+			h.logger.Debug("【异步刷新】白名单域名使用国内DNS: %s", task.Domain)
+		} else {
+			upstream = h.config.NotCNUpstream
+			h.logger.Debug("【异步刷新】白名单域名使用国外DNS: %s", task.Domain)
 		}
-		f.Close()
+	} else if rule, matched := h.matchDesignatedDomain(task.Domain); matched {
+		// 定向域名使用指定策略
+		if rule.UpstreamType == "cn_upstream" {
+			upstream = h.config.CNUpstream
+			h.logger.Debug("【异步刷新】定向域名使用国内DNS: %s", task.Domain)
+		} else if rule.UpstreamType == "not_cn_upstream" {
+			upstream = h.config.NotCNUpstream
+			h.logger.Debug("【异步刷新】定向域名使用国外DNS: %s", task.Domain)
+		} else {
+			upstream = []string{rule.DNS}
+			h.logger.Debug("【异步刷新】定向域名使用指定DNS: %s -> %s", task.Domain, rule.DNS)
+		}
+	} else {
+		// 默认使用所有上游
+		upstream = append(h.config.CNUpstream, h.config.NotCNUpstream...)
+		h.logger.Debug("【异步刷新】使用默认DNS策略: %s", task.Domain)
 	}
-	// 更新dirty部分
-	for domain := range TagDirty {
-		tag := TagMap[domain]
-		existing[domain] = []string{domain, tag.Tag, tag.Upstream}
-	}
-	// 写回全部
-	f, err := os.Create(tagCSVFile)
+
+	h.logger.Debug("【异步刷新】执行DNS查询，使用上游: %v", upstream)
+
+	// 执行查询
+	resp, err := h.proxyQuery(req, upstream)
 	if err != nil {
+		h.logger.Debug("【异步刷新】查询失败: %s, 错误: %v", task.Domain, err)
 		return
 	}
-	writer := csv.NewWriter(f)
-	for _, rec := range existing {
-		_ = writer.Write(rec)
+
+	if resp != nil && resp.Rcode == dns.RcodeSuccess {
+		// 记录刷新前的信息
+		h.logger.Debug("【异步刷新】查询成功: %s, 响应码: %s", task.Domain, dns.RcodeToString[resp.Rcode])
+
+		// 记录响应详情
+		if len(resp.Answer) > 0 {
+			for i, rr := range resp.Answer {
+				h.logger.Debug("【异步刷新】响应记录 %d: %s, TTL: %ds", i+1, rr.String(), rr.Header().Ttl)
+			}
+		}
+
+		// 计算新的缓存TTL
+		newTTL := h.calculateCacheTTL(resp)
+		h.logger.Debug("【异步刷新】计算新TTL: %v", newTTL)
+
+		// 查询成功，更新缓存
+		h.setCachedResponse(req, resp)
+		h.logger.Debug("【异步刷新】缓存更新完成: %s, 新TTL: %v", task.Domain, newTTL)
+	} else {
+		h.logger.Debug("【异步刷新】查询返回无效响应: %s, 响应码: %s", task.Domain, dns.RcodeToString[resp.Rcode])
 	}
-	writer.Flush()
-	f.Close()
-	// 清空dirty
-	TagDirty = make(map[string]struct{})
+}
+
+// Close 关闭Handler，清理资源
+func (h *Handler) Close() {
+	if h.dotPool != nil {
+		h.dotPool.Close()
+	}
+	if h.dohPool != nil {
+		h.dohPool.Close()
+	}
+	if h.hotCache != nil {
+		h.hotCache.Clear()
+	}
+
+	// 关闭异步刷新通道
+	if h.asyncRefreshChan != nil {
+		close(h.asyncRefreshChan)
+	}
+}
+
+// handleAsyncRefreshQuery 处理异步刷新的完整DNS查询流程
+// 跳过缓存检查，重新进行分流和查询
+func (h *Handler) handleAsyncRefreshQuery(req *dns.Msg, domain string, qtype uint16) *dns.Msg {
+	cfg := h.config
+
+	h.logger.Debug("【异步刷新】开始完整DNS查询流程: %s", domain)
+
+	// 1. 域名查询检查（日志记录）
+	h.logger.Debug("【异步刷新】【域名查询】开始处理域名: %s, 类型: %s", domain, dns.TypeToString[qtype])
+
+	// 2. 定向域名检查 - 强制指定DNS策略
+	if rule, matched := h.matchDesignatedDomain(domain); matched {
+		h.logger.Info("【异步刷新】【定向域名命中】%s，使用指定DNS: %s", domain, rule.DNS)
+		AddOrUpdateDomainTagSimple(domain, TAG_DINGXIANG)
+		h.logger.Info("【异步刷新】标签系统：%s 标记为定向域名", domain)
+		h.metrics.GetDesignatedHits().Inc()
+		return h.handleSpecialQueryForAsync(req, domain, qtype, rule)
+	}
+	h.logger.Debug("【异步刷新】【定向域名检查】域名 %s 未匹配定向规则", domain)
+
+	// 3. 白名单检查 - 白名单域名跳过云服务检查，不进行IP替换
+	if h.isWhitelisted(domain) {
+		h.logger.Info("【异步刷新】【白名单命中】%s，跳过云服务检查，直接进行分流", domain)
+		AddOrUpdateDomainTagSimple(domain, TAG_WHITELIST)
+		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "whitelist").Inc()
+
+		// 白名单域名直接进行geosite分流，跳过Cloudflare/AWS检查
+		isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+		var upstream []string
+
+		// 检查是否已经标记过，避免重复标记
+		if existingTag, exists := QueryDomainTag(domain); exists {
+			if existingTag.Tag == "2" { // TAG_CN = 2
+				upstream = cfg.CNUpstream
+				h.logger.Debug("【异步刷新】白名单域名使用已有标签，国内DNS解析: %s", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("【异步刷新】白名单域名使用已有标签，国外DNS解析: %s", domain)
+			}
+		} else {
+			// 首次标记
+			if isCN {
+				upstream = cfg.CNUpstream
+				h.logger.Debug("【异步刷新】白名单域名使用国内DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_CN)
+				h.logger.Info("【异步刷新】标签系统：%s 标记为国内", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("【异步刷新】白名单域名使用国外DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
+				h.logger.Info("【异步刷新】标签系统：%s 标记为国外", domain)
+			}
+		}
+
+		resp, err := h.proxyQuery(req, upstream)
+		if err != nil || resp == nil {
+			h.logger.Error("【异步刷新】白名单域名查询失败: %s", domain)
+			return nil
+		}
+		return resp
+	}
+
+	// 4. 云服务检查 - 使用定向域名指定的DNS策略进行查询
+	h.logger.Debug("【异步刷新】【云服务检查】开始检查域名: %s", domain)
+	var upstreamForCloudCheck []string
+	if designatedRule, exists := h.getDesignatedRuleForDomain(domain); exists {
+		// 使用定向域名指定的DNS策略
+		if designatedRule.UpstreamType == "cn_upstream" {
+			upstreamForCloudCheck = cfg.CNUpstream
+			h.logger.Debug("【异步刷新】云服务检查使用定向域名指定的国内DNS: %s", domain)
+		} else if designatedRule.UpstreamType == "not_cn_upstream" {
+			upstreamForCloudCheck = cfg.NotCNUpstream
+			h.logger.Debug("【异步刷新】云服务检查使用定向域名指定的国外DNS: %s", domain)
+		} else {
+			upstreamForCloudCheck = []string{designatedRule.DNS}
+			h.logger.Debug("【异步刷新】云服务检查使用定向域名指定的DNS服务器: %s -> %s", domain, designatedRule.DNS)
+		}
+	} else {
+		// 没有定向域名配置，使用默认策略（所有上游）
+		upstreamForCloudCheck = append(cfg.CNUpstream, cfg.NotCNUpstream...)
+		h.logger.Debug("【异步刷新】云服务检查使用默认DNS策略: %s", domain)
+	}
+
+	h.logger.Debug("【异步刷新】【云服务检查】执行DNS查询，使用上游: %v", upstreamForCloudCheck)
+	resp, err := h.proxyQuery(req, upstreamForCloudCheck)
+	if err != nil || resp == nil {
+		h.logger.Error("【异步刷新】云服务检查查询失败: %s", domain)
+		return nil
+	}
+
+	// 检查是否为云服务响应
+	if h.isCloudResponse(resp, CFType) {
+		AddOrUpdateDomainTagSimple(domain, TAG_CF)
+		h.logger.Info("【异步刷新】标签系统：%s 标记为Cloudflare", domain)
+		// 处理IP替换
+		return h.handleReplacementForAsync(req, resp, qtype, domain, netip.Addr{}, CFType)
+	}
+	if h.isCloudResponse(resp, AWSType) {
+		AddOrUpdateDomainTagSimple(domain, TAG_AWS)
+		h.logger.Info("【异步刷新】标签系统：%s 标记为AWS", domain)
+		// 处理IP替换
+		return h.handleReplacementForAsync(req, resp, qtype, domain, netip.Addr{}, AWSType)
+	}
+
+	// 5. geosite国内外分流
+	h.logger.Debug("【异步刷新】【标签分流】开始进行geosite分流: %s", domain)
+	isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+	var upstream []string
+
+	// 检查是否已经标记过，避免重复标记
+	if existingTag, exists := QueryDomainTag(domain); exists {
+		if existingTag.Tag == "2" { // TAG_CN = 2
+			upstream = cfg.CNUpstream
+			h.logger.Debug("【异步刷新】使用已有标签，国内DNS解析: %s", domain)
+		} else {
+			upstream = cfg.NotCNUpstream
+			h.logger.Debug("【异步刷新】使用已有标签，国外DNS解析: %s", domain)
+		}
+	} else {
+		// 首次标记
+		if isCN {
+			upstream = cfg.CNUpstream
+			h.logger.Debug("【异步刷新】使用国内DNS解析: %s", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_CN)
+			h.logger.Info("【异步刷新】标签系统：%s 标记为国内", domain)
+		} else {
+			upstream = cfg.NotCNUpstream
+			h.logger.Debug("【异步刷新】使用国外DNS解析: %s", domain)
+			h.logger.Info("【异步刷新】标签系统：%s 标记为国外", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
+		}
+	}
+
+	h.logger.Debug("【异步刷新】【标签分流】执行DNS查询，使用上游: %v", upstream)
+	resp, err = h.proxyQuery(req, upstream)
+	if err != nil || resp == nil {
+		h.logger.Error("【异步刷新】标签分流查询失败: %s", domain)
+		return nil
+	}
+
+	return resp
+}
+
+// handleSpecialQueryForAsync 异步刷新时的特殊查询处理
+func (h *Handler) handleSpecialQueryForAsync(req *dns.Msg, domain string, qtype uint16, rule *DesignatedDomain) *dns.Msg {
+	h.logger.Debug("【异步刷新】处理定向域名查询: %s via %s", domain, rule.DNS)
+
+	var resp *dns.Msg
+	var err error
+	if rule.UpstreamType == "cn_upstream" {
+		resp, err = h.proxyQuery(req, h.config.CNUpstream)
+	} else if rule.UpstreamType == "not_cn_upstream" {
+		resp, err = h.proxyQuery(req, h.config.NotCNUpstream)
+	} else {
+		// 使用指定的具体DNS服务器
+		network, timeout := h.getNetworkAndTimeout(rule.DNS)
+		c := &dns.Client{
+			Net:     network,
+			Timeout: timeout,
+		}
+		resp, _, err = c.ExchangeContext(context.Background(), req, rule.DNS)
+	}
+
+	if err != nil || resp == nil {
+		h.logger.Error("【异步刷新】定向域名查询失败: %s via %s: %v", domain, rule.DNS, err)
+		return nil
+	}
+
+	h.logger.Debug("【异步刷新】定向域名查询成功: %s via %s", domain, rule.DNS)
+	return resp
+}
+
+// handleReplacementForAsync 异步刷新时的IP替换处理
+func (h *Handler) handleReplacementForAsync(req *dns.Msg, resp *dns.Msg, qtype uint16, domain string, originalIP netip.Addr, iptype int) *dns.Msg {
+	h.logger.Debug("【异步刷新】处理IP替换: %s, 类型: %d", domain, iptype)
+
+	// 这里可以添加IP替换逻辑，但异步刷新主要是更新缓存
+	// 所以直接返回原始响应即可
+	return resp
+}
+
+// periodicTagCleanup 定期清理标签系统
+func (h *Handler) periodicTagCleanup() {
+	ticker := time.NewTicker(10 * time.Minute) // 每10分钟清理一次
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		h.cleanupExpiredTags()
+		
+		// 强制刷新标签到文件，释放内存
+		TagMapMu.Lock()
+		if len(TagDirtySimple) > 0 {
+			go FlushDomainTagsSimpleToFile()
+		}
+		TagMapMu.Unlock()
+	}
 }

@@ -148,9 +148,14 @@ type DomainTag struct {
 
 // 标签系统全局变量
 var (
+	TagMapSimple   = make(map[string]*DomainTag) // 域名->标签
+	TagDirtySimple = make(map[string]struct{})
+	TagMapMu       sync.RWMutex // 添加互斥锁保护
+	maxTagMapSize  = 100000     // 限制标签map最大大小
+	
+	// 旧的标签系统变量（保持向后兼容）
 	TagMap   = make(map[string]*DomainTag) // 域名->标签
-	TagMapMu sync.RWMutex
-	TagDirty = make(map[string]struct{}) // 本次运行新增/变更的域名
+	TagDirty = make(map[string]struct{})   // 本次运行新增/变更的域名
 )
 
 // 极简标签常量
@@ -161,12 +166,7 @@ const (
 	TAG_NOT_CN    = 3
 	TAG_CF        = 4
 	TAG_AWS       = 5
-)
-
-// 极简标签map
-var (
-	TagMapSimple   = make(map[string]int) // 域名->标签
-	TagDirtySimple = make(map[string]struct{})
+	TAG_WHITELIST = 6
 )
 
 const (
@@ -197,25 +197,56 @@ func LoadDomainTagsSimple() error {
 		if v, err := strconv.Atoi(rec[1]); err == nil {
 			tag = v
 		}
-		TagMapSimple[rec[0]] = tag
+		TagMapSimple[rec[0]] = &DomainTag{Tag: rec[0], Upstream: strconv.Itoa(tag), Updated: time.Now().Unix()}
 	}
 	return nil
 }
 
 // 追加标签并标记为dirty
 func AddOrUpdateDomainTagSimple(domain string, tag int) {
-	TagMapSimple[domain] = tag
+	TagMapMu.Lock()
+	defer TagMapMu.Unlock()
+	
+	// 检查map大小，如果超过限制则清理旧数据
+	if len(TagMapSimple) >= maxTagMapSize {
+		// 清理最旧的1000个标签
+		cleanupOldTags(1000)
+	}
+	
+	TagMapSimple[domain] = &DomainTag{
+		Tag:      strconv.Itoa(tag),
+		Upstream: strconv.Itoa(tag),
+		Updated:  time.Now().Unix(),
+	}
 	TagDirtySimple[domain] = struct{}{}
 	if len(TagDirtySimple) >= tagSimpleFlushBatch {
 		go FlushDomainTagsSimpleToFile()
 	}
 }
 
+// 清理旧标签
+func cleanupOldTags(count int) {
+	// 简单的清理策略：随机删除一些标签
+	deleted := 0
+	for domain := range TagMapSimple {
+		if deleted >= count {
+			break
+		}
+		delete(TagMapSimple, domain)
+		delete(TagDirtySimple, domain)
+		deleted++
+	}
+}
+
 // 批量写入并释放map
 func FlushDomainTagsSimpleToFile() {
+	TagMapMu.Lock()
+	defer TagMapMu.Unlock()
+	
 	if len(TagDirtySimple) == 0 {
 		return
 	}
+	
 	// 先读出原有数据，合并写回
 	existing := make(map[string]string)
 	if f, err := os.Open(tagSimpleCSVFile); err == nil {
@@ -229,11 +260,13 @@ func FlushDomainTagsSimpleToFile() {
 		}
 		f.Close()
 	}
+	
 	// 更新dirty部分
 	for domain := range TagDirtySimple {
 		tag := TagMapSimple[domain]
-		existing[domain] = strconv.Itoa(tag)
+		existing[domain] = tag.Tag // 写入Tag字段
 	}
+	
 	// 写回全部
 	f, err := os.Create(tagSimpleCSVFile)
 	if err != nil {
@@ -245,7 +278,7 @@ func FlushDomainTagsSimpleToFile() {
 	}
 	writer.Flush()
 	f.Close()
-	// 清空map
-	TagMapSimple = make(map[string]int)
+	
+	// 清空dirty map，但保留TagMapSimple中的数据
 	TagDirtySimple = make(map[string]struct{})
 }

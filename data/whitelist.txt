@@ -1,0 +1,21 @@
+# Whitelist domains
+x.com
+*.x.com
+twitter.com
+*.twitter.com
+twimg.com
+*.twimg.com
+twtrdns.net
+*.twtrdns.net
+t.co
+
+*bing.com
+*.niao.fun
+*.cloudflare-cn.com
+fn.niao.fun
+qh.niao.fun
+*.cloudfront.182682.xyz
+*.cloudflare.182682.xyz
+*.synology.com
+*.mgstage.com
+*.jav321.com

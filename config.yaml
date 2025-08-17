@@ -1,65 +1,80 @@
+# DNS代理配置文件
 listen_port: 5354
-metrics_port: 0
 
-# 上游DNS服务器配置 - 直接使用DoH
+# 国内上游DNS服务器
 cn_upstream:
-  - "https://doh.pub/dns-query"
-  - "udp://223.5.5.5:53"
+  # - "223.5.5.5:53" # 阿里DNS
+  # - "119.29.29.29:53" # 腾讯DNS
+  - "tls://223.5.5.5:853" # 阿里DNS DoT
+  - "tls://1.12.12.12:853" # 腾讯DNS DoT
+  # - "https://dns.alidns.com/dns-query"
+
+# 国外上游DNS服务器
 not_cn_upstream:
-  - "https://dns.alidns.com/dns-query"
+  - "udp://10.0.0.1:1053"
+  # - "https://cloudflare-dns.com/dns-query"
+  # - "https://dns.google/dns-query"
+  # - "tls://1dot1dot1dot1.cloudflare-dns.com:853"
+  #- "tls://8.8.8.8:853@dns.google"
 
-doh:
-  cn:
-    enabled: true
-    timeout: "2s"
-    resolver: "119.29.29.29:53"
-  not_cn:
-    enabled: true
-    timeout: "3s"
-    resolver: "119.29.29.29:53"
+# Geosite配置
+geosite_group: "GEOLOCATION-CN"
+geosite_file: "./data/geosite.dat"
+geosite_url: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+geosite_refresh: "24h"
 
-# Cloudflare和AWS IP范围文件
-cf_mrs_file4: "./data/cloudflare-v4.txt"
+# Cloudflare和AWS IP段文件
+cf_mrs_file4: "./data/cf_mrs_file4.txt"
 cf_mrs_file4_url: "https://www.cloudflare.com/ips-v4"
-cf_mrs_file6: "./data/cloudflare-v6.txt"
+cf_mrs_file6: "./data/cf_mrs_file6.txt"
 cf_mrs_file6_url: "https://www.cloudflare.com/ips-v6"
 aws_mrs_file64: "./data/aws.txt"
 aws_mrs_file64_url: "https://ip-ranges.amazonaws.com/ip-ranges.json"
-cf_mrs_cache: "./data/cloudflare.txt"
-
-# 替换域名配置
-replace_cf_domain: "cf-cname.xingpingcn.top"
-replace_aws_domain: "cc.cloudfront.182682.xyz"
-
-# cname 比较优秀的域名cf-cname.xingpingcn.top  cf.090227.xyz
-# 缓存时间配置
-cf_cache_time: 23h59m
-replace_cache_time: "30m"
 
 # 缓存配置
-cache:
-  max_size: 100MB # 最大缓存大小
-  dns_ttl_min: 30s # DNS缓存最小TTL
-  dns_ttl_max: 1h # DNS缓存最大TTL
-  health_check_ttl: 15m # 健康检查缓存TTL
-  replace_cname_ttl: 30m
+cf_cache_time: "72h" # Cloudflare IP段文件缓存时间
+replace_cache_time: "10m" # IP替换规则缓存时间
 
-# 域名规则文件（统一到data目录）
-# 后续版本会移除白名单，目前已经修改逻辑了，全部用指定designated，可以指定dns 也可以直接使用cn_upstream/not_cn_upstream，
-#优化匹配 *.aaa.* 可以写成aaa cn_upstream
-designated_domain: "./data/designated.txt"
+# 替换域名配置
+replace_cf_domain: "cf-cname.xingpingcn.top" # 检测到Cloudflare IP时替换的CNAME域名
+replace_aws_domain: "cc.cloudfront.182682.xyz" # 检测到AWS IP时替换的CNAME域名
 
-# 日志和监控
+# 白名单和定向域名文件
+whitelist_file: "./data/whitelist.txt" # 白名单域名文件：跳过云服务检查的域名列表
+designated_domain: "./data/designated.txt" # 定向域名文件：指定使用特定DNS策略的域名列表
+
+# 日志级别
 log_level: "debug"
 
-# TLS配置（DoH/DoT）
-doh_port: 0
+# 指标端口
+metrics_port: 0
+
+# DoT和DoH端口配置
 dot_port: 0
+doh_port: 0
+
+# TLS证书文件（用于DoT/DoH服务器）
 tls_cert_file: "./data/fullchain.pem"
 tls_key_file: "./data/privkey.pem"
 
-# Geosite配置
-geosite_file: "./data/geosite.dat"
-geosite_url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat"
-geosite_refresh: 72h
-geosite_group: "GEOLOCATION-CN"
+# 缓存配置
+cache:
+  max_size: "100MB" # 最大缓存大小，如 "100MB" -> 100000个域名
+  dns_ttl_min: "10m" # DNS TTL最小值：如果DNS响应TTL小于此值，强制使用此值
+  dns_ttl_max: "1h" # DNS TTL最大值：如果DNS响应TTL大于此值，强制使用此值
+  replace_cname_ttl: "30m" # 替换域名TTL：IP替换逻辑中CNAME解析结果缓存时间
+  strict_ttl: true # 严格TTL模式：强制使用配置的TTL范围
+  enable_async_refresh: true # 启用异步刷新：TTL到期前自动刷新DNS记录
+  refresh_threshold: 5s # 刷新阈值：TTL剩余5秒时开始异步刷新（必须小于最小TTL）
+  max_async_workers: 10 # 最大异步工作线程数：并发处理异步刷新任务
+
+# DoH配置
+doh:
+  cn:
+    enabled: true # 启用国内DoH
+    resolver: "223.5.5.5:53" # 国内DoH解析器地址
+    timeout: "5s" # DoH查询超时时间
+  not_cn:
+    enabled: true # 启用国外DoH
+    resolver: "8.8.8.8:53" # 国外DoH解析器地址
+    timeout: "5s" # DoH查询超时时间
