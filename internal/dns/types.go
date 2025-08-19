@@ -151,7 +151,7 @@ var (
 	TagMapSimple   = make(map[string]*DomainTag) // 域名->标签
 	TagDirtySimple = make(map[string]struct{})
 	TagMapMu       sync.RWMutex // 添加互斥锁保护
-	maxTagMapSize  = 100000     // 限制标签map最大大小
+	maxTagMapSize  = 50000      // 降低标签map最大大小，减少内存占用
 	
 	// 旧的标签系统变量（保持向后兼容）
 	TagMap   = make(map[string]*DomainTag) // 域名->标签

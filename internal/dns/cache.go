@@ -79,13 +79,21 @@ func (h *Handler) setCachedResponse(req *dns.Msg, resp *dns.Msg) {
 	}
 }
 
-// scheduleAsyncRefresh 安排异步刷新任务
+// scheduleAsyncRefresh 安排异步刷新任务 - 优化版本
 func (h *Handler) scheduleAsyncRefresh(req *dns.Msg, cacheTTL time.Duration) {
 	// 计算刷新时间点（TTL剩余时间达到阈值时）
 	refreshTime := time.Now().Add(cacheTTL - h.config.Cache.RefreshThreshold)
 	
 	// 如果刷新时间已经过了，不安排任务
 	if refreshTime.Before(time.Now()) {
+		return
+	}
+
+	// 检查任务队列状态，避免过度积压
+	if len(h.asyncRefreshChan) > 800 { // 超过80%容量时跳过
+		h.logger.Warn("异步刷新任务队列过载 (%d/%d), 跳过任务: %s", 
+			len(h.asyncRefreshChan), cap(h.asyncRefreshChan), 
+			strings.TrimSuffix(req.Question[0].Name, "."))
 		return
 	}
 
