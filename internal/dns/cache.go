@@ -272,9 +272,12 @@ func (h *Handler) checkRealMemoryUsage() {
 		h.logger.Warn("【内存监控】内存使用过高: %d MB (限制: %d MB), 执行强制清理", 
 			memoryUsageMB, memoryLimitMB)
 		
-		// 强制清理缓存
+		// 强制清理缓存到30%
 		if h.hotCache != nil {
-			h.hotCache.Clear()
+			stats := h.hotCache.GetStats()
+			targetSize := int(float64(stats.MaxSize) * 0.3)
+			deletedCount := h.hotCache.ForceCleanupToSize(targetSize)
+			h.logger.Info("【内存监控】强制清理完成，删除了 %d 个缓存项", deletedCount)
 		}
 		
 		// 清理标签系统
@@ -289,6 +292,13 @@ func (h *Handler) checkRealMemoryUsage() {
 	// 记录内存使用情况
 	h.logger.Debug("【内存监控】当前内存使用: %d MB, 堆内存: %d MB, GC次数: %d", 
 		memoryUsageMB, m.HeapAlloc/1024/1024, m.NumGC)
+	
+	// 如果内存使用超过限制的95%，执行紧急清理
+	if memoryLimitMB > 0 && memoryUsageMB > memoryLimitMB*95/100 {
+		h.logger.Error("【内存监控】内存使用超过95%%，执行紧急清理: %d MB (限制: %d MB)", 
+			memoryUsageMB, memoryLimitMB)
+		h.EmergencyMemoryCleanup()
+	}
 }
 
 // parseCacheSize 解析缓存大小配置，如 "50MB" -> 50*1024*1024
@@ -323,7 +333,7 @@ func parseCacheSize(sizeStr string) (int64, error) {
 
 // 添加主动缓存清理机制
 func (h *Handler) aggressiveCacheCleanup() {
-	ticker := time.NewTicker(1 * time.Minute) // 每1分钟清理一次，更频繁
+	ticker := time.NewTicker(30 * time.Second) // 每30秒清理一次，更频繁
 	defer ticker.Stop()
 	
 	for range ticker.C {
@@ -345,11 +355,24 @@ func (h *Handler) aggressiveCacheCleanup() {
 				h.hotCache.Clear()
 			}
 			
-			// 如果缓存大小超过限制的80%，强制清理
-			if stats.Size > int(float64(stats.MaxSize)*0.8) {
-				h.logger.Warn("【主动清理】缓存大小超过限制的80%% (%d/%d), 执行清理", 
+			// 如果缓存大小超过限制的70%，强制清理到50%
+			if stats.Size > int(float64(stats.MaxSize)*0.7) {
+				h.logger.Warn("【主动清理】缓存大小超过限制的70%% (%d/%d), 执行强制清理", 
 					stats.Size, stats.MaxSize)
-				h.hotCache.Clear()
+				targetSize := int(float64(stats.MaxSize) * 0.5)
+				deletedCount := h.hotCache.ForceCleanupToSize(targetSize)
+				h.logger.Info("【主动清理】强制清理完成，删除了 %d 个缓存项，当前大小: %d", 
+					deletedCount, h.hotCache.GetStats().Size)
+			}
+			
+			// 如果缓存大小超过限制的90%，紧急清理到30%
+			if stats.Size > int(float64(stats.MaxSize)*0.9) {
+				h.logger.Error("【紧急清理】缓存大小超过限制的90%% (%d/%d), 执行紧急清理", 
+					stats.Size, stats.MaxSize)
+				targetSize := int(float64(stats.MaxSize) * 0.3)
+				deletedCount := h.hotCache.ForceCleanupToSize(targetSize)
+				h.logger.Info("【紧急清理】紧急清理完成，删除了 %d 个缓存项，当前大小: %d", 
+					deletedCount, h.hotCache.GetStats().Size)
 			}
 		}
 		
@@ -390,6 +413,30 @@ func (h *Handler) ClearCache() {
 		h.hotCache.Clear()
 		h.logger.Info("【手动清理】缓存清理完成")
 	}
+}
+
+// 紧急内存清理 - 用于内存爆炸情况
+func (h *Handler) EmergencyMemoryCleanup() {
+	h.logger.Error("【紧急清理】执行紧急内存清理")
+	
+	// 1. 清理缓存到10%
+	if h.hotCache != nil {
+		stats := h.hotCache.GetStats()
+		targetSize := int(float64(stats.MaxSize) * 0.1)
+		deletedCount := h.hotCache.ForceCleanupToSize(targetSize)
+		h.logger.Info("【紧急清理】缓存清理完成，删除了 %d 个缓存项", deletedCount)
+	}
+	
+	// 2. 清理标签系统
+	h.cleanupExpiredTags()
+	
+	// 3. 强制GC多次
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		time.Sleep(100 * time.Millisecond)
+	}
+	
+	h.logger.Info("【紧急清理】紧急内存清理完成")
 }
 
 // 获取缓存统计信息

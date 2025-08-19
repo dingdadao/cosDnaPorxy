@@ -145,9 +145,12 @@ func NewHandler(cfg *config.Config) *Handler {
 	// 启动内存监控
 	handler.StartMemoryMonitor()
 	
-	// 启动主动缓存清理
+		// 启动主动缓存清理
 	go handler.aggressiveCacheCleanup()
-
+	
+	// 启动内存监控
+	go handler.monitorMemoryUsage()
+	
 	return handler
 }
 
@@ -587,6 +590,20 @@ func (h *Handler) processAsyncRefresh(task *AsyncRefreshTask) {
 		// 查询成功，更新缓存
 		h.setCachedResponse(req, resp)
 		h.logger.Debug("【异步刷新】缓存更新完成: %s, 新TTL: %v", task.Domain, newTTL)
+		
+		// 异步刷新后，检查缓存大小，如果超过限制则强制清理
+		if h.hotCache != nil {
+			stats := h.hotCache.GetStats()
+			if stats.Size > int(float64(stats.MaxSize)*0.9) { // 超过90%时清理
+				h.logger.Warn("【异步刷新】缓存大小超过90%% (%d/%d), 执行强制清理", 
+					stats.Size, stats.MaxSize)
+				// 清理到70%大小
+				targetSize := int(float64(stats.MaxSize) * 0.7)
+				deletedCount := h.hotCache.ForceCleanupToSize(targetSize)
+				h.logger.Info("【异步刷新】强制清理完成，删除了 %d 个缓存项，当前大小: %d", 
+					deletedCount, h.hotCache.GetStats().Size)
+			}
+		}
 	} else {
 		h.logger.Debug("【异步刷新】查询返回无效响应: %s, 响应码: %s", task.Domain, dns.RcodeToString[resp.Rcode])
 	}
@@ -806,4 +823,185 @@ func (h *Handler) periodicTagCleanup() {
 		}
 		TagMapMu.Unlock()
 	}
+}
+
+// DNSQueryResult DNS查询结果
+type DNSQueryResult struct {
+	Response    *dns.Msg
+	Upstream    []string
+	QueryType   string
+	Domain      string
+	IsCN        bool
+	IsWhitelist bool
+	IsDesignated bool
+	DesignatedRule *DesignatedDomain
+}
+
+// processDNSQuery 统一的DNS查询处理函数
+func (h *Handler) processDNSQuery(req *dns.Msg, domain string, qtype uint16, skipCache bool) *DNSQueryResult {
+	cfg := h.config
+	result := &DNSQueryResult{
+		Domain:    domain,
+		QueryType: dns.TypeToString[qtype],
+	}
+
+	// 1. 缓存检查（可选跳过）
+	if !skipCache {
+		if cachedResp, hit := h.getCachedResponse(req); hit {
+			result.Response = cachedResp
+			result.QueryType = "cached"
+			return result
+		}
+	}
+
+	// 2. 域名查询检查（日志记录）
+	h.logger.Debug("【域名查询】开始处理域名: %s, 类型: %s", domain, dns.TypeToString[qtype])
+
+	// 3. 定向域名检查 - 强制指定DNS策略
+	h.logger.Debug("【定向域名检查】开始检查域名: %s", domain)
+	if rule, matched := h.matchDesignatedDomain(domain); matched {
+		h.logger.Info("【定向域名命中】%s，使用指定DNS: %s", domain, rule.DNS)
+		AddOrUpdateDomainTagSimple(domain, TAG_DINGXIANG)
+		h.logger.Info("标签系统：%s 标记为定向域名", domain)
+		h.metrics.GetDesignatedHits().Inc()
+		
+		result.IsDesignated = true
+		result.DesignatedRule = rule
+		result.Response = h.handleSpecialQueryForAsync(req, domain, qtype, rule)
+		return result
+	}
+	h.logger.Debug("【定向域名检查】域名 %s 未匹配定向规则", domain)
+
+	// 4. 白名单检查 - 白名单域名跳过云服务检查，不进行IP替换
+	if h.isWhitelisted(domain) {
+		h.logger.Info("【白名单命中】%s，跳过云服务检查，直接进行分流", domain)
+		AddOrUpdateDomainTagSimple(domain, TAG_WHITELIST)
+		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "whitelist").Inc()
+
+		result.IsWhitelist = true
+		// 白名单域名直接进行geosite分流，跳过Cloudflare/AWS检查
+		isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+		result.IsCN = isCN
+		
+		var upstream []string
+		// 检查是否已经标记过，避免重复标记
+		if existingTag, exists := QueryDomainTag(domain); exists {
+			if existingTag.Tag == "2" { // TAG_CN = 2
+				upstream = cfg.CNUpstream
+				h.logger.Debug("白名单域名使用已有标签，国内DNS解析: %s", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("白名单域名使用已有标签，国外DNS解析: %s", domain)
+			}
+		} else {
+			// 首次标记
+			if isCN {
+				upstream = cfg.CNUpstream
+				h.logger.Debug("白名单域名使用国内DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_CN)
+				h.logger.Info("标签系统：%s 标记为国内", domain)
+			} else {
+				upstream = cfg.NotCNUpstream
+				h.logger.Debug("白名单域名使用国外DNS解析: %s", domain)
+				AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
+				h.logger.Info("标签系统：%s 标记为国外", domain)
+			}
+		}
+
+		result.Upstream = upstream
+		resp, err := h.proxyQuery(req, upstream)
+		if err != nil || resp == nil {
+			h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+			return nil
+		}
+		result.Response = resp
+		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
+		return result
+	}
+
+	// 5. 云服务检查 - 使用定向域名指定的DNS策略进行查询
+	h.logger.Debug("【云服务检查】开始检查域名: %s", domain)
+	var upstreamForCloudCheck []string
+	if designatedRule, exists := h.getDesignatedRuleForDomain(domain); exists {
+		// 使用定向域名指定的DNS策略
+		if designatedRule.UpstreamType == "cn_upstream" {
+			upstreamForCloudCheck = cfg.CNUpstream
+			h.logger.Debug("云服务检查使用定向域名指定的国内DNS: %s", domain)
+		} else if designatedRule.UpstreamType == "not_cn_upstream" {
+			upstreamForCloudCheck = cfg.NotCNUpstream
+			h.logger.Debug("云服务检查使用定向域名指定的国外DNS: %s", domain)
+		} else {
+			upstreamForCloudCheck = []string{designatedRule.DNS}
+			h.logger.Debug("云服务检查使用定向域名指定的DNS服务器: %s -> %s", domain, designatedRule.DNS)
+		}
+	} else {
+		// 没有定向域名配置，使用默认策略（所有上游）
+		upstreamForCloudCheck = append(cfg.CNUpstream, cfg.NotCNUpstream...)
+		h.logger.Debug("云服务检查使用默认DNS策略: %s", domain)
+	}
+
+	h.logger.Debug("【云服务检查】执行DNS查询，使用上游: %v", upstreamForCloudCheck)
+	resp, err := h.proxyQuery(req, upstreamForCloudCheck)
+	if err != nil || resp == nil {
+		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+		return nil
+	}
+
+	// 检查是否为云服务响应
+	if h.isCloudResponse(resp, CFType) {
+		AddOrUpdateDomainTagSimple(domain, TAG_CF)
+		h.logger.Info("标签系统：%s 标记为Cloudflare", domain)
+		// 处理IP替换
+		result.Response = h.handleReplacementForAsync(req, resp, qtype, domain, netip.Addr{}, CFType)
+		return result
+	}
+	if h.isCloudResponse(resp, AWSType) {
+		AddOrUpdateDomainTagSimple(domain, TAG_AWS)
+		h.logger.Info("标签系统：%s 标记为AWS", domain)
+		// 处理IP替换
+		result.Response = h.handleReplacementForAsync(req, resp, qtype, domain, netip.Addr{}, AWSType)
+		return result
+	}
+
+	// 6. geosite国内外分流
+	h.logger.Debug("【标签分流】开始进行geosite分流: %s", domain)
+	isCN := h.geositeManager.CheckDomainInTag(domain, cfg.GeositeGroup)
+	result.IsCN = isCN
+	
+	var upstream []string
+	// 检查是否已经标记过，避免重复标记
+	if existingTag, exists := QueryDomainTag(domain); exists {
+		if existingTag.Tag == "2" { // TAG_CN = 2
+			upstream = cfg.CNUpstream
+			h.logger.Debug("使用已有标签，国内DNS解析: %s", domain)
+		} else {
+			upstream = cfg.NotCNUpstream
+			h.logger.Debug("使用已有标签，国外DNS解析: %s", domain)
+		}
+	} else {
+		// 首次标记
+		if isCN {
+			upstream = cfg.CNUpstream
+			h.logger.Debug("使用国内DNS解析: %s", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_CN)
+			h.logger.Info("标签系统：%s 标记为国内", domain)
+		} else {
+			upstream = cfg.NotCNUpstream
+			h.logger.Debug("使用国外DNS解析: %s", domain)
+			AddOrUpdateDomainTagSimple(domain, TAG_NOT_CN)
+			h.logger.Info("标签系统：%s 标记为国外", domain)
+		}
+	}
+
+	result.Upstream = upstream
+	h.logger.Debug("【标签分流】执行DNS查询，使用上游: %v", upstream)
+	resp, err = h.proxyQuery(req, upstream)
+	if err != nil || resp == nil {
+		h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "failed").Inc()
+		return nil
+	}
+
+	result.Response = resp
+	h.metrics.GetQueriesTotal().WithLabelValues(dns.TypeToString[qtype], "passed").Inc()
+	return result
 }

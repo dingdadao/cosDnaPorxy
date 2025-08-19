@@ -2,7 +2,9 @@ package dns
 
 import (
 	"container/heap"
+	"container/list"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,16 +15,20 @@ type HotDomain struct {
 	LastAccess time.Time     // 最后访问时间
 	TTL        time.Duration // 缓存TTL
 	Data       interface{}   // 缓存的数据
+	GlobalID   uint64        // 全局唯一编号
 	index      int           // 堆中的索引位置
+	listElement *list.Element // 在时间队列中的位置
 }
 
-// HotCache 热点域名缓存池
+// HotCache 热点域名缓存池 - 优化版本
 type HotCache struct {
 	mu          sync.RWMutex
 	maxSize     int                    // 最大缓存项数
 	domains     map[string]*HotDomain  // 域名到热点数据的映射
-	hotHeap     *HotDomainHeap         // 最小堆，用于快速找到最冷的数据
+	hotHeap     *HotDomainHeap         // 最小堆，用于热度排序
+	timeQueue   *list.List             // 双端队列，按时间顺序排列（最旧的在前）
 	stats       *CacheStats            // 缓存统计
+	globalID    uint64                 // 全局递增ID
 }
 
 // CacheStats 缓存统计
@@ -37,14 +43,16 @@ type CacheStats struct {
 // NewHotCache 创建新的热点缓存
 func NewHotCache(maxSize int) *HotCache {
 	if maxSize <= 0 {
-		maxSize = 10000 // 默认1万个域名
+		maxSize = 5000 // 默认5000个域名，更保守
 	}
 	
 	cache := &HotCache{
-		maxSize: maxSize,
-		domains: make(map[string]*HotDomain),
-		hotHeap: &HotDomainHeap{},
-		stats:   &CacheStats{MaxSize: maxSize},
+		maxSize:   maxSize,
+		domains:   make(map[string]*HotDomain),
+		hotHeap:   &HotDomainHeap{},
+		timeQueue: list.New(),
+		stats:     &CacheStats{MaxSize: maxSize},
+		globalID:  0,
 	}
 	
 	heap.Init(cache.hotHeap)
@@ -70,7 +78,7 @@ func (c *HotCache) Get(domain string) (interface{}, bool) {
 	// 检查是否过期
 	if time.Now().After(hotDomain.LastAccess.Add(hotDomain.TTL)) {
 		// 过期，从缓存中移除
-		delete(c.domains, domain)
+		c.removeFromCache(hotDomain)
 		c.stats.Misses++
 		return nil, false
 	}
@@ -82,11 +90,14 @@ func (c *HotCache) Get(domain string) (interface{}, bool) {
 	// 更新堆中的位置
 	heap.Fix(c.hotHeap, hotDomain.index)
 	
+	// 移动到时间队列末尾（最新）
+	c.timeQueue.MoveToBack(hotDomain.listElement)
+	
 	c.stats.Hits++
 	return hotDomain.Data, true
 }
 
-// Set 设置缓存数据
+// Set 设置缓存数据 - 严格控制大小
 func (c *HotCache) Set(domain string, data interface{}, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -101,13 +112,17 @@ func (c *HotCache) Set(domain string, data interface{}, ttl time.Duration) {
 		existing.TTL = ttl
 		existing.LastAccess = time.Now()
 		existing.HitCount++
+		// 更新全局ID，表示这是最新的
+		existing.GlobalID = atomic.AddUint64(&c.globalID, 1)
 		heap.Fix(c.hotHeap, existing.index)
+		// 移动到时间队列末尾
+		c.timeQueue.MoveToBack(existing.listElement)
 		return
 	}
 	
-	// 如果缓存已满，驱逐最冷的数据
+	// 如果缓存已满，强制驱逐最旧的数据
 	if len(c.domains) >= c.maxSize {
-		c.evictColdest()
+		c.evictOldest()
 	}
 	
 	// 创建新的热点域名
@@ -117,16 +132,55 @@ func (c *HotCache) Set(domain string, data interface{}, ttl time.Duration) {
 		LastAccess: time.Now(),
 		TTL:        ttl,
 		Data:       data,
+		GlobalID:   atomic.AddUint64(&c.globalID, 1),
 	}
 	
-	// 添加到缓存和堆
+	// 添加到缓存、堆和时间队列
 	c.domains[domain] = hotDomain
 	heap.Push(c.hotHeap, hotDomain)
+	hotDomain.listElement = c.timeQueue.PushBack(hotDomain)
 	
 	c.stats.Size = len(c.domains)
 }
 
-// evictColdest 驱逐最冷的数据
+// evictOldest 驱逐最旧的数据（O(1)操作）
+func (c *HotCache) evictOldest() {
+	if c.timeQueue.Len() == 0 {
+		return
+	}
+	
+	// 从时间队列头部取出最旧的数据
+	oldestElement := c.timeQueue.Front()
+	if oldestElement == nil {
+		return
+	}
+	
+	oldest := oldestElement.Value.(*HotDomain)
+	
+	// 从所有数据结构中移除
+	c.removeFromCache(oldest)
+}
+
+// removeFromCache 从缓存中移除域名（内部方法）
+func (c *HotCache) removeFromCache(hotDomain *HotDomain) {
+	// 从map中删除
+	delete(c.domains, hotDomain.Domain)
+	
+	// 从堆中移除
+	if hotDomain.index >= 0 {
+		heap.Remove(c.hotHeap, hotDomain.index)
+	}
+	
+	// 从时间队列中移除
+	if hotDomain.listElement != nil {
+		c.timeQueue.Remove(hotDomain.listElement)
+	}
+	
+	c.stats.Evictions++
+	c.stats.Size = len(c.domains)
+}
+
+// evictColdest 驱逐最冷的数据（基于热度）
 func (c *HotCache) evictColdest() {
 	if c.hotHeap.Len() == 0 {
 		return
@@ -134,7 +188,13 @@ func (c *HotCache) evictColdest() {
 	
 	// 从堆顶取出最冷的数据
 	coldest := heap.Pop(c.hotHeap).(*HotDomain)
+	
+	// 从map和时间队列中移除
 	delete(c.domains, coldest.Domain)
+	if coldest.listElement != nil {
+		c.timeQueue.Remove(coldest.listElement)
+	}
+	
 	c.stats.Evictions++
 	c.stats.Size = len(c.domains)
 }
@@ -145,9 +205,7 @@ func (c *HotCache) Remove(domain string) {
 	defer c.mu.Unlock()
 	
 	if hotDomain, exists := c.domains[domain]; exists {
-		heap.Remove(c.hotHeap, hotDomain.index)
-		delete(c.domains, domain)
-		c.stats.Size = len(c.domains)
+		c.removeFromCache(hotDomain)
 	}
 }
 
@@ -159,7 +217,11 @@ func (c *HotCache) Clear() {
 	c.domains = make(map[string]*HotDomain)
 	c.hotHeap = &HotDomainHeap{}
 	heap.Init(c.hotHeap)
+	c.timeQueue.Init()
 	c.stats.Size = 0
+	c.stats.Evictions = 0
+	c.stats.Hits = 0
+	c.stats.Misses = 0
 }
 
 // GetStats 获取缓存统计
@@ -206,16 +268,47 @@ func (c *HotCache) CleanupExpired() int {
 	now := time.Now()
 	expiredCount := 0
 	
-	for domain, hotDomain := range c.domains {
+	// 从时间队列头部开始检查（最旧的在前）
+	for element := c.timeQueue.Front(); element != nil; {
+		hotDomain := element.Value.(*HotDomain)
+		nextElement := element.Next() // 保存下一个元素，因为当前元素可能被删除
+		
 		if now.After(hotDomain.LastAccess.Add(hotDomain.TTL)) {
-			heap.Remove(c.hotHeap, hotDomain.index)
-			delete(c.domains, domain)
+			c.removeFromCache(hotDomain)
 			expiredCount++
 		}
+		
+		element = nextElement
 	}
 	
-	c.stats.Size = len(c.domains)
 	return expiredCount
+}
+
+// ForceCleanupToSize 强制清理到指定大小（O(n)操作，但更高效）
+func (c *HotCache) ForceCleanupToSize(targetSize int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if targetSize >= len(c.domains) {
+		return 0
+	}
+	
+	// 计算需要删除的数量
+	toDelete := len(c.domains) - targetSize
+	deletedCount := 0
+	
+	// 从时间队列头部开始删除（最旧的在前）
+	for element := c.timeQueue.Front(); element != nil && deletedCount < toDelete; {
+		hotDomain := element.Value.(*HotDomain)
+		nextElement := element.Next()
+		
+		c.removeFromCache(hotDomain)
+		deletedCount++
+		
+		element = nextElement
+	}
+	
+	return deletedCount
 }
 
 // ===== 最小堆实现 =====
