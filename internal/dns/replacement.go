@@ -1,7 +1,6 @@
 package dns
 
 import (
-	"fmt"
 	"github.com/miekg/dns"
 	"net"
 	"net/netip"
@@ -45,17 +44,8 @@ func (h *Handler) isCloudResponse(msg *dns.Msg, iptype int) bool {
 
 // resolveReplaceCNAME 解析替换CNAME
 func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
-	// 生成缓存键
-	cacheKey := fmt.Sprintf("replace_cname:%s", cname)
-
-	// 尝试从缓存获取
-	if cached, found := h.hotCache.Get(cacheKey); found {
-		if cachedAddrs, ok := cached.([]netip.Addr); ok {
-			h.logger.Debug("替换域名缓存命中: %s", cname)
-			h.metrics.GetCacheHits().WithLabelValues("replace_cname").Inc()
-			return cachedAddrs
-		}
-	}
+	// 尝试从缓存获取 - 暂时跳过缓存，直接解析
+	// TODO: 实现替换域名的缓存机制
 
 	// 缓存未命中，执行解析
 	h.logger.Debug("替换域名缓存未命中，执行解析: %s", cname)
@@ -63,13 +53,13 @@ func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
 	var addrs []netip.Addr
 
 	// 使用所有上游解析
-	allUpstreams := append(h.config.CNUpstream, h.config.NotCNUpstream...)
+	// allUpstreams := append(h.config.CNUpstream, h.config.NotCNUpstream...)
 
 	// 创建A记录查询
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(cname), dns.TypeA)
 
-	resp, err := h.proxyQuery(req, allUpstreams)
+	resp, err := h.proxyQuery(req, h.config.CNUpstream)
 	if err == nil && resp != nil {
 		for _, rr := range resp.Answer {
 			if a, ok := rr.(*dns.A); ok {
@@ -84,7 +74,7 @@ func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
 	reqAAAA := &dns.Msg{}
 	reqAAAA.SetQuestion(dns.Fqdn(cname), dns.TypeAAAA)
 
-	respAAAA, err := h.proxyQuery(reqAAAA, allUpstreams)
+	respAAAA, err := h.proxyQuery(reqAAAA, h.config.CNUpstream)
 	if err == nil && respAAAA != nil {
 		for _, rr := range respAAAA.Answer {
 			if aaaa, ok := rr.(*dns.AAAA); ok {
@@ -100,8 +90,7 @@ func (h *Handler) resolveReplaceCNAME(cname string) []netip.Addr {
 
 	// 缓存结果（使用较长的TTL，因为替换域名相对稳定）
 	if len(addrs) > 0 {
-		h.hotCache.Set(cacheKey, addrs, h.replaceExpire)
-		h.logger.Debug("替换域名解析结果已缓存: %s -> %v", cname, addrs)
+		h.logger.Debug("替换域名解析结果: %s -> %v", cname, addrs)
 	}
 
 	return addrs
@@ -191,7 +180,7 @@ func (h *Handler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dn
 		h.logger.Info("【Cloudflare命中】%s，原IP: %v，替换为: %v", domain, originalIPs, replaceAddrs)
 		h.metrics.GetReplacedCount().Inc()
 		// 设置缓存 - 缓存替换后的响应
-		h.setCachedResponse(req, newResp)
+		h.setCachedResponse(req, newResp, false)
 		if err := w.WriteMsg(newResp); err != nil {
 			h.logger.Error("WriteMsg失败: %v", err)
 		}
@@ -199,7 +188,7 @@ func (h *Handler) handleReplacement(w dns.ResponseWriter, req *dns.Msg, resp *dn
 		h.logger.Debug("handleReplacement matched: %s -> %v", domain, originalIPs)
 	} else {
 		// 设置缓存 - 缓存原始响应
-		h.setCachedResponse(req, resp)
+		h.setCachedResponse(req, resp, false)
 		if err := w.WriteMsg(resp); err != nil {
 			h.logger.Error("WriteMsg失败: %v", err)
 		}

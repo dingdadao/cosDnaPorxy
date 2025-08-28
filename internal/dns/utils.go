@@ -100,13 +100,13 @@ func (h *Handler) loadDesignatedDomains() {
 				// 处理 *.lan 格式 - 匹配以 .lan 结尾的域名
 				suffix := rawPattern[2:] // 去掉 "*."
 				regexPattern = "^.*\\." + regexp.QuoteMeta(suffix) + "$"
-				h.logger.Debug("通配符转换: %s -> 以.%s结尾 -> %s", rawPattern, suffix, regexPattern)
+				// h.logger.Debug("通配符转换: %s -> 以.%s结尾 -> %s", rawPattern, suffix, regexPattern)
 			} else {
 				// 其他通配符格式
 				tempPattern := strings.ReplaceAll(rawPattern, "*", ".*")
 				regexPattern = "^" + regexp.QuoteMeta(tempPattern) + "$"
 				regexPattern = strings.ReplaceAll(regexPattern, `\\.\*`, ".*")
-				h.logger.Debug("通配符转换: %s -> %s -> %s", rawPattern, tempPattern, regexPattern)
+				// h.logger.Debug("通配符转换: %s -> %s -> %s", rawPattern, tempPattern, regexPattern)
 			}
 		} else if strings.HasPrefix(rawPattern, "/") && strings.HasSuffix(rawPattern, "/") && len(rawPattern) > 2 {
 			// 允许用户直接写正则，如 /mgstage.*/
@@ -136,7 +136,7 @@ func (h *Handler) loadDesignatedDomains() {
 		})
 		
 		// 添加调试日志
-		h.logger.Debug("加载规则: %s -> %s (正则: %s, 类型: %s)", rawPattern, parts[1], regexPattern, upstreamType)
+		// h.logger.Debug("加载规则: %s -> %s (正则: %s, 类型: %s)", rawPattern, parts[1], regexPattern, upstreamType)
 	}
 
 	if err := scanner.Err(); err != nil {

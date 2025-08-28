@@ -442,7 +442,7 @@ func (h *Handler) queryMultipleServers(req *dns.Msg, servers []string) (*dns.Msg
 				h.logger.Debug("选择最快的DNS响应: %s (耗时: %v)", res.server, res.latency)
 
 				// 缓存结果（使用配置的TTL时间）
-				h.setCachedResponse(req, res.resp)
+				h.setCachedResponse(req, res.resp, false)
 
 				// 取消其他查询，释放资源
 				cancel()

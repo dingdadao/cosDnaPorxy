@@ -1,8 +1,6 @@
 module cosDnaPorxy
 
-go 1.23.0
-
-toolchain go1.23.9
+go 1.23.9
 
 require (
 	github.com/dgraph-io/ristretto v0.2.0

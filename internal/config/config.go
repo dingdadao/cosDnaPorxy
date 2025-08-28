@@ -32,15 +32,12 @@ type DoHGroupConfig struct {
 
 // CacheConfig 缓存配置
 type CacheConfig struct {
-	MaxSize            string        `yaml:"max_size"`             // 最大缓存大小，如 "100MB"
-	DNSTTLMin          time.Duration `yaml:"dns_ttl_min"`          // DNS TTL最小值
-	DNSTTLMax          time.Duration `yaml:"dns_ttl_max"`          // DNS TTL最大值
-	HealthCheckTTL     time.Duration `yaml:"health_check_ttl"`     // 健康检查TTL
-	ReplaceCNameTTL    time.Duration `yaml:"replace_cname_ttl"`    // 替换域名TTL
-	StrictTTL          bool          `yaml:"strict_ttl"`           // 严格TTL模式
-	EnableAsyncRefresh bool          `yaml:"enable_async_refresh"` // 启用异步刷新
+	MaxItems           int           `yaml:"max_items"`            // 最大缓存条目数
+	TTL                time.Duration `yaml:"ttl"`                  // 统一缓存TTL
 	RefreshThreshold   time.Duration `yaml:"refresh_threshold"`    // 刷新阈值（TTL剩余时间）
+	EnableAsyncRefresh bool          `yaml:"enable_async_refresh"` // 启用异步刷新
 	MaxAsyncWorkers    int           `yaml:"max_async_workers"`    // 最大异步工作线程数
+	EvictionPolicy     string        `yaml:"eviction_policy"`      // 淘汰策略：user_query_time（用户查询时间）
 }
 
 // Config 配置结构体
@@ -117,23 +114,20 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	// 设置缓存默认值
-	if config.Cache.DNSTTLMin == 0 {
-		config.Cache.DNSTTLMin = 30 * time.Second
+	if config.Cache.MaxItems == 0 {
+		config.Cache.MaxItems = 5000 // 默认5000个条目
 	}
-	if config.Cache.DNSTTLMax == 0 {
-		config.Cache.DNSTTLMax = 3600 * time.Second
-	}
-	if config.Cache.HealthCheckTTL == 0 {
-		config.Cache.HealthCheckTTL = 15 * time.Second
-	}
-	if config.Cache.ReplaceCNameTTL == 0 {
-		config.Cache.ReplaceCNameTTL = 300 * time.Second
+	if config.Cache.TTL == 0 {
+		config.Cache.TTL = 300 * time.Second // 5分钟默认TTL
 	}
 	if config.Cache.RefreshThreshold == 0 {
 		config.Cache.RefreshThreshold = 30 * time.Second
 	}
 	if config.Cache.MaxAsyncWorkers == 0 {
 		config.Cache.MaxAsyncWorkers = 5
+	}
+	if config.Cache.EvictionPolicy == "" {
+		config.Cache.EvictionPolicy = "user_query_time" // 默认按用户查询时间淘汰
 	}
 
 	return &config, nil
@@ -147,12 +141,14 @@ func ValidateConfig(cfg *Config) error {
 	if len(cfg.CNUpstream) == 0 || len(cfg.NotCNUpstream) == 0 {
 		return fmt.Errorf("no upstream servers configured")
 	}
-	if cfg.ReplaceCFDomain == "" {
-		return fmt.Errorf("replace_domain must be set")
-	}
-	if cfg.CFMrsFile4 == "" || cfg.AWSMrsFile46 == "" {
-		return fmt.Errorf("IP ranges URLs must be configured")
-	}
+	// 暂时跳过域名替换验证，因为这些功能已经被移除
+	// if cfg.ReplaceCFDomain == "" {
+	// 	return fmt.Errorf("replace_domain must be set")
+	// }
+	// 暂时跳过IP范围文件验证，因为这些功能已经被移除
+	// if cfg.CFMrsFile4 == "" || cfg.AWSMrsFile46 == "" {
+	// 	return fmt.Errorf("IP ranges URLs must be configured")
+	// }
 	return nil
 }
 

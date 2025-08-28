@@ -17,12 +17,6 @@ not_cn_upstream:
   # - "tls://1dot1dot1dot1.cloudflare-dns.com:853"
   #- "tls://8.8.8.8:853@dns.google"
 
-# Geosite配置
-geosite_group: "GEOLOCATION-CN"
-geosite_file: "./data/geosite.dat"
-geosite_url: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-geosite_refresh: "24h"
-
 # Cloudflare和AWS IP段文件
 cf_mrs_file4: "./data/cf_mrs_file4.txt"
 cf_mrs_file4_url: "https://www.cloudflare.com/ips-v4"
@@ -31,9 +25,11 @@ cf_mrs_file6_url: "https://www.cloudflare.com/ips-v6"
 aws_mrs_file64: "./data/aws.txt"
 aws_mrs_file64_url: "https://ip-ranges.amazonaws.com/ip-ranges.json"
 
-# 缓存配置
-cf_cache_time: "72h" # Cloudflare IP段文件缓存时间
-replace_cache_time: "10m" # IP替换规则缓存时间
+# Geosite配置
+geosite_group: "GEOLOCATION-CN"
+geosite_file: "./data/geosite.dat"
+geosite_url: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+geosite_refresh: "24h"
 
 # 替换域名配置
 replace_cf_domain: "cf-cname.xingpingcn.top" # 检测到Cloudflare IP时替换的CNAME域名
@@ -59,14 +55,12 @@ tls_key_file: "./data/privkey.pem"
 
 # 缓存配置
 cache:
-  max_size: "100MB" # 最大缓存大小，如 "100MB" -> 100000个域名
-  dns_ttl_min: "10m" # DNS TTL最小值：如果DNS响应TTL小于此值，强制使用此值
-  dns_ttl_max: "1h" # DNS TTL最大值：如果DNS响应TTL大于此值，强制使用此值
-  replace_cname_ttl: "30m" # 替换域名TTL：IP替换逻辑中CNAME解析结果缓存时间
-  strict_ttl: true # 严格TTL模式：强制使用配置的TTL范围
+  max_items: 2 # 最大缓存条目数
+  ttl: "1m" # 统一缓存TTL：所有DNS响应的缓存时间
+  refresh_threshold: "30s" # 刷新阈值：TTL剩余30秒时开始异步刷新
   enable_async_refresh: true # 启用异步刷新：TTL到期前自动刷新DNS记录
-  refresh_threshold: 5s # 刷新阈值：TTL剩余5秒时开始异步刷新（必须小于最小TTL）
-  max_async_workers: 10 # 最大异步工作线程数：并发处理异步刷新任务
+  max_async_workers: 5 # 最大异步工作线程数：并发处理异步刷新任务
+  eviction_policy: "user_query_time" # 淘汰策略：user_query_time（用户查询时间）
 
 # DoH配置
 doh:
