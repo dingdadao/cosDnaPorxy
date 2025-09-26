@@ -1,143 +1,166 @@
 package dns
 
 import (
-	"cosDnaPorxy/internal/config"
-	"crypto/tls"
-	"encoding/base64"
+	"context"
 	"fmt"
-	"github.com/miekg/dns"
-	"io"
-	"log"
 	"net"
-	"net/http"
+	"sync"
+	"time"
+
+	"cosDnaPorxy/internal/config"
+	"cosDnaPorxy/internal/utils"
+
+	"github.com/miekg/dns"
 )
 
-// dnsResponseWriter DNS响应写入器
-type dnsResponseWriter struct {
-	w http.ResponseWriter
+// Server DNS服务器包装器
+type Server struct {
+	config  *config.Config
+	logger  *utils.EnhancedLogger
+	handler *RefactoredHandler
+	server  *dns.Server
+	conn    net.PacketConn
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.RWMutex
+	running bool
 }
 
-func (d *dnsResponseWriter) LocalAddr() net.Addr  { return dummyAddr{} }
-func (d *dnsResponseWriter) RemoteAddr() net.Addr { return dummyAddr{} }
-func (d *dnsResponseWriter) WriteMsg(m *dns.Msg) error {
-	data, err := m.Pack()
+// NewUDPServer 创建UDP DNS服务器
+func NewUDPServer(cfg *config.Config, handler *RefactoredHandler) (*Server, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &Server{
+		config:  cfg,
+		logger:  handler.Logger,
+		handler: handler,
+		ctx:     ctx,
+		cancel:  cancel,
+	}, nil
+}
+
+// Start 启动DNS服务器
+func (s *Server) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.running {
+		return fmt.Errorf("DNS服务器已在运行")
+	}
+
+	// 创建UDP连接
+	addr := fmt.Sprintf(":%d", s.config.ListenPort)
+	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("监听UDP端口失败: %w", err)
 	}
-	d.w.Header().Set("Content-Type", "application/dns-message")
-	_, err = d.w.Write(data)
-	return err
-}
-func (d *dnsResponseWriter) Write([]byte) (int, error) { return 0, nil }
-func (d *dnsResponseWriter) Close() error              { return nil }
-func (d *dnsResponseWriter) TsigStatus() error         { return nil }
-func (d *dnsResponseWriter) TsigTimersOnly(bool)       {}
-func (d *dnsResponseWriter) Hijack()                   {}
+	s.conn = conn
 
-type dummyAddr struct{}
-
-func (dummyAddr) Network() string { return "tcp" }
-func (dummyAddr) String() string  { return "127.0.0.1:0" }
-
-// StartUDPServer 启动UDP DNS服务器
-func StartUDPServer(config *config.Config, handler dns.Handler) {
-	server := &dns.Server{
-		Addr:    fmt.Sprintf(":%d", config.ListenPort),
-		Net:     "udp",
-		Handler: handler,
-		UDPSize: 65535,
-	}
-	log.Printf("Starting UDP DNS server on :%d", config.ListenPort)
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("UDP DNS server failed: %v", err)
-	}
-}
-
-// StartDoTServer 启动DoT服务器
-func StartDoTServer(config *config.Config, handler dns.Handler) {
-	if config.TLSCertFile == "" || config.TLSKeyFile == "" || config.DoTPort == 0 {
-		log.Println("DoT not configured. Skipping.")
-		return
+	// 创建DNS服务器
+	s.server = &dns.Server{
+		PacketConn: conn,
+		Handler:    s.handler,
+		Net:        "udp",
 	}
 
-	cert, err := tls.LoadX509KeyPair(config.TLSCertFile, config.TLSKeyFile)
-	if err != nil {
-		log.Fatalf("Failed to load TLS certificate: %v", err)
-	}
+	s.running = true
 
-	server := &dns.Server{
-		Addr:      fmt.Sprintf(":%d", config.DoTPort),
-		Net:       "tcp-tls",
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
-		Handler:   handler,
-	}
-
-	log.Printf("Starting DoT server on :%d", config.DoTPort)
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("DoT server failed: %v", err)
-	}
-}
-
-// handleDoHRequest 处理DoH请求
-func handleDoHRequest(w http.ResponseWriter, r *http.Request, handler dns.Handler, config *config.Config) {
-	var dnsQuery []byte
-	var err error
-
-	switch r.Method {
-	case http.MethodGet:
-		dnsParam := r.URL.Query().Get("dns")
-		dnsQuery, err = base64.RawURLEncoding.DecodeString(dnsParam)
-	case http.MethodPost:
-		dnsQuery, err = io.ReadAll(r.Body)
-	default:
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if err != nil {
-		http.Error(w, "Invalid DNS query", http.StatusBadRequest)
-		return
-	}
-
-	req := &dns.Msg{}
-	if err := req.Unpack(dnsQuery); err != nil {
-		http.Error(w, "Failed to parse DNS query", http.StatusBadRequest)
-		return
-	}
-
-	rw := &dnsResponseWriter{w: w}
-	handler.ServeDNS(rw, req)
-}
-
-// loadTLSCert 加载TLS证书
-func loadTLSCert(cfg *config.Config) tls.Certificate {
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-	if err != nil {
-		log.Fatalf("Failed to load TLS cert/key: %v", err)
-	}
-	return cert
-}
-
-// StartDoHServer 启动DoH服务器
-func StartDoHServer(config *config.Config, handler dns.Handler) {
-	if config.TLSCertFile == "" || config.TLSKeyFile == "" || config.DoHPort == 0 {
-		log.Println("DoH not configured. Skipping.")
-		return
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
-		handleDoHRequest(w, r, handler, config)
+	s.logger.Info("🚀 [UDP DNS服务器启动] ", map[string]interface{}{
+		"rule": "UDP_SERVER_START",
+		"addr": addr,
 	})
 
-	server := &http.Server{
-		Addr:      fmt.Sprintf(":%d", config.DoHPort),
-		Handler:   mux,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{loadTLSCert(config)}},
+	// 启动服务器（阻塞）
+	if err := s.server.ActivateAndServe(); err != nil {
+		s.running = false
+		return fmt.Errorf("DNS服务器启动失败: %w", err)
 	}
 
-	log.Printf("Starting DoH server on :%d", config.DoHPort)
-	if err := server.ListenAndServeTLS(config.TLSCertFile, config.TLSKeyFile); err != nil {
-		log.Fatalf("DoH server failed: %v", err)
+	return nil
+}
+
+// Stop 停止DNS服务器
+func (s *Server) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.running {
+		return
 	}
-} 
+
+	s.logger.Info("🔄 [停止UDP DNS服务器] ", map[string]interface{}{
+		"rule": "UDP_SERVER_STOP",
+	})
+
+	// 设置关闭超时
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// 关闭服务器
+	if s.server != nil {
+		if err := s.server.ShutdownContext(shutdownCtx); err != nil {
+			s.logger.Warn("⚠️ DNS服务器关闭警告", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	}
+
+	// 关闭连接
+	if s.conn != nil {
+		if err := s.conn.Close(); err != nil {
+			s.logger.Warn("⚠️ 连接关闭警告", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	}
+
+	s.running = false
+	s.cancel()
+
+	s.logger.Info("✅ [UDP DNS服务器已停止] ", map[string]interface{}{
+		"rule": "UDP_SERVER_STOPPED",
+	})
+}
+
+// IsRunning 检查服务器是否在运行
+func (s *Server) IsRunning() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.running
+}
+
+// GetStats 获取服务器统计信息
+func (s *Server) GetStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	stats := map[string]interface{}{
+		"running": s.running,
+		"port":    s.config.ListenPort,
+		"type":    "udp",
+	}
+
+	if s.running && s.conn != nil {
+		stats["local_addr"] = s.conn.LocalAddr().String()
+	}
+
+	return stats
+}
+
+// StartUDPServer 启动UDP DNS服务器（兼容旧接口）
+func StartUDPServer(cfg *config.Config, handler *RefactoredHandler) {
+	server, err := NewUDPServer(cfg, handler)
+	if err != nil {
+		handler.Logger.Error("❌ 创建UDP服务器失败", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	if err := server.Start(); err != nil {
+		handler.Logger.Error("❌ 启动UDP服务器失败", map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+}
