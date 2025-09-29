@@ -384,7 +384,12 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 		return fmt.Errorf(errorMsg)
 	}
 
-	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response.Rcode == dns.RcodeSuccess {
+	// 验证查询结果：必须有成功响应且包含实际答案记录
+	if result.HasSuccess && result.SuccessResult != nil &&
+		result.SuccessResult.Response != nil &&
+		result.SuccessResult.Response.Rcode == dns.RcodeSuccess &&
+		len(result.SuccessResult.Response.Answer) > 0 {
+
 		// 检查是否为云服务
 		detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
 		isCloud := detection.Type != CloudTypeNone
@@ -396,9 +401,10 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 		}
 
 		h.Logger.Info("✅ [缓存刷新成功] ", map[string]interface{}{
-			"domain":   domain,
-			"rule":     "CACHE_REFRESH_SUCCESS",
-			"is_cloud": isCloud,
+			"domain":       domain,
+			"rule":         "CACHE_REFRESH_SUCCESS",
+			"is_cloud":     isCloud,
+			"answer_count": len(result.SuccessResult.Response.Answer),
 		})
 
 		h.Logger.Debug("缓存刷新详细信息", map[string]interface{}{
@@ -410,10 +416,35 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 			"rcode":         dns.RcodeToString[result.SuccessResult.Response.Rcode],
 		})
 	} else {
-		h.Logger.Warn("⚠️ [缓存刷新无成功响应] ", map[string]interface{}{
-			"domain":     domain,
-			"rule":       "CACHE_REFRESH_NO_SUCCESS",
-			"has_result": result.FastestResult != nil,
+		// 记录详细的失败原因
+		failureReason := "unknown_error"
+		if result.FastestResult != nil && result.FastestResult.Error != nil {
+			failureReason = result.FastestResult.Error.Error()
+		} else if !result.HasSuccess {
+			failureReason = "no_successful_response"
+		} else if result.SuccessResult == nil {
+			failureReason = "success_result_is_nil"
+		} else if result.SuccessResult.Response == nil {
+			failureReason = "response_is_nil"
+		} else if result.SuccessResult.Response.Rcode != dns.RcodeSuccess {
+			failureReason = fmt.Sprintf("non_success_rcode: %s", dns.RcodeToString[result.SuccessResult.Response.Rcode])
+		} else if len(result.SuccessResult.Response.Answer) == 0 {
+			failureReason = "no_answer_records"
+		}
+
+		h.Logger.Warn("⚠️ [缓存刷新跳过] ", map[string]interface{}{
+			"domain":         domain,
+			"rule":           "CACHE_REFRESH_SKIP",
+			"reason":         failureReason,
+			"has_result":     result.FastestResult != nil,
+			"has_success":    result.HasSuccess,
+			"success_result": result.SuccessResult != nil,
+		})
+
+		// 不更新缓存，保持原有缓存内容
+		h.Logger.Debug("异步刷新未更新缓存，保持原有缓存内容", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
 		})
 	}
 
