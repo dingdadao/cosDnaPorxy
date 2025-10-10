@@ -2,6 +2,7 @@ package dns
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/miekg/dns"
 )
@@ -91,7 +92,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 	var responseToReturn *dns.Msg
 	var errorToReturn error
 
-	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response != nil {
+	if h.IsValidDNSResult(result) {
 		// 有有效结果，优先返回成功结果
 		responseToReturn = result.SuccessResult.Response
 		h.Logger.Debug("✅ 返回成功结果给客户端", map[string]interface{}{
@@ -125,4 +126,43 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 	}
 
 	return responseToReturn, errorToReturn
+}
+
+// ValidateDNSResult 验证查询结果是否包含有效的 DNS 记录
+func (h *RefactoredHandler) ValidateDNSResult(result *ConcurrentQueryResult) (bool, string) {
+	if result == nil {
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "result == nil"})
+		return false, "result == nil"
+	}
+	if result.SuccessResult == nil {
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "SuccessResult == nil"})
+		return false, "SuccessResult == nil"
+	}
+	r := result.SuccessResult
+	if r.Error != nil {
+		h.Logger.Debug("DNS 响应错误", map[string]interface{}{"error": r.Error.Error()})
+		return false, r.Error.Error()
+	}
+	if r.Response == nil {
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Response == nil"})
+		return false, "Response == nil"
+	}
+	resp := r.Response
+	if resp.Rcode != dns.RcodeSuccess {
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Rcode != Success", "rcode": resp.Rcode})
+		return false, fmt.Sprintf("Rcode=%d", resp.Rcode)
+	}
+	if len(resp.Answer) == 0 {
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Answer 为空"})
+		return false, "Answer 为空"
+	}
+
+	h.Logger.Debug("DNS 验证成功", map[string]interface{}{"answer_count": len(resp.Answer)})
+	return true, "验证成功"
+}
+
+// IsValidDNSResult 只返回 bool
+func (h *RefactoredHandler) IsValidDNSResult(result *ConcurrentQueryResult) bool {
+	ok, _ := h.ValidateDNSResult(result)
+	return ok
 }

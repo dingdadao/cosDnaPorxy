@@ -35,8 +35,8 @@ type DoTConn struct {
 func NewDoTConnPool() *DoTConnPool {
 	return &DoTConnPool{
 		conns:    make(map[string]*DoTConn),
-		maxConns: 10,  // 增加每个服务器的最大连接数
-		timeout:  30 * time.Second, // 增加连接超时时间
+		maxConns: 20,               // 增加每个服务器的最大连接数到20
+		timeout:  90 * time.Second, // 增加连接超时时间到90秒
 	}
 }
 
@@ -66,20 +66,13 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 
 	// 创建TCP连接
 	log.Printf("[DoT连接池] 开始连接TCP: %s", serverAddr)
-	tcpConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second)  // 增加TCP连接超时
+	tcpConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second) // 增加TCP连接超时
 	if err != nil {
 		log.Printf("[DoT连接池] TCP连接失败: %s, 错误: %v", serverAddr, err)
 		return nil, fmt.Errorf("failed to dial TCP: %w", err)
 	}
 	log.Printf("[DoT连接池] TCP连接成功: %s", serverAddr)
 
-	// 创建TLS连接
-	tlsConfig := &tls.Config{
-		ServerName:         strings.Split(serverAddr, ":")[0],
-		InsecureSkipVerify: false,
-		MinVersion:         tls.VersionTLS12,
-	}
-	
 	// 设置TCP保活
 	if tcpConn, ok := tcpConn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
@@ -87,10 +80,17 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 		tcpConn.SetLinger(0) // 立即关闭
 	}
 
+	// 创建TLS连接
+	tlsConfig := &tls.Config{
+		ServerName:         strings.Split(serverAddr, ":")[0],
+		InsecureSkipVerify: false,
+		MinVersion:         tls.VersionTLS12,
+	}
+
 	tlsConn := tls.Client(tcpConn, tlsConfig)
 
 	// 设置TLS握手超时
-	handshakeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)  // 增加TLS握手超时
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // 增加TLS握手超时到10秒
 	defer cancel()
 
 	log.Printf("[DoT连接池] 开始TLS握手: %s", serverAddr)
@@ -123,14 +123,14 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 func (p *DoTConnPool) cleanupOldConnections() {
 	var oldestConn *DoTConn
 	var oldestTime time.Time
-	
+
 	for _, conn := range p.conns {
 		if oldestConn == nil || conn.lastUsed.Before(oldestTime) {
 			oldestConn = conn
 			oldestTime = conn.lastUsed
 		}
 	}
-	
+
 	if oldestConn != nil {
 		log.Printf("[DoT连接池] 清理最旧连接: %s", oldestConn.server)
 		oldestConn.Close()
@@ -150,8 +150,6 @@ func (p *DoTConnPool) PutConn(conn *DoTConn) {
 	conn.inUse = false
 	conn.lastUsed = time.Now()
 }
-
-
 
 // Close 关闭连接池中的所有连接
 func (p *DoTConnPool) Close() {
@@ -188,8 +186,8 @@ type DoHConnPool struct {
 func NewDoHConnPool() *DoHConnPool {
 	return &DoHConnPool{
 		clients:    make(map[string]*http.Client),
-		maxClients: 10, // 每个服务器最多10个客户端
-		timeout:    30 * time.Second,
+		maxClients: 20,               // 每个服务器最多20个客户端
+		timeout:    90 * time.Second, // 增加超时时间到90秒
 	}
 }
 
@@ -212,10 +210,10 @@ func (p *DoHConnPool) GetClient(server string) *http.Client {
 	client := &http.Client{
 		Timeout: p.timeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
+			MaxIdleConns:        200,              // 增加最大空闲连接数
+			MaxIdleConnsPerHost: 20,               // 增加每个主机的最大空闲连接数
+			IdleConnTimeout:     90 * time.Second, // 增加空闲连接超时时间
+			TLSHandshakeTimeout: 10 * time.Second, // 增加TLS握手超时
 			DisableCompression:  true,
 		},
 	}
@@ -247,4 +245,4 @@ func (p *DoHConnPool) Close() {
 		client.CloseIdleConnections()
 	}
 	p.clients = make(map[string]*http.Client)
-} 
+}

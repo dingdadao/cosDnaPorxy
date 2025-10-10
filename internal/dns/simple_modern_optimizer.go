@@ -83,16 +83,16 @@ func (qo *SimpleModernOptimizer) initHTTPClient() {
 	qo.httpClient = &http.Client{
 		Timeout: qo.modernTimeout, // 使用现代协议超时
 		Transport: &http.Transport{
-			MaxIdleConns:          50,               // 减少空闲连接
-			MaxIdleConnsPerHost:   5,                // 减少每个主机的空闲连接
-			IdleConnTimeout:       30 * time.Second, // 更短的空闲超时
+			MaxIdleConns:          200,              // 增加空闲连接到200
+			MaxIdleConnsPerHost:   20,               // 增加每个主机的空闲连接到20
+			IdleConnTimeout:       90 * time.Second, // 延长空闲超时到90秒
 			TLSHandshakeTimeout:   qo.modernTimeout, // 使用现代协议超时
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig:       qo.tlsConfig,
-			DisableKeepAlives:     true, // 禁用keep-alive，强制关闭连接
+			DisableKeepAlives:     false, // 启用keep-alive
 			DialContext: (&net.Dialer{
 				Timeout:   qo.modernTimeout, // 连接超时
-				KeepAlive: 0,                // 禁用TCP keep-alive
+				KeepAlive: 30 * time.Second, // 启用TCP keep-alive并设置更长时间
 			}).DialContext,
 		},
 	}
@@ -115,8 +115,6 @@ func (qo *SimpleModernOptimizer) Query(req *dns.Msg, upstreams []string) *Concur
 // concurrentQuery 并发查询多个上游服务器
 func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
-	defer cancel()
 
 	// 过滤有效的上游服务器
 	validUpstreams := qo.filterValidUpstreams(upstreams)
@@ -128,6 +126,81 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			HasSuccess: false,
 		}
 	}
+
+	// 如果只有一个有效的上游服务器，直接查询而不使用并发
+	if len(validUpstreams) == 1 {
+		server := validUpstreams[0]
+		qo.logger.Debug("📡 单一服务器直接查询", map[string]interface{}{
+			"server": server,
+			"domain": req.Question[0].Name,
+		})
+
+		result := qo.queryServer(req, server)
+
+		// 添加空指针检查
+		if result == nil {
+			result = &QueryResult{
+				Server: server,
+				Error:  fmt.Errorf("query result is nil"),
+			}
+		}
+
+		var allResults []*QueryResult
+		allResults = append(allResults, result)
+
+		// 检查结果是否有效
+		hasSuccess := false
+		hasValidResponse := false
+		var successResult *QueryResult
+		var fastestValidResult *QueryResult
+
+		if result.Error == nil && result.Response != nil && result.Response.Rcode == dns.RcodeSuccess {
+			result.IsSuccess = true
+			successResult = result
+			hasSuccess = true
+
+			if len(result.Response.Answer) > 0 {
+				fastestValidResult = result
+				hasValidResponse = true
+			}
+		}
+
+		// 安全地获取答案数量
+		answerCount := 0
+		if result.Response != nil {
+			answerCount = len(result.Response.Answer)
+		}
+
+		qo.logger.Info("✅ 单一服务器查询完成", map[string]interface{}{
+			"server":      server,
+			"time":        result.ResponseTime.String(),
+			"has_success": hasSuccess,
+			"has_valid":   hasValidResponse,
+			"answers":     answerCount,
+			"total_time":  time.Since(start).String(),
+		})
+
+		// 返回结果：优先使用有效结果作为 SuccessResult
+		var finalSuccessResult *QueryResult
+		if hasValidResponse && fastestValidResult != nil {
+			finalSuccessResult = fastestValidResult
+		} else if hasSuccess && successResult != nil {
+			finalSuccessResult = successResult
+		}
+
+		return &ConcurrentQueryResult{
+			FastestResult:  result,             // 最快结果（可能是错误）
+			SuccessResult:  finalSuccessResult, // 最优有效结果
+			AllResults:     allResults,
+			HasSuccess:     hasValidResponse || hasSuccess, // 有效结果或成功结果
+			FastestTime:    result.ResponseTime,
+			TotalQueryTime: time.Since(start),
+		}
+	}
+
+	// 多个上游服务器时使用并发查询
+	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	defer cancel()
 
 	// 创建结果通道
 	resultChan := make(chan *QueryResult, len(validUpstreams))
@@ -190,69 +263,107 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	hasSuccess := false
 	hasValidResponse := false
 
-	// 从通道中收集结果，优先返回有效结果
-	for result := range resultChan {
-		allResults = append(allResults, result)
+	// 优化：一旦发现有效结果就立即返回，而不是等待所有查询完成
+	// 创建一个用于快速返回的通道
+	quickReturnChan := make(chan *QueryResult, 1)
 
-		// 记录最快的结果（无论成功失败）
-		if fastestResult == nil {
-			fastestResult = result
-			fastestTime = result.ResponseTime
-		}
+	// 启动一个goroutine来处理结果收集
+	// 一旦发现有效结果就立即停止等待其他结果
+	resultProcessingDone := make(chan struct{})
+	go func() {
+		defer close(resultProcessingDone)
 
-		// 检查是否为有效响应
-		if result.Error == nil && result.Response != nil {
-			if result.Response.Rcode == dns.RcodeSuccess {
-				result.IsSuccess = true
+		for result := range resultChan {
+			allResults = append(allResults, result)
 
-				// 记录第一个成功结果
-				if !hasSuccess {
-					successResult = result
-					hasSuccess = true
-				}
+			// 记录最快的结果（无论成功失败）
+			if fastestResult == nil {
+				fastestResult = result
+				fastestTime = result.ResponseTime
+			} else if result.ResponseTime < fastestTime {
+				fastestResult = result
+				fastestTime = result.ResponseTime
+			}
 
-				// 检查是否有答案（更优先的结果）
-				if len(result.Response.Answer) > 0 {
-					if !hasValidResponse {
-						fastestValidResult = result
-						hasValidResponse = true
-						qo.logger.Debug("🏆 发现第一个有效结果", map[string]interface{}{
-							"server":  result.Server,
-							"time":    result.ResponseTime.String(),
-							"answers": len(result.Response.Answer),
-							"rcode":   dns.RcodeToString[result.Response.Rcode],
-						})
+			// 检查是否为有效响应
+			if result.Error == nil && result.Response != nil {
+				if result.Response.Rcode == dns.RcodeSuccess {
+					result.IsSuccess = true
+
+					// 记录第一个成功结果
+					if !hasSuccess {
+						successResult = result
+						hasSuccess = true
+					}
+
+					// 检查是否有答案（更优先的结果）
+					if len(result.Response.Answer) > 0 {
+						if !hasValidResponse {
+							fastestValidResult = result
+							hasValidResponse = true
+							qo.logger.Debug("🏆 发现第一个有效结果", map[string]interface{}{
+								"server":  result.Server,
+								"time":    result.ResponseTime.String(),
+								"answers": len(result.Response.Answer),
+								"rcode":   dns.RcodeToString[result.Response.Rcode],
+							})
+							// 一旦发现有效结果，立即发送到快速返回通道并停止等待
+							select {
+							case quickReturnChan <- result:
+								// 发现有效结果后，取消上下文以停止其他查询
+								cancel()
+							default:
+								// 如果通道已满，忽略
+							}
+							// 发现有效结果后立即返回
+							return
+						}
 					}
 				}
 			}
 		}
-	}
+	}()
 
-	totalTime := time.Since(start)
-
-	// 选择最优结果：有效结果 > 成功结果 > 最快结果
+	// 等待第一个有效结果或超时
 	var bestResult *QueryResult
-	if hasValidResponse && fastestValidResult != nil {
-		bestResult = fastestValidResult
-		qo.logger.Debug("🏅 使用最优有效结果", map[string]interface{}{
+	select {
+	case bestResult = <-quickReturnChan:
+		// 收到第一个有效结果，立即使用
+		qo.logger.Debug("⚡ 快速返回第一个有效结果", map[string]interface{}{
 			"server":  bestResult.Server,
 			"answers": len(bestResult.Response.Answer),
+			"time":    bestResult.ResponseTime.String(),
 		})
-	} else if hasSuccess && successResult != nil {
-		bestResult = successResult
-		qo.logger.Debug("🥈 使用成功结果（无答案）", map[string]interface{}{
-			"server": bestResult.Server,
-			"rcode":  dns.RcodeToString[bestResult.Response.Rcode],
-		})
-	} else {
-		bestResult = fastestResult
-		serverName := "none"
-		if bestResult != nil {
-			serverName = bestResult.Server
+		// 等待结果处理完成（应该很快）
+		<-resultProcessingDone
+	case <-time.After(qo.modernTimeout):
+		// 超时后等待结果处理完成
+		<-resultProcessingDone
+		qo.logger.Debug("⏰ 等待超时，使用已收集的结果")
+
+		// 选择最优结果：有效结果 > 成功结果 > 最快结果
+		if hasValidResponse && fastestValidResult != nil {
+			bestResult = fastestValidResult
+			qo.logger.Debug("🏅 使用最优有效结果", map[string]interface{}{
+				"server":  bestResult.Server,
+				"answers": len(bestResult.Response.Answer),
+			})
+		} else if hasSuccess && successResult != nil {
+			bestResult = successResult
+			qo.logger.Debug("🥈 使用成功结果（无答案）", map[string]interface{}{
+				"server": bestResult.Server,
+				"rcode":  dns.RcodeToString[bestResult.Response.Rcode],
+			})
+		} else {
+			bestResult = fastestResult
+			serverName := "none"
+			if bestResult != nil {
+				serverName = bestResult.Server
+			}
+			qo.logger.Debug("🚔 使用最快结果（可能失败）", map[string]interface{}{
+				"server": serverName,
+			})
 		}
-		qo.logger.Debug("🚔 使用最快结果（可能失败）", map[string]interface{}{
-			"server": serverName,
-		})
 	}
 
 	// 确保始终有 FastestResult，即使所有查询都失败
@@ -260,11 +371,12 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 		fastestResult = &QueryResult{
 			Error:        fmt.Errorf("all %d upstream queries failed", len(validUpstreams)),
 			Server:       "none",
-			ResponseTime: totalTime,
+			ResponseTime: time.Since(start),
 		}
 	}
 
 	// 记录统计信息
+	totalQueryTime := time.Since(start)
 	if hasValidResponse && fastestValidResult != nil {
 		qo.logger.Info("✅ 简化并发查询成功（有效结果）", map[string]interface{}{
 			"fastest_server":      fastestResult.Server,
@@ -273,7 +385,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"valid_result_time":   fastestValidResult.ResponseTime.String(),
 			"valid_answers":       len(fastestValidResult.Response.Answer),
 			"total_results":       len(allResults),
-			"total_time":          totalTime.String(),
+			"total_time":          totalQueryTime.String(),
 		})
 	} else if hasSuccess && successResult != nil {
 		qo.logger.Info("🥈 简化并发查询成功（无答案）", map[string]interface{}{
@@ -282,14 +394,14 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"success_server": successResult.Server,
 			"success_time":   successResult.ResponseTime.String(),
 			"total_results":  len(allResults),
-			"total_time":     totalTime.String(),
+			"total_time":     totalQueryTime.String(),
 		})
 	} else {
 		qo.logger.Warn("⚠️ 简化并发查询全部失败", map[string]interface{}{
 			"fastest_server": fastestResult.Server,
 			"fastest_time":   fastestTime.String(),
 			"total_results":  len(allResults),
-			"total_time":     totalTime.String(),
+			"total_time":     totalQueryTime.String(),
 		})
 	}
 
@@ -307,7 +419,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 		AllResults:     allResults,
 		HasSuccess:     hasValidResponse || hasSuccess, // 有效结果或成功结果
 		FastestTime:    fastestTime,
-		TotalQueryTime: totalTime,
+		TotalQueryTime: totalQueryTime,
 	}
 }
 
@@ -529,7 +641,6 @@ func (qo *SimpleModernOptimizer) queryDoH(req *dns.Msg, serverURL string) (*dns.
 	// 设置DoH头部
 	httpReq.Header.Set("Content-Type", "application/dns-message")
 	httpReq.Header.Set("Accept", "application/dns-message")
-	httpReq.Header.Set("Connection", "close") // 强制关闭连接
 
 	// 发送请求
 	httpResp, err := qo.httpClient.Do(httpReq)

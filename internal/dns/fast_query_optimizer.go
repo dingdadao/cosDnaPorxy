@@ -232,6 +232,8 @@ func (qo *FastQueryOptimizer) queryServer(req *dns.Msg, server string) *QueryRes
 			"rtt":     rtt.String(),
 			"answers": len(resp.Answer),
 			"rcode":   dns.RcodeToString[resp.Rcode],
+			// "resp.name": resp.Question[0].Name,
+			// "resp.type": dns.TypeToString[resp.Question[0].Qtype],
 		})
 	} else if err != nil {
 		qo.logger.Debug("❌ DNS查询失败", map[string]interface{}{

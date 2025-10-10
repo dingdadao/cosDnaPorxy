@@ -221,9 +221,31 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 	// 深拷贝响应对象
 	responseCopy := response.Copy()
 
+	// 计算实际TTL（使用响应中的最小TTL，但不低于默认TTL）
+	actualTTL := c.defaultTTL
+	if responseCopy != nil && len(responseCopy.Answer) > 0 {
+		// 从响应中获取最小的TTL
+		var minTTL uint32 = 0
+		for _, rr := range responseCopy.Answer {
+			if rr.Header().Ttl > 0 {
+				if minTTL == 0 || rr.Header().Ttl < minTTL {
+					minTTL = rr.Header().Ttl
+				}
+			}
+		}
+
+		// 如果有有效的TTL，则使用它（但不低于默认TTL）
+		if minTTL > 0 {
+			upstreamTTL := time.Duration(minTTL) * time.Second
+			if upstreamTTL > c.defaultTTL {
+				actualTTL = upstreamTTL
+			}
+		}
+	}
+
 	// 计算过期时间和刷新阈值
-	expireAt := time.Now().Add(c.defaultTTL)
-	refreshThreshold := time.Duration(float64(c.defaultTTL) * 0.3) // 30%作为刷新阈值
+	expireAt := time.Now().Add(actualTTL)
+	refreshThreshold := time.Duration(float64(actualTTL) * 0.3) // 30%作为刷新阈值
 
 	// 生成缓存键
 	key := c.key(domain, qType)
@@ -313,8 +335,14 @@ func (c *OptimizedDNSCache) ShouldRefresh(domain string, qType uint16) bool {
 		}
 	}
 
+	// 设置最小刷新间隔，避免过于频繁的刷新
+	minRefreshInterval := 30 * time.Second
+	if refreshThreshold < minRefreshInterval {
+		refreshThreshold = minRefreshInterval
+	}
+
 	// 如果剩余TTL小于刷新阈值，则需要刷新
-	shouldRefresh := remainingTTL < refreshThreshold
+	shouldRefresh := remainingTTL <= refreshThreshold
 
 	// 添加调试日志
 	if shouldRefresh {
@@ -435,6 +463,40 @@ func (c *OptimizedDNSCache) GetStats() CacheStats {
 	size := len(c.store)
 	c.mu.RUnlock()
 	return CacheStats{Size: size}
+}
+
+// ExtendTTL 延长缓存条目的过期时间
+func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time.Duration) {
+	// 添加空指针检查
+	if c == nil {
+		return
+	}
+
+	key := c.key(domain, qType)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, exists := c.store[key]; exists {
+		// 检查当前剩余TTL
+		remainingTTL := time.Until(entry.ExpireAt)
+
+		// 如果当前剩余TTL已经大于要延长的时间，则不进行延长
+		// 这样可以避免频繁刷新导致的过度延长
+		if remainingTTL > duration {
+			return
+		}
+
+		// 延长过期时间，但不超过配置的最大TTL
+		newTTL := duration
+		if newTTL > c.defaultTTL*2 { // 最多延长到默认TTL的2倍
+			newTTL = c.defaultTTL * 2
+		}
+
+		entry.ExpireAt = time.Now().Add(newTTL)
+		// 更新最后访问时间
+		entry.LastAccess = time.Now()
+	}
 }
 
 // DebugCache 输出缓存内容用于调试

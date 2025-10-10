@@ -50,10 +50,12 @@ type Config struct {
 	CFCacheTime               string           `yaml:"cf_cache_time"`
 	CFMrsFile6URL             string           `yaml:"cf_mrs_file6_url"`
 	ReplaceCacheTime          string           `yaml:"replace_cache_time"`
+	NoAnswerCacheTime         string           `yaml:"no_answer_cache_time"` // 无答案响应的缓存时间
 	AWSMrsFile46              string           `yaml:"aws_mrs_file64"`
 	AWSMrsFile46URL           string           `yaml:"aws_mrs_file64_url"`
 	ReplaceCFDomain           string           `yaml:"replace_cf_domain"`
 	ReplaceAWSDomain          string           `yaml:"replace_aws_domain"`
+	DefaultDNS                string           `yaml:"default_dns"` // 默认DNS服务器（支持URL scheme格式）
 	WhitelistFile             string           `yaml:"whitelist_file"`
 	DesignatedDomain          string           `yaml:"designated_domain"`
 	LogLevel                  string           `yaml:"log_level"`

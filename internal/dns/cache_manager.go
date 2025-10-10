@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"context"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -190,6 +191,11 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 	// }
 }
 
+// IsCloud 检查域名是否为云服务域名
+func (cm *CacheManager) IsCloud(domain string, qtype uint16) bool {
+	return cm.cache.IsCloud(domain, qtype)
+}
+
 // Set 设置缓存（只缓存成功的响应）
 func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCloud bool, cloudType ...int) {
 	timer := cm.logger.StartTimer("cache_set", map[string]interface{}{
@@ -249,6 +255,25 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 	// 计算实际TTL
 	actualTTL := cm.calculateTTL(response)
 
+	// 对于没有答案的NOERROR响应，使用配置的缓存时间（默认10秒）
+	if len(response.Answer) == 0 {
+		noAnswerTTL := 10 * time.Second // 默认值
+		if cm.config.NoAnswerCacheTime != "" {
+			if parsedTime, err := time.ParseDuration(cm.config.NoAnswerCacheTime); err == nil {
+				noAnswerTTL = parsedTime
+			}
+		}
+		if noAnswerTTL < actualTTL {
+			actualTTL = noAnswerTTL
+		}
+		cm.logger.Debug("⏱️ 无答案响应使用配置的缓存时间", map[string]interface{}{
+			"domain":    domain,
+			"qtype":     dns.TypeToString[qtype],
+			"cache_ttl": actualTTL.String(),
+			"reason":    "no_answer_response",
+		})
+	}
+
 	cm.cache.Set(domain, qtype, response, false)
 
 	cm.logger.Info("📋 [缓存设置-成功响应] ", map[string]interface{}{
@@ -298,7 +323,7 @@ func (cm *CacheManager) calculateTTL(response *dns.Msg) time.Duration {
 }
 
 // isValidDNSResponse 验证DNS响应是否值得缓存
-// 只缓存 NOERROR 且有答案记录的响应
+// 缓存 NOERROR 响应，包括有答案和无答案的情况
 func (cm *CacheManager) isValidDNSResponse(domain string, qtype uint16, response *dns.Msg) bool {
 	if response == nil {
 		return false
@@ -315,16 +340,8 @@ func (cm *CacheManager) isValidDNSResponse(domain string, qtype uint16, response
 		return false
 	}
 
-	// 检查是否有答案记录 - NOERROR但无答案的不缓存
-	if len(response.Answer) == 0 {
-		cm.logger.Debug("🔍 NOERROR但无答案记录，不缓存", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
-		})
-		return false
-	}
-
-	// NOERROR且有答案记录，可以缓存
+	// NOERROR响应可以缓存，无论是否有答案记录
+	// 这样可以避免对不存在记录的重复查询
 	return true
 }
 
@@ -482,7 +499,19 @@ func (cm *CacheManager) scanCacheForRefresh() {
 			"refresh_threshold": cm.config.Cache.RefreshThreshold.String(),
 		})
 
+		// 限制同时提交的刷新任务数量，防止队列溢出
+		maxTasks := cap(cm.asyncChan) / 2
+		submitted := 0
+
 		for _, entry := range entriesToRefresh {
+			if submitted >= maxTasks {
+				cm.logger.Warn("⚠️ 刷新任务达到上限，停止提交新任务", map[string]interface{}{
+					"submitted": submitted,
+					"max_tasks": maxTasks,
+				})
+				break
+			}
+
 			// 计算过期时间（当前时间 + TTL）
 			expireTime := time.Now().Add(cm.config.Cache.TTL)
 			priority := 0
@@ -496,6 +525,7 @@ func (cm *CacheManager) scanCacheForRefresh() {
 				"priority": priority,
 			})
 			cm.submitAsyncRefresh(entry.Domain, entry.QType, expireTime, priority)
+			submitted++
 		}
 	} else {
 		cm.logger.Debug("🔍 未发现需要刷新的缓存条目", map[string]interface{}{
@@ -539,6 +569,7 @@ func (cm *CacheManager) asyncWorker(workerID int) {
 				"stack_trace": string(debug.Stack()),
 			})
 			// 重新启动工作器
+			time.Sleep(1 * time.Second) // 短暂等待后再重启
 			go cm.asyncWorker(workerID)
 		}
 	}()
@@ -547,10 +578,38 @@ func (cm *CacheManager) asyncWorker(workerID int) {
 		"worker_id": workerID,
 	})
 
+	// 为每个工作器设置处理超时，防止任务卡住
 	for {
 		select {
 		case task := <-cm.asyncChan:
-			cm.processAsyncTask(task, workerID)
+			// 为每个任务设置超时
+			taskCtx, taskCancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+			done := make(chan struct{})
+			go func() {
+				cm.processAsyncTask(task, workerID)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// 任务完成
+			case <-taskCtx.Done():
+				// 任务超时
+				cm.logger.Warn("⏰ 异步任务处理超时", map[string]interface{}{
+					"domain":    task.Domain,
+					"qtype":     dns.TypeToString[task.QType],
+					"worker_id": workerID,
+				})
+
+				// 清理任务状态
+				key := fmt.Sprintf("%s:%d", task.Domain, task.QType)
+				cm.asyncMu.Lock()
+				delete(cm.asyncSet, key)
+				cm.asyncMu.Unlock()
+			}
+
+			taskCancel()
 		case <-cm.workerPool.stopCh:
 			cm.logger.Debug("🔄 异步工作器停止", map[string]interface{}{
 				"worker_id": workerID,
@@ -565,6 +624,18 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 	key := fmt.Sprintf("%s:%d", task.Domain, task.QType)
 
 	defer func() {
+		// 添加panic恢复机制
+		if r := recover(); r != nil {
+			cm.logger.Error("💥 [异步任务处理panic] ", map[string]interface{}{
+				"rule":        "ASYNC_TASK_PANIC",
+				"worker_id":   workerID,
+				"domain":      task.Domain,
+				"qtype":       dns.TypeToString[task.QType],
+				"panic_msg":   fmt.Sprintf("%v", r),
+				"stack_trace": string(debug.Stack()),
+			})
+		}
+
 		cm.asyncMu.Lock()
 		delete(cm.asyncSet, key)
 		cm.asyncMu.Unlock()
@@ -612,6 +683,13 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 				"worker_id": workerID,
 			})
 		}
+	} else {
+		timer.EndWithError(fmt.Errorf("refresh callback is nil"))
+		cm.logger.Warn("⚠️ 刷新回调未设置", map[string]interface{}{
+			"domain":    task.Domain,
+			"qtype":     dns.TypeToString[task.QType],
+			"worker_id": workerID,
+		})
 	}
 }
 
@@ -654,6 +732,16 @@ func (cm *CacheManager) Clear() {
 	}
 
 	cm.logger.Info("🗑️ 缓存已清空")
+}
+
+// ExtendTTL 延长缓存条目的过期时间
+func (cm *CacheManager) ExtendTTL(domain string, qtype uint16, duration time.Duration) {
+	cm.cache.ExtendTTL(domain, qtype, duration)
+	cm.logger.Debug("🕒 缓存TTL已延长", map[string]interface{}{
+		"domain":   domain,
+		"qtype":    dns.TypeToString[qtype],
+		"duration": duration.String(),
+	})
 }
 
 // Close 关闭缓存管理器

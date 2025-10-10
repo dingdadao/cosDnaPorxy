@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
@@ -61,7 +62,6 @@ type RefactoredHandler struct {
 	cacheManager      *CacheManager
 	cloudDetector     *CloudDetector
 	queryOptimizer    interface{} // 可以是 *FastQueryOptimizer 或 *SimpleModernOptimizer
-	whitelistMatcher  *WhitelistMatcher
 	designatedMatcher *DesignatedMatcher
 
 	ctx    context.Context
@@ -95,8 +95,11 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 		})
 	}
 
-	whitelistMatcher := &WhitelistMatcher{logger: logger}
-	designatedMatcher := &DesignatedMatcher{logger: logger}
+	designatedMatcher := NewDesignatedMatcher(logger)
+	// 设置默认DNS
+	if cfg.DefaultDNS != "" {
+		designatedMatcher.SetDefaultDNS(cfg.DefaultDNS)
+	}
 
 	handler := &RefactoredHandler{
 		config:            cfg,
@@ -104,7 +107,6 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 		cacheManager:      cacheManager,
 		cloudDetector:     cloudDetector,
 		queryOptimizer:    queryOptimizer,
-		whitelistMatcher:  whitelistMatcher,
 		designatedMatcher: designatedMatcher,
 		ctx:               ctx,
 		cancel:            cancel,
@@ -176,34 +178,39 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 // processQuery 处理单个DNS查询
 func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
-	h.Logger.Debug("🔍 开始处理DNS查询", map[string]interface{}{
+	h.Logger.Info("🔍 [DNS查询开始] ", map[string]interface{}{
 		"domain":      domain,
 		"qtype":       dns.TypeToString[qtype],
 		"client_addr": w.RemoteAddr().String(),
 		"request_id":  req.Id,
+		"rule":        "DNS_QUERY_START",
 	})
 
 	// 1. 缓存检查
 	if resp, hit, isCloud, cloudType := h.cacheManager.Get(domain, qtype); hit {
+		h.Logger.Info("✅ [DNS查询结果-缓存命中] ", map[string]interface{}{
+			"domain":     domain,
+			"type":       "cache_hit",
+			"is_cloud":   isCloud,
+			"cloud_type": cloudType,
+		})
+
 		if isCloud {
 			// 云域名缓存命中
-			h.Logger.Info("📋 [缓存命中-云域名] ", map[string]interface{}{
-				"domain":     domain,
-				"rule":       "CACHE_CLOUD",
-				"cloud_type": cloudType,
-			})
-
 			// 云域名需要特殊处理
-			if cloudResp, cloudHit, cType := h.cacheManager.GetCloudResponse(domain, qtype); cloudHit {
-				h.Logger.Debug("📋 返回云IP替换缓存", map[string]interface{}{
-					"domain":       domain,
-					"qtype":        dns.TypeToString[qtype],
-					"cloud_type":   cType,
-					"answer_count": len(cloudResp.Answer),
-				})
+			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponse(domain, qtype); cloudHit {
 				respCopy := cloudResp.Copy()
 				respCopy.Id = req.Id
+				// 确保响应中的 TTL 不小于配置的最小 TTL
+				h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 				w.WriteMsg(respCopy)
+
+				h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+					"domain":       domain,
+					"result":       "success",
+					"source":       "cloud_cache",
+					"answer_count": len(cloudResp.Answer),
+				})
 				return
 			}
 
@@ -212,142 +219,213 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			return
 		} else {
 			// 普通域名缓存命中
-			h.Logger.Info("📋 [缓存命中-普通域名] ", map[string]interface{}{
-				"domain": domain,
-				"rule":   "CACHE_NORMAL",
+			respCopy := resp.Copy()
+			respCopy.Id = req.Id
+			// 确保响应中的 TTL 不小于配置的最小 TTL
+			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+			w.WriteMsg(respCopy)
+
+			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+				"domain":       domain,
+				"result":       "success",
+				"source":       "normal_cache",
+				"answer_count": len(resp.Answer),
+			})
+			return
+		}
+	} else {
+		h.Logger.Info("❌ [缓存未命中] ", map[string]interface{}{
+			"domain": domain,
+			"type":   "cache_miss",
+		})
+	}
+
+	// 2. 定向域名检查（统一处理所有域名路由）
+	h.Logger.Debug("🎯 开始定向域名检查", map[string]interface{}{
+		"domain": domain,
+		"step":   "DESIGNATED_CHECK",
+	})
+
+	// 使用新的统一匹配方法
+	if dnsServer, hasDesignated := h.designatedMatcher.GetDesignatedDomainOrDefault(domain); hasDesignated {
+		// 如果匹配到定向域名且不是使用默认DNS，则使用指定的DNS服务器
+		if dnsServer != h.designatedMatcher.GetDefaultDNS() {
+			h.Logger.Info("🎯 [定向域名匹配] ", map[string]interface{}{
+				"domain":  domain,
+				"matched": true,
+				"dns":     dnsServer,
 			})
 
-			h.Logger.Debug("返回普通缓存响应", map[string]interface{}{
-				"domain":       domain,
-				"qtype":        dns.TypeToString[qtype],
-				"answer_count": len(resp.Answer),
-				"rcode":        dns.RcodeToString[resp.Rcode],
-			})
+			resp, err := h.proxyQueryWithCaching(req, []string{dnsServer}, domain, qtype)
+			if err != nil || resp == nil {
+				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
+					"domain": domain,
+					"source": "designated",
+					"error":  err,
+				})
+				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+				return
+			}
+
+			// 检查是否为云服务
+			detection := h.cloudDetector.DetectCloudService(resp)
+			if detection.Type != CloudTypeNone {
+				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
+					"domain":     domain,
+					"cloud_type": detection.Type,
+					"detected":   true,
+				})
+
+				// 执行云IP替换
+				h.handleCloudReplacement(w, req, domain, qtype, int(detection.Type))
+				return
+			}
 
 			respCopy := resp.Copy()
 			respCopy.Id = req.Id
+			// 确保响应中的 TTL 不小于配置的最小 TTL
+			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 			w.WriteMsg(respCopy)
-			return
-		}
-	}
 
-	// 2. 白名单检查
-	if h.whitelistMatcher.IsWhitelisted(domain) {
-		h.Logger.Info("✅ [白名单命中] ", map[string]interface{}{
-			"domain": domain,
-			"rule":   "WHITELIST",
-		})
-
-		h.Logger.Debug("白名单域名查询上游", map[string]interface{}{
-			"domain":    domain,
-			"upstreams": h.config.Upstream,
-		})
-
-		resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype)
-		if err != nil || resp == nil {
-			h.Logger.Error("❌ 白名单域名查询失败", map[string]interface{}{
-				"domain": domain,
-				"error":  err,
+			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+				"domain":       domain,
+				"result":       "success",
+				"source":       "designated",
+				"answer_count": len(resp.Answer),
 			})
-			h.sendErrorResponse(w, req, dns.RcodeServerFailure)
 			return
-		}
-
-		respCopy := resp.Copy()
-		respCopy.Id = req.Id
-		w.WriteMsg(respCopy)
-		return
-	}
-
-	// 3. 定向域名检查
-	if designated := h.designatedMatcher.GetDesignatedDomain(domain); designated != nil {
-		h.Logger.Info("🎯 [定向域名命中] ", map[string]interface{}{
-			"domain": domain,
-			"rule":   "DESIGNATED",
-			"dns":    designated.DNS,
-		})
-
-		h.Logger.Debug("定向域名查询指定DNS", map[string]interface{}{
-			"domain":         domain,
-			"designated_dns": designated.DNS,
-			"pattern":        designated.Pattern,
-		})
-
-		resp, err := h.proxyQueryWithCaching(req, []string{designated.DNS}, domain, qtype)
-		if err != nil || resp == nil {
-			h.Logger.Error("❌ 定向域名查询失败", map[string]interface{}{
+		} else {
+			h.Logger.Info("🔄 [使用默认DNS] ", map[string]interface{}{
 				"domain": domain,
-				"dns":    designated.DNS,
-				"error":  err,
+				"dns":    dnsServer,
 			})
-			h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+			// 当使用默认DNS时，使用上游配置进行查询
+			h.Logger.Info("🌐 [上游DNS查询] ", map[string]interface{}{
+				"domain":    domain,
+				"upstreams": h.config.Upstream,
+			})
+
+			resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype)
+			if err != nil || resp == nil {
+				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
+					"domain":    domain,
+					"source":    "upstream",
+					"upstreams": h.config.Upstream,
+					"error":     err,
+				})
+				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+				return
+			}
+
+			// 检查是否为云服务
+			detection := h.cloudDetector.DetectCloudService(resp)
+			if detection.Type != CloudTypeNone {
+				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
+					"domain":     domain,
+					"cloud_type": detection.Type,
+					"detected":   true,
+				})
+
+				// 执行云IP替换
+				h.handleCloudReplacement(w, req, domain, qtype, int(detection.Type))
+				return
+			}
+
+			respCopy := resp.Copy()
+			respCopy.Id = req.Id
+			// 确保响应中的 TTL 不小于配置的最小 TTL
+			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+			w.WriteMsg(respCopy)
+
+			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+				"domain":       domain,
+				"result":       "success",
+				"source":       "upstream",
+				"answer_count": len(resp.Answer),
+			})
 			return
 		}
-
-		respCopy := resp.Copy()
-		respCopy.Id = req.Id
-		w.WriteMsg(respCopy)
-		return
+	} else {
+		h.Logger.Info("❌ [定向域名未匹配] ", map[string]interface{}{
+			"domain":  domain,
+			"matched": false,
+		})
 	}
 
-	// 4. 云域名检查和普通域名处理
-	timer := h.Logger.StartTimer("upstream_query", map[string]interface{}{
-		"domain": domain,
-		"qtype":  dns.TypeToString[qtype],
+	// 如果没有匹配到定向域名，则使用上游配置进行并发查询
+	h.Logger.Info("🌐 [上游DNS查询] ", map[string]interface{}{
+		"domain":    domain,
+		"upstreams": h.config.Upstream,
 	})
 
 	resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype)
-	timer.End()
-
 	if err != nil || resp == nil {
-		h.Logger.Error("❌ 上游查询失败", map[string]interface{}{
-			"domain": domain,
-			"error":  err,
+		h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
+			"domain":    domain,
+			"source":    "upstream",
+			"upstreams": h.config.Upstream,
+			"error":     err,
 		})
 		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
 		return
 	}
 
-	// 检测云服务
+	// 检查是否为云服务
 	detection := h.cloudDetector.DetectCloudService(resp)
 	if detection.Type != CloudTypeNone {
-		h.Logger.Info("☁️ [云域名检测] ", map[string]interface{}{
+		h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
 			"domain":     domain,
-			"rule":       "CLOUD_DETECTED",
 			"cloud_type": detection.Type,
+			"detected":   true,
 		})
-
-		h.Logger.Debug("云服务检测结果", map[string]interface{}{
-			"domain":         domain,
-			"cloud_type":     detection.Type,
-			"detected_ips":   detection.DetectedIPs,
-			"replace_domain": detection.ReplaceDomain,
-		})
-
-		// 标记为云域名
-		h.cacheManager.Set(domain, qtype, nil, true, int(detection.Type))
 
 		// 执行云IP替换
 		h.handleCloudReplacement(w, req, domain, qtype, int(detection.Type))
 		return
 	}
 
-	// 5. 普通域名响应
-	h.Logger.Info("🌐 [普通域名] ", map[string]interface{}{
-		"domain": domain,
-		"rule":   "NORMAL",
-	})
-
-	h.Logger.Debug("返回普通域名响应", map[string]interface{}{
-		"domain":       domain,
-		"qtype":        dns.TypeToString[qtype],
-		"answer_count": len(resp.Answer),
-		"rcode":        dns.RcodeToString[resp.Rcode],
-	})
-
 	respCopy := resp.Copy()
 	respCopy.Id = req.Id
+	// 确保响应中的 TTL 不小于配置的最小 TTL
+	h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 	w.WriteMsg(respCopy)
+
+	h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+		"domain":       domain,
+		"result":       "success",
+		"source":       "upstream",
+		"answer_count": len(resp.Answer),
+	})
+}
+
+// ensureMinimumTTL 确保响应中的 TTL 不小于指定的最小值
+func (h *RefactoredHandler) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration) {
+	if resp == nil {
+		return
+	}
+
+	minTTLSeconds := uint32(minTTL.Seconds())
+
+	// 更新 Answer 部分的 TTL
+	for _, rr := range resp.Answer {
+		if rr.Header().Ttl < minTTLSeconds {
+			rr.Header().Ttl = minTTLSeconds
+		}
+	}
+
+	// 更新 Authority 部分的 TTL
+	for _, rr := range resp.Ns {
+		if rr.Header().Ttl < minTTLSeconds {
+			rr.Header().Ttl = minTTLSeconds
+		}
+	}
+
+	// 更新 Additional 部分的 TTL
+	for _, rr := range resp.Extra {
+		if rr.Header().Ttl < minTTLSeconds {
+			rr.Header().Ttl = minTTLSeconds
+		}
+	}
 }
 
 // handleCloudReplacement 处理云IP替换
@@ -413,8 +491,25 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 		finalResp.Answer = append(finalResp.Answer, newRR)
 	}
 
-	// 缓存替换后的响应
-	h.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType)
+	// 解析替换缓存时间配置
+	replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+	if h.config.ReplaceCacheTime != "" {
+		if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+			replaceCacheTime = parsedTime
+		} else {
+			h.Logger.Warn("⚠️ 解析替换缓存时间失败，使用默认值", map[string]interface{}{
+				"replace_cache_time": h.config.ReplaceCacheTime,
+				"error":              err.Error(),
+				"default_value":      h.config.Cache.TTL.String(),
+			})
+		}
+	}
+
+	// 确保云域名替换响应的TTL不小于配置的替换缓存时间
+	h.ensureMinimumTTL(finalResp, replaceCacheTime)
+
+	// 缓存替换后的响应，使用配置的替换缓存时间
+	h.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType, replaceCacheTime)
 
 	h.Logger.Info("✅ [云IP替换成功] ", map[string]interface{}{
 		"domain":         domain,
@@ -422,6 +517,7 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 		"replace_domain": replaceDomain,
 		"cloud_type":     cloudTypeName,
 		"answer_count":   len(finalResp.Answer),
+		"cache_ttl":      replaceCacheTime.String(),
 	})
 
 	h.Logger.Debug("云IP替换详细信息", map[string]interface{}{
@@ -431,6 +527,7 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 		"original_answers": len(replaceResp.Answer),
 		"final_answers":    len(finalResp.Answer),
 		"cached_as_cloud":  true,
+		"cache_ttl":        replaceCacheTime.String(),
 	})
 
 	finalResp.Id = req.Id
@@ -471,4 +568,440 @@ func (h *RefactoredHandler) Close() {
 	}
 
 	h.Logger.Info("📪 重构后DNS处理器已关闭")
+}
+
+// loadAllData 加载所有配置数据
+func (h *RefactoredHandler) loadAllData() error {
+	var lastErr error
+
+	// 加载云服务网段
+	if err := h.cloudDetector.LoadNetworkRanges(
+		h.config.CloudflareNetFile,
+		h.config.CloudflareNetFile6,
+		h.config.AWSNetFile,
+	); err != nil {
+		h.Logger.Error("加载云服务网段失败", map[string]interface{}{
+			"error": err.Error(),
+		})
+		lastErr = err
+	}
+
+	// 加载定向域名（包含原白名单内容）
+	if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
+		h.Logger.Error("加载定向域名失败", map[string]interface{}{
+			"error": err.Error(),
+		})
+		lastErr = err
+	}
+
+	return lastErr
+}
+
+// refreshDNSRecord 刷新DNS记录（缓存回调）
+func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error {
+	// 添加顶层panic恢复机制
+	defer func() {
+		if r := recover(); r != nil {
+			// 记录panic信息
+			if h != nil && h.Logger != nil {
+				h.Logger.Error("💥 [异步刷新panic] ", map[string]interface{}{
+					"rule":        "REFRESH_RECORD_PANIC",
+					"domain":      domain,
+					"qtype":       dns.TypeToString[qtype],
+					"panic_msg":   fmt.Sprintf("%v", r),
+					"stack_trace": string(debug.Stack()),
+				})
+			}
+
+			// 即使发生panic，也要尝试延长缓存TTL以防止频繁刷新
+			if h != nil && h.cacheManager != nil {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL/2)
+			}
+		}
+	}()
+
+	// 添加空指针检查
+	if h == nil {
+		return fmt.Errorf("handler is nil")
+	}
+
+	if h.Logger == nil {
+		return fmt.Errorf("logger is nil")
+	}
+
+	h.Logger.Info("🔄 [异步刷新开始] ", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+	})
+
+	// 确定应该使用的上游DNS服务器（遵循相同的优先级规则）
+	upstreams := h.determineUpstreamsForDomain(domain)
+
+	// 添加上游服务器检查
+	if len(upstreams) == 0 {
+		h.Logger.Warn("⚠️ [异步刷新警告] 未找到有效的上游服务器", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+		// 即使刷新失败，也要延长原缓存的过期时间，防止频繁刷新
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf("no valid upstream servers found")
+	}
+
+	req := &dns.Msg{}
+	req.SetQuestion(dns.Fqdn(domain), qtype)
+
+	// 添加请求检查
+	if req == nil {
+		h.Logger.Error("❌ [异步刷新失败] 请求对象为空", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf("request object is nil")
+	}
+
+	// 使用类型断言调用不同类型的查询优化器
+	var result *ConcurrentQueryResult
+	if h.queryOptimizer == nil {
+		h.Logger.Error("❌ [异步刷新失败] 查询优化器未初始化", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf("query optimizer is nil")
+	}
+
+	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
+		// 使用现代查询优化器
+		result = modernOptimizer.Query(req, upstreams)
+	} else if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
+		// 使用传统查询优化器
+		result = traditionalOptimizer.Query(req, upstreams)
+	} else {
+		h.Logger.Error("❌ [异步刷新失败] ", map[string]interface{}{
+			"domain": domain,
+			"error":  "unknown query optimizer type",
+		})
+		// 即使刷新失败，也要延长原缓存的过期时间，防止频繁刷新
+		// 延长时间为配置TTL的一半，避免过于频繁的刷新
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf("unknown query optimizer type")
+	}
+
+	if result == nil {
+		h.Logger.Error("❌ [异步刷新失败] 查询结果为空", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf("query result is nil")
+	}
+
+	if result.FastestResult == nil || result.FastestResult.Error != nil {
+		errorMsg := "all upstream queries failed"
+		if result.FastestResult != nil && result.FastestResult.Error != nil {
+			errorMsg = result.FastestResult.Error.Error()
+		}
+		h.Logger.Error("❌ [异步刷新失败] ", map[string]interface{}{
+			"domain": domain,
+			"error":  errorMsg,
+		})
+		// 即使刷新失败，也要延长原缓存的过期时间，防止频繁刷新
+		// 延长时间为配置TTL的一半，避免过于频繁的刷新
+		if h.cacheManager != nil {
+			// 直接从缓存中获取云域名信息，判断应该使用哪种TTL
+			_, _, isCloud, _ := h.cacheManager.Get(domain, qtype)
+			if isCloud {
+				// 对于云域名，使用配置的替换缓存时间
+				replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+				if h.config.ReplaceCacheTime != "" {
+					if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+						replaceCacheTime = parsedTime
+					}
+				}
+				h.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
+			} else {
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL)
+			}
+		}
+		return fmt.Errorf(errorMsg)
+	}
+
+	// 验证查询结果：必须有成功响应且包含实际答案记录
+	if result.HasSuccess && result.SuccessResult != nil &&
+		result.SuccessResult.Response != nil &&
+		result.SuccessResult.Response.Rcode == dns.RcodeSuccess &&
+		len(result.SuccessResult.Response.Answer) > 0 {
+
+		// 添加缓存管理器检查
+		if h.cacheManager == nil {
+			h.Logger.Error("❌ [异步刷新失败] 缓存管理器未初始化", map[string]interface{}{
+				"domain": domain,
+				"qtype":  dns.TypeToString[qtype],
+			})
+			return fmt.Errorf("cache manager is nil")
+		}
+
+		// 直接从缓存中获取云域名信息，避免重复检测
+		_, _, isCloud, cloudType := h.cacheManager.Get(domain, qtype)
+
+		if isCloud {
+			// 对于云域名，使用配置的替换缓存时间
+			replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
+			if h.config.ReplaceCacheTime != "" {
+				if parsedTime, err := time.ParseDuration(h.config.ReplaceCacheTime); err == nil {
+					replaceCacheTime = parsedTime
+				}
+			}
+			// 确保云域名响应的TTL不小于配置的替换缓存时间
+			h.ensureMinimumTTL(result.SuccessResult.Response, replaceCacheTime)
+			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+			// 同时更新云响应缓存
+			h.cacheManager.SetCloudResponse(domain, qtype, result.SuccessResult.Response, cloudType, replaceCacheTime)
+		} else {
+			// 确保普通域名响应的TTL不小于配置的最小TTL
+			h.ensureMinimumTTL(result.SuccessResult.Response, h.config.Cache.TTL)
+
+			// 添加云检测器检查
+			if h.cloudDetector == nil {
+				h.Logger.Error("❌ [异步刷新失败] 云检测器未初始化", map[string]interface{}{
+					"domain": domain,
+					"qtype":  dns.TypeToString[qtype],
+				})
+				h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL/2)
+				return fmt.Errorf("cloud detector is nil")
+			}
+
+			// 对于非云域名，检测是否为云服务
+			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
+			isCloud = detection.Type != CloudTypeNone
+			cloudType = int(detection.Type)
+
+			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+		}
+
+		h.Logger.Info("✅ [异步刷新成功] ", map[string]interface{}{
+			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"is_cloud":     isCloud,
+			"cloud_type":   cloudType,
+			"answer_count": len(result.SuccessResult.Response.Answer),
+			"upstreams":    upstreams,
+		})
+	} else {
+		// 记录详细的失败原因
+		failureReason := "unknown_error"
+		if result.FastestResult != nil && result.FastestResult.Error != nil {
+			failureReason = result.FastestResult.Error.Error()
+		} else if !result.HasSuccess {
+			failureReason = "no_successful_response"
+		} else if result.SuccessResult == nil {
+			failureReason = "success_result_is_nil"
+		} else if result.SuccessResult.Response == nil {
+			failureReason = "response_is_nil"
+		} else if result.SuccessResult.Response.Rcode != dns.RcodeSuccess {
+			failureReason = fmt.Sprintf("non_success_rcode: %s", dns.RcodeToString[result.SuccessResult.Response.Rcode])
+		} else if len(result.SuccessResult.Response.Answer) == 0 {
+			failureReason = "no_answer_records"
+		}
+
+		h.Logger.Warn("⚠️ [异步刷新跳过] ", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"reason": failureReason,
+		})
+
+		// 即使刷新失败，也要延长原缓存的过期时间，防止频繁刷新
+		// 这样可以避免缓存立即过期导致的查询失败
+		// 延长时间为配置TTL的一半，避免过于频繁的刷新
+		if h.cacheManager != nil {
+			h.cacheManager.ExtendTTL(domain, qtype, h.config.Cache.TTL/2)
+		}
+	}
+
+	return nil
+}
+
+// determineUpstreamsForDomain 确定域名应该使用的上游DNS服务器（使用统一的定向域名匹配）
+func (h *RefactoredHandler) determineUpstreamsForDomain(domain string) []string {
+	// 使用统一的定向域名匹配逻辑
+	if dnsServer, hasDesignated := h.designatedMatcher.GetDesignatedDomainOrDefault(domain); hasDesignated {
+		h.Logger.Debug("异步刷新：定向域名或默认DNS", map[string]interface{}{
+			"domain":     domain,
+			"dns_server": dnsServer,
+		})
+		return []string{dnsServer}
+	}
+
+	// 如果没有匹配到任何配置，使用上游DNS作为备用
+	h.Logger.Debug("异步刷新：使用上游DNS作为备用", map[string]interface{}{
+		"domain":    domain,
+		"upstreams": h.config.Upstream,
+	})
+	return h.config.Upstream
+}
+
+// startBackgroundTasks 启动后台任务
+func (h *RefactoredHandler) startBackgroundTasks() {
+	// 定向域名刷新任务
+	if h.config.DesignatedDomain != "" && h.config.DesignatedRefreshInterval > 0 {
+		go h.designatedRefreshTask()
+	}
+
+	// 网络段刷新任务
+	if h.config.NetworkRefreshInterval > 0 {
+		go h.networkRefreshTask()
+	}
+}
+
+// designatedRefreshTask 定向域名刷新任务
+func (h *RefactoredHandler) designatedRefreshTask() {
+	ticker := time.NewTicker(h.config.DesignatedRefreshInterval)
+	defer ticker.Stop()
+
+	h.Logger.Info("🔄 [定向域名定时刷新启动] ", map[string]interface{}{
+		"rule":     "DESIGNATED_REFRESH_TASK",
+		"interval": h.config.DesignatedRefreshInterval.String(),
+	})
+
+	for {
+		select {
+		case <-ticker.C:
+			h.Logger.Debug("开始定时定向域名刷新", map[string]interface{}{
+				"file": h.config.DesignatedDomain,
+			})
+			if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
+				h.Logger.Error("❌ [定向域名刷新失败] ", map[string]interface{}{
+					"rule":  "DESIGNATED_REFRESH_FAILED",
+					"error": err.Error(),
+				})
+			} else {
+				h.Logger.Info("✅ [定向域名刷新成功] ", map[string]interface{}{
+					"rule": "DESIGNATED_REFRESH_SUCCESS",
+				})
+			}
+		case <-h.ctx.Done():
+			h.Logger.Info("📋 [定向域名刷新任务停止] ", map[string]interface{}{
+				"rule": "DESIGNATED_REFRESH_STOPPED",
+			})
+			return
+		}
+	}
+}
+
+// networkRefreshTask 网络段刷新任务
+func (h *RefactoredHandler) networkRefreshTask() {
+	ticker := time.NewTicker(h.config.NetworkRefreshInterval)
+	defer ticker.Stop()
+
+	h.Logger.Info("🔄 [网络段定时刷新启动] ", map[string]interface{}{
+		"rule":     "NETWORK_REFRESH_TASK",
+		"interval": h.config.NetworkRefreshInterval.String(),
+	})
+
+	for {
+		select {
+		case <-ticker.C:
+			h.Logger.Debug("开始定时网络段刷新", map[string]interface{}{
+				"cloudflare_v4": h.config.CloudflareNetFile,
+				"cloudflare_v6": h.config.CloudflareNetFile6,
+				"aws_file":      h.config.AWSNetFile,
+			})
+			if err := h.cloudDetector.LoadNetworkRanges(
+				h.config.CloudflareNetFile,
+				h.config.CloudflareNetFile6,
+				h.config.AWSNetFile,
+			); err != nil {
+				h.Logger.Error("❌ [网络段刷新失败] ", map[string]interface{}{
+					"rule":  "NETWORK_REFRESH_FAILED",
+					"error": err.Error(),
+				})
+			} else {
+				h.Logger.Info("✅ [网络段刷新成功] ", map[string]interface{}{
+					"rule": "NETWORK_REFRESH_SUCCESS",
+				})
+			}
+		case <-h.ctx.Done():
+			h.Logger.Info("📋 [网络段刷新任务停止] ", map[string]interface{}{
+				"rule": "NETWORK_REFRESH_STOPPED",
+			})
+			return
+		}
+	}
 }

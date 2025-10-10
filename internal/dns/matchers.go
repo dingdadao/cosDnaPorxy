@@ -8,160 +8,225 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/miekg/dns"
 )
 
-// WhitelistMatcher 白名单匹配器
-type WhitelistMatcher struct {
-	patterns []string
-	mu       sync.RWMutex
-	logger   *utils.EnhancedLogger
+// MatchResult 匹配结果
+type MatchResult struct {
+	Matched bool
+	DNS     string
+	Pattern string
+	Type    string
 }
 
-// DesignatedMatcher 定向域名匹配器
+// DomainTrie 域名前缀树结构
+type DomainTrie struct {
+	children     map[string]*DomainTrie
+	dnsServer    string
+	pattern      string
+	upstreamType string
+	isWildcard   bool
+}
+
+// NewDomainTrie 创建新的域名前缀树
+func NewDomainTrie() *DomainTrie {
+	return &DomainTrie{
+		children: make(map[string]*DomainTrie),
+	}
+}
+
+// Insert 插入域名模式
+func (t *DomainTrie) Insert(pattern, dnsServer, upstreamType string) {
+	if strings.HasPrefix(pattern, "*.") {
+		// 处理通配符前缀：*.example.com
+		domain := pattern[2:]
+		parts := strings.Split(domain, ".")
+		// 反向存储：com.example
+		reverseParts := make([]string, len(parts))
+		for i := 0; i < len(parts); i++ {
+			reverseParts[i] = parts[len(parts)-1-i]
+		}
+
+		current := t
+		for _, part := range reverseParts {
+			if current.children[part] == nil {
+				current.children[part] = NewDomainTrie()
+			}
+			current = current.children[part]
+		}
+		current.dnsServer = dnsServer
+		current.pattern = pattern
+		current.upstreamType = upstreamType
+		current.isWildcard = true
+	} else {
+		// 处理精确匹配：example.com
+		parts := strings.Split(pattern, ".")
+		reverseParts := make([]string, len(parts))
+		for i := 0; i < len(parts); i++ {
+			reverseParts[i] = parts[len(parts)-1-i]
+		}
+
+		current := t
+		for _, part := range reverseParts {
+			if current.children[part] == nil {
+				current.children[part] = NewDomainTrie()
+			}
+			current = current.children[part]
+		}
+		current.dnsServer = dnsServer
+		current.pattern = pattern
+		current.upstreamType = upstreamType
+		current.isWildcard = false
+	}
+}
+
+// Search 搜索域名匹配
+func (t *DomainTrie) Search(domain string) *MatchResult {
+	parts := strings.Split(strings.ToLower(domain), ".")
+	reverseParts := make([]string, len(parts))
+	for i := 0; i < len(parts); i++ {
+		reverseParts[i] = parts[len(parts)-1-i]
+	}
+
+	current := t
+	var lastWildcardMatch *DomainTrie
+
+	for i, part := range reverseParts {
+		// 检查精确匹配
+		if next := current.children[part]; next != nil {
+			current = next
+			// 记录最后一个通配符匹配
+			if current.isWildcard && current.dnsServer != "" {
+				lastWildcardMatch = current
+			}
+			// 如果是最后一个部分且有精确匹配
+			if i == len(reverseParts)-1 && current.dnsServer != "" && !current.isWildcard {
+				return &MatchResult{
+					Matched: true,
+					DNS:     current.dnsServer,
+					Pattern: current.pattern,
+					Type:    "exact",
+				}
+			}
+		} else {
+			// 没有精确匹配，检查是否有通配符匹配
+			if wildcardNode := current.children["*"]; wildcardNode != nil && wildcardNode.dnsServer != "" {
+				return &MatchResult{
+					Matched: true,
+					DNS:     wildcardNode.dnsServer,
+					Pattern: wildcardNode.pattern,
+					Type:    "wildcard",
+				}
+			}
+			break
+		}
+	}
+
+	// 如果没有精确匹配，使用最后一个通配符匹配
+	if lastWildcardMatch != nil {
+		return &MatchResult{
+			Matched: true,
+			DNS:     lastWildcardMatch.dnsServer,
+			Pattern: lastWildcardMatch.pattern,
+			Type:    "wildcard",
+		}
+	}
+
+	return &MatchResult{Matched: false}
+}
+
+// DesignatedMatcher 高性能定向域名匹配器
 type DesignatedMatcher struct {
-	domains []*DesignatedDomain
-	mu      sync.RWMutex
-	logger  *utils.EnhancedLogger
+	// 基本字段
+	defaultDNS string
+	logger     *utils.EnhancedLogger
+	mu         sync.RWMutex
+
+	// 高性能索引结构
+	trie        *DomainTrie         // 前缀树（用于大部分匹配）
+	exactMap    map[string]string   // 精确匹配哈希表
+	wildcards   []*DesignatedDomain // 复杂通配符（正则）
+	domainCount int                 // 域名数量统计
+	domains     []*DesignatedDomain // 定向域名列表
 }
 
 // DesignatedDomain 定向域名配置
 type DesignatedDomain struct {
 	Domain       string
-	Pattern      string // 添加原始模式字符串
+	Pattern      string
 	DNS          string
 	Regex        *regexp.Regexp
 	UpstreamType string
+	MatchType    string // "exact", "wildcard", "regex"
 }
 
-// IsWhitelisted 检查域名是否在白名单中
-func (wm *WhitelistMatcher) IsWhitelisted(domain string) bool {
-	wm.mu.RLock()
-	defer wm.mu.RUnlock()
-
-	for _, pattern := range wm.patterns {
-		if wm.matchPattern(pattern, domain) {
-			wm.logger.Debug("✅ 白名单匹配", map[string]interface{}{
-				"domain":  domain,
-				"pattern": pattern,
-			})
-			return true
-		}
+// NewDesignatedMatcher 创建高性能匹配器
+func NewDesignatedMatcher(logger *utils.EnhancedLogger) *DesignatedMatcher {
+	return &DesignatedMatcher{
+		logger:    logger,
+		trie:      NewDomainTrie(),
+		exactMap:  make(map[string]string),
+		wildcards: make([]*DesignatedDomain, 0),
+		domains:   make([]*DesignatedDomain, 0),
 	}
-
-	return false
 }
 
-// matchPattern 匹配模式
-func (wm *WhitelistMatcher) matchPattern(pattern, domain string) bool {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	domain = strings.ToLower(domain)
-
-	// 完全匹配
-	if pattern == domain {
-		return true
-	}
-
-	// 通配符前缀：*.example.com
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := pattern[2:]
-		if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
-			return true
-		}
-	}
-
-	// 通配符后缀：example.*
-	if strings.HasSuffix(pattern, ".*") {
-		prefix := pattern[:len(pattern)-2]
-		if domain == prefix || strings.HasPrefix(domain, prefix+".") {
-			return true
-		}
-	}
-
-	// 简单包含匹配
-	if strings.Contains(pattern, "*") {
-		// 转为正则表达式
-		regexPattern := "^" + regexp.QuoteMeta(pattern) + "$"
-		regexPattern = strings.ReplaceAll(regexPattern, `\*`, ".*")
-
-		if re, err := regexp.Compile(regexPattern); err == nil {
-			return re.MatchString(domain)
-		}
-	}
-
-	return false
-}
-
-// LoadWhitelist 加载白名单
-func (wm *WhitelistMatcher) LoadWhitelist(filePath string) error {
-	timer := wm.logger.StartTimer("load_whitelist")
-	defer timer.End()
-
-	if filePath == "" {
-		wm.logger.Warn("白名单文件路径为空")
-		return nil
-	}
-
-	// 检查文件是否存在
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		wm.logger.Warn("白名单文件不存在，创建默认文件", map[string]interface{}{
-			"file": filePath,
-		})
-
-		defaultContent := `# 白名单域名列表
-# 支持格式：
-# example.com - 完全匹配
-# *.example.com - 通配符前缀匹配
-# example.* - 通配符后缀匹配
-
-# 示例条目
-*.cloudflare.com
-*.amazonaws.com
-`
-		if err := os.WriteFile(filePath, []byte(defaultContent), 0644); err != nil {
-			return fmt.Errorf("创建默认白名单文件失败: %w", err)
-		}
-	}
-
-	patterns, err := wm.readLines(filePath)
-	if err != nil {
-		return fmt.Errorf("读取白名单文件失败: %w", err)
-	}
-
-	wm.mu.Lock()
-	wm.patterns = patterns
-	wm.mu.Unlock()
-
-	wm.logger.Info("📋 白名单加载完成", map[string]interface{}{
-		"file":  filePath,
-		"count": len(patterns),
+// SetDefaultDNS 设置默认DNS服务器
+func (dm *DesignatedMatcher) SetDefaultDNS(defaultDNS string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.defaultDNS = defaultDNS
+	dm.logger.Info("🔧 高性能默认DNS服务器已设置", map[string]interface{}{
+		"default_dns": defaultDNS,
 	})
-
-	return nil
 }
 
-// GetDesignatedDomain 获取匹配的定向域名
-func (dm *DesignatedMatcher) GetDesignatedDomain(domain string) *DesignatedDomain {
+// GetDefaultDNS 获取默认DNS服务器
+func (dm *DesignatedMatcher) GetDefaultDNS() string {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	return dm.defaultDNS
+}
+
+// GetDesignatedDomainOrDefault 高性能匹配方法
+func (dm *DesignatedMatcher) GetDesignatedDomainOrDefault(domain string) (string, bool) {
+	// 添加空指针检查
+	if dm == nil {
+		return "", false
+	}
+
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
-	for _, dd := range dm.domains {
-		if dd.Regex != nil && dd.Regex.MatchString(domain) {
-			dm.logger.Debug("🎯 定向域名匹配", map[string]interface{}{
-				"domain":     domain,
-				"designated": dd.Domain,
-				"dns":        dd.DNS,
-			})
-			return dd
+	// 添加默认DNS检查
+	if dm.defaultDNS == "" {
+		return "", false
+	}
+
+	// 1. 快速精确匹配检查
+	domainLower := strings.ToLower(domain)
+	if dns, exists := dm.exactMap[domainLower]; exists {
+		return dns, true
+	}
+
+	// 2. 使用前缀树进行快速匹配
+	if dm.trie != nil {
+		if result := dm.trie.Search(domainLower); result.Matched {
+			return result.DNS, true
 		}
 	}
 
-	return nil
+	// 3. 复杂正则匹配（仅在必要时）
+	for _, dd := range dm.wildcards {
+		if dd != nil && dd.Regex != nil && dd.Regex.MatchString(domainLower) {
+			return dd.DNS, true
+		}
+	}
+
+	// 4. 返回默认DNS
+	return dm.defaultDNS, dm.defaultDNS != ""
 }
 
-// LoadDesignatedDomains 加载定向域名
+// LoadDesignatedDomains 高性能加载定向域名
 func (dm *DesignatedMatcher) LoadDesignatedDomains(filePath string) error {
 	timer := dm.logger.StartTimer("load_designated_domains")
 	defer timer.End()
@@ -176,19 +241,8 @@ func (dm *DesignatedMatcher) LoadDesignatedDomains(filePath string) error {
 		dm.logger.Warn("定向域名文件不存在，创建默认文件", map[string]interface{}{
 			"file": filePath,
 		})
-
-		defaultContent := `# 定向域名配置
-# 格式: 域名模式 DNS服务器
-# 示例:
-# *.example.com 8.8.8.8:53
-# *.test.local 192.168.1.1:53
-# *.internal https://dns.example.com/dns-query
-
-# 测试条目
-*.local 192.168.1.1:53
-`
-		if err := os.WriteFile(filePath, []byte(defaultContent), 0644); err != nil {
-			return fmt.Errorf("创建默认定向域名文件失败: %w", err)
+		if err := dm.createDefaultFile(filePath); err != nil {
+			return err
 		}
 	}
 
@@ -197,7 +251,15 @@ func (dm *DesignatedMatcher) LoadDesignatedDomains(filePath string) error {
 		return fmt.Errorf("读取定向域名文件失败: %w", err)
 	}
 
-	var domains []*DesignatedDomain
+	// 创建新的索引结构
+	newTrie := NewDomainTrie()
+	newExactMap := make(map[string]string)
+	newWildcards := make([]*DesignatedDomain, 0)
+	newDomains := make([]*DesignatedDomain, 0)
+
+	var exactCount, wildcardCount, regexCount int
+
+	// 批量解析和分类
 	for lineNum, line := range lines {
 		dd, err := dm.parseDesignatedLine(line)
 		if err != nil {
@@ -208,22 +270,49 @@ func (dm *DesignatedMatcher) LoadDesignatedDomains(filePath string) error {
 			})
 			continue
 		}
-		domains = append(domains, dd)
+
+		// 添加到domains列表
+		newDomains = append(newDomains, dd)
+
+		// 根据模式类型分类存储
+		pattern := strings.ToLower(dd.Pattern)
+		if dd.MatchType == "exact" {
+			// 精确匹配直接存储到哈希表
+			newExactMap[pattern] = dd.DNS
+			exactCount++
+		} else if dd.MatchType == "wildcard" && strings.HasPrefix(pattern, "*.") {
+			// 简单通配符存储到前缀树
+			newTrie.Insert(pattern, dd.DNS, dd.UpstreamType)
+			wildcardCount++
+		} else {
+			// 复杂正则匹配
+			newWildcards = append(newWildcards, dd)
+			regexCount++
+		}
 	}
 
+	// 原子性更新索引结构
 	dm.mu.Lock()
-	dm.domains = domains
+	dm.trie = newTrie
+	dm.exactMap = newExactMap
+	dm.wildcards = newWildcards
+	dm.domains = newDomains
+	dm.domainCount = len(lines)
 	dm.mu.Unlock()
 
-	dm.logger.Info("🎯 定向域名加载完成", map[string]interface{}{
-		"file":  filePath,
-		"count": len(domains),
+	dm.logger.Info("🎯 高性能定向域名加载完成", map[string]interface{}{
+		"file":           filePath,
+		"total_count":    len(lines),
+		"exact_count":    exactCount,
+		"wildcard_count": wildcardCount,
+		"regex_count":    regexCount,
+		"performance":    "optimized",
 	})
 
 	return nil
 }
 
-// parseDesignatedLine 解析定向域名配置行
+// parseDesignatedLine 解析定向域名配置行（优化版）
 func (dm *DesignatedMatcher) parseDesignatedLine(line string) (*DesignatedDomain, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
@@ -233,13 +322,16 @@ func (dm *DesignatedMatcher) parseDesignatedLine(line string) (*DesignatedDomain
 	domainPattern := parts[0]
 	dnsServer := parts[1]
 
-	// 构建正则表达式
-	pattern := strings.ReplaceAll(domainPattern, "*", ".*")
-	pattern = "^" + pattern + "$"
+	// 处理 default_dns 关键字
+	if dnsServer == "default_dns" {
+		dm.mu.RLock()
+		defaultDNS := dm.defaultDNS
+		dm.mu.RUnlock()
 
-	regex, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil, fmt.Errorf("正则表达式编译失败: %w", err)
+		if defaultDNS == "" {
+			return nil, fmt.Errorf("使用了 default_dns 关键字，但未设置默认DNS服务器")
+		}
+		dnsServer = defaultDNS
 	}
 
 	// 确定上游类型
@@ -249,40 +341,64 @@ func (dm *DesignatedMatcher) parseDesignatedLine(line string) (*DesignatedDomain
 		upstreamType = "doh"
 	case strings.HasPrefix(dnsServer, "tls://"):
 		upstreamType = "dot"
+	case strings.HasPrefix(dnsServer, "h3://"):
+		upstreamType = "doh3"
+	}
+
+	// 确定匹配类型和构建索引
+	var matchType string
+	var regex *regexp.Regexp
+
+	if !strings.Contains(domainPattern, "*") {
+		// 精确匹配
+		matchType = "exact"
+	} else if strings.HasPrefix(domainPattern, "*.") && !strings.Contains(domainPattern[2:], "*") {
+		// 简单通配符：*.example.com
+		matchType = "wildcard"
+	} else {
+		// 复杂正则匹配
+		matchType = "regex"
+		pattern := "^" + strings.ReplaceAll(regexp.QuoteMeta(domainPattern), `\*`, ".*") + "$"
+		var err error
+		regex, err = regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("正则表达式编译失败: %w", err)
+		}
 	}
 
 	return &DesignatedDomain{
 		Domain:       domainPattern,
-		Pattern:      domainPattern, // 设置原始模式字符串
+		Pattern:      domainPattern,
 		DNS:          dnsServer,
 		Regex:        regex,
 		UpstreamType: upstreamType,
+		MatchType:    matchType,
 	}, nil
 }
 
-// readLines 读取文件行
-func (wm *WhitelistMatcher) readLines(filePath string) ([]string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+// createDefaultFile 创建默认文件
+func (dm *DesignatedMatcher) createDefaultFile(filePath string) error {
+	defaultContent := `# 高性能定向域名配置
+# 格式: 域名模式 DNS服务器
+# 支持协议:
+#   - UDP: udp://IP:PORT 或 IP:PORT
+#   - TCP: tcp://IP:PORT  
+#   - DoH: https://domain/path
+#   - DoT: tls://domain:PORT
+#   - DoH3: h3://domain/path
+# 特殊关键字:
+#   - default_dns: 使用配置文件中设置的默认DNS服务器
 
-	var lines []string
-	scanner := bufio.NewScanner(file)
+# 性能优先级：精确匹配 > 简单通配符 > 正则表达式
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// 跳过空行和注释
-		if line != "" && !strings.HasPrefix(line, "#") {
-			lines = append(lines, line)
-		}
-	}
-
-	return lines, scanner.Err()
+# 示例配置
+*.local udp://192.168.1.1:53
+*.bing.com default_dns
+`
+	return os.WriteFile(filePath, []byte(defaultContent), 0644)
 }
 
-// readLines 读取文件行（定向域名版本）
+// readLines 读取文件行
 func (dm *DesignatedMatcher) readLines(filePath string) ([]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -304,278 +420,83 @@ func (dm *DesignatedMatcher) readLines(filePath string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-// loadAllData 加载所有配置数据
-func (h *RefactoredHandler) loadAllData() error {
-	var lastErr error
+// GetDesignatedDomain 获取匹配的定向域名
+func (dm *DesignatedMatcher) GetDesignatedDomain(domain string) *DesignatedDomain {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
 
-	// 加载云服务网段
-	if err := h.cloudDetector.LoadNetworkRanges(
-		h.config.CloudflareNetFile,
-		h.config.CloudflareNetFile6,
-		h.config.AWSNetFile,
-	); err != nil {
-		h.Logger.Error("加载云服务网段失败", map[string]interface{}{
-			"error": err.Error(),
-		})
-		lastErr = err
-	}
-
-	// 加载白名单
-	if err := h.whitelistMatcher.LoadWhitelist(h.config.WhitelistFile); err != nil {
-		h.Logger.Error("加载白名单失败", map[string]interface{}{
-			"error": err.Error(),
-		})
-		lastErr = err
-	}
-
-	// 加载定向域名
-	if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
-		h.Logger.Error("加载定向域名失败", map[string]interface{}{
-			"error": err.Error(),
-		})
-		lastErr = err
-	}
-
-	return lastErr
-}
-
-// refreshDNSRecord 刷新DNS记录（缓存回调）
-func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error {
-	h.Logger.Info("🔄 [缓存刷新开始] ", map[string]interface{}{
-		"domain": domain,
-		"rule":   "CACHE_REFRESH_START",
+	// 记录开始匹配的调试信息
+	dm.logger.Debug("🎯 开始定向域名匹配检查", map[string]interface{}{
+		"domain":       domain,
+		"domain_count": len(dm.domains),
 	})
 
-	h.Logger.Debug("异步缓存刷新查询开始", map[string]interface{}{
-		"domain":    domain,
-		"qtype":     dns.TypeToString[qtype],
-		"upstreams": h.config.Upstream,
+	// 如果没有配置定向域名，直接返回nil
+	if len(dm.domains) == 0 {
+		dm.logger.Debug("⚠️ 定向域名为空，跳过匹配", map[string]interface{}{
+			"domain": domain,
+		})
+		return nil
+	}
+
+	// 记录所有定向域名模式
+	patterns := make([]string, len(dm.domains))
+	for i, dd := range dm.domains {
+		patterns[i] = dd.Pattern + " -> " + dd.DNS
+	}
+	dm.logger.Debug("📋 定向域名模式列表", map[string]interface{}{
+		"domain":   domain,
+		"patterns": patterns,
 	})
 
-	req := &dns.Msg{}
-	req.SetQuestion(dns.Fqdn(domain), qtype)
-
-	// 使用类型断言调用不同类型的查询优化器
-	var result *ConcurrentQueryResult
-	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
-		// 使用现代查询优化器
-		result = modernOptimizer.Query(req, h.config.Upstream)
-	} else if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
-		// 使用传统查询优化器
-		result = traditionalOptimizer.Query(req, h.config.Upstream)
-	} else {
-		h.Logger.Error("❗ [缓存刷新失败] ", map[string]interface{}{
-			"domain": domain,
-			"rule":   "CACHE_REFRESH_FAILED",
-			"error":  "unknown query optimizer type",
+	for i, dd := range dm.domains {
+		dm.logger.Debug("🔎 检查定向域名模式", map[string]interface{}{
+			"domain":  domain,
+			"pattern": dd.Pattern,
+			"dns":     dd.DNS,
+			"index":   i + 1,
+			"total":   len(dm.domains),
+			"regex":   dd.Regex.String(),
 		})
-		return fmt.Errorf("unknown query optimizer type")
-	}
-	if result.FastestResult == nil || result.FastestResult.Error != nil {
-		errorMsg := "all upstream queries failed"
-		if result.FastestResult != nil && result.FastestResult.Error != nil {
-			errorMsg = result.FastestResult.Error.Error()
-		}
-		h.Logger.Error("❌ [缓存刷新失败] ", map[string]interface{}{
-			"domain": domain,
-			"rule":   "CACHE_REFRESH_FAILED",
-			"error":  errorMsg,
-		})
-		return fmt.Errorf(errorMsg)
-	}
 
-	// 验证查询结果：必须有成功响应且包含实际答案记录
-	if result.HasSuccess && result.SuccessResult != nil &&
-		result.SuccessResult.Response != nil &&
-		result.SuccessResult.Response.Rcode == dns.RcodeSuccess &&
-		len(result.SuccessResult.Response.Answer) > 0 {
-
-		// 检查是否为云服务
-		detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
-		isCloud := detection.Type != CloudTypeNone
-
-		if isCloud {
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, int(detection.Type))
+		if dd.Regex != nil && dd.Regex.MatchString(domain) {
+			dm.logger.Info("🎯 定向域名匹配成功", map[string]interface{}{
+				"domain":          domain,
+				"matched_pattern": dd.Pattern,
+				"designated_dns":  dd.DNS,
+				"upstream_type":   dd.UpstreamType,
+				"pattern_index":   i + 1,
+				"rule":            "DESIGNATED_MATCHED",
+			})
+			return dd
 		} else {
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud)
+			dm.logger.Debug("❌ 定向域名模式不匹配", map[string]interface{}{
+				"domain":  domain,
+				"pattern": dd.Pattern,
+				"dns":     dd.DNS,
+				"index":   i + 1,
+				"regex":   dd.Regex.String(),
+			})
 		}
-
-		h.Logger.Info("✅ [缓存刷新成功] ", map[string]interface{}{
-			"domain":       domain,
-			"rule":         "CACHE_REFRESH_SUCCESS",
-			"is_cloud":     isCloud,
-			"answer_count": len(result.SuccessResult.Response.Answer),
-		})
-
-		h.Logger.Debug("缓存刷新详细信息", map[string]interface{}{
-			"domain":        domain,
-			"qtype":         dns.TypeToString[qtype],
-			"is_cloud":      isCloud,
-			"response_time": result.SuccessResult.ResponseTime.String(),
-			"answer_count":  len(result.SuccessResult.Response.Answer),
-			"rcode":         dns.RcodeToString[result.SuccessResult.Response.Rcode],
-		})
-	} else {
-		// 记录详细的失败原因
-		failureReason := "unknown_error"
-		if result.FastestResult != nil && result.FastestResult.Error != nil {
-			failureReason = result.FastestResult.Error.Error()
-		} else if !result.HasSuccess {
-			failureReason = "no_successful_response"
-		} else if result.SuccessResult == nil {
-			failureReason = "success_result_is_nil"
-		} else if result.SuccessResult.Response == nil {
-			failureReason = "response_is_nil"
-		} else if result.SuccessResult.Response.Rcode != dns.RcodeSuccess {
-			failureReason = fmt.Sprintf("non_success_rcode: %s", dns.RcodeToString[result.SuccessResult.Response.Rcode])
-		} else if len(result.SuccessResult.Response.Answer) == 0 {
-			failureReason = "no_answer_records"
-		}
-
-		h.Logger.Warn("⚠️ [缓存刷新跳过] ", map[string]interface{}{
-			"domain":         domain,
-			"rule":           "CACHE_REFRESH_SKIP",
-			"reason":         failureReason,
-			"has_result":     result.FastestResult != nil,
-			"has_success":    result.HasSuccess,
-			"success_result": result.SuccessResult != nil,
-		})
-
-		// 不更新缓存，保持原有缓存内容
-		h.Logger.Debug("异步刷新未更新缓存，保持原有缓存内容", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
-		})
 	}
+
+	dm.logger.Debug("❌ 定向域名匹配失败", map[string]interface{}{
+		"domain":          domain,
+		"checked_domains": len(dm.domains),
+		"result":          "NO_MATCH",
+	})
 
 	return nil
 }
 
-// startBackgroundTasks 启动后台任务
-func (h *RefactoredHandler) startBackgroundTasks() {
-	// 白名单刷新任务
-	if h.config.WhitelistFile != "" && h.config.WhitelistRefreshInterval > 0 {
-		go h.whitelistRefreshTask()
-	}
+// GetStats 获取性能统计（兼容接口）
+func (dm *DesignatedMatcher) GetStats() map[string]interface{} {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
 
-	// 定向域名刷新任务
-	if h.config.DesignatedDomain != "" && h.config.DesignatedRefreshInterval > 0 {
-		go h.designatedRefreshTask()
-	}
-
-	// 网络段刷新任务
-	if h.config.NetworkRefreshInterval > 0 {
-		go h.networkRefreshTask()
-	}
-}
-
-// whitelistRefreshTask 白名单刷新任务
-func (h *RefactoredHandler) whitelistRefreshTask() {
-	ticker := time.NewTicker(h.config.WhitelistRefreshInterval)
-	defer ticker.Stop()
-
-	h.Logger.Info("🔄 [白名单定时刷新启动] ", map[string]interface{}{
-		"rule":     "WHITELIST_REFRESH_TASK",
-		"interval": h.config.WhitelistRefreshInterval.String(),
-	})
-
-	for {
-		select {
-		case <-ticker.C:
-			h.Logger.Debug("开始定时白名单刷新", map[string]interface{}{
-				"file": h.config.WhitelistFile,
-			})
-			if err := h.whitelistMatcher.LoadWhitelist(h.config.WhitelistFile); err != nil {
-				h.Logger.Error("❌ [白名单刷新失败] ", map[string]interface{}{
-					"rule":  "WHITELIST_REFRESH_FAILED",
-					"error": err.Error(),
-				})
-			} else {
-				h.Logger.Info("✅ [白名单刷新成功] ", map[string]interface{}{
-					"rule": "WHITELIST_REFRESH_SUCCESS",
-				})
-			}
-		case <-h.ctx.Done():
-			h.Logger.Info("📋 [白名单刷新任务停止] ", map[string]interface{}{
-				"rule": "WHITELIST_REFRESH_STOPPED",
-			})
-			return
-		}
-	}
-}
-
-// designatedRefreshTask 定向域名刷新任务
-func (h *RefactoredHandler) designatedRefreshTask() {
-	ticker := time.NewTicker(h.config.DesignatedRefreshInterval)
-	defer ticker.Stop()
-
-	h.Logger.Info("🔄 [定向域名定时刷新启动] ", map[string]interface{}{
-		"rule":     "DESIGNATED_REFRESH_TASK",
-		"interval": h.config.DesignatedRefreshInterval.String(),
-	})
-
-	for {
-		select {
-		case <-ticker.C:
-			h.Logger.Debug("开始定时定向域名刷新", map[string]interface{}{
-				"file": h.config.DesignatedDomain,
-			})
-			if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
-				h.Logger.Error("❌ [定向域名刷新失败] ", map[string]interface{}{
-					"rule":  "DESIGNATED_REFRESH_FAILED",
-					"error": err.Error(),
-				})
-			} else {
-				h.Logger.Info("✅ [定向域名刷新成功] ", map[string]interface{}{
-					"rule": "DESIGNATED_REFRESH_SUCCESS",
-				})
-			}
-		case <-h.ctx.Done():
-			h.Logger.Info("📋 [定向域名刷新任务停止] ", map[string]interface{}{
-				"rule": "DESIGNATED_REFRESH_STOPPED",
-			})
-			return
-		}
-	}
-}
-
-// networkRefreshTask 网络段刷新任务
-func (h *RefactoredHandler) networkRefreshTask() {
-	ticker := time.NewTicker(h.config.NetworkRefreshInterval)
-	defer ticker.Stop()
-
-	h.Logger.Info("🔄 [网络段定时刷新启动] ", map[string]interface{}{
-		"rule":     "NETWORK_REFRESH_TASK",
-		"interval": h.config.NetworkRefreshInterval.String(),
-	})
-
-	for {
-		select {
-		case <-ticker.C:
-			h.Logger.Debug("开始定时网络段刷新", map[string]interface{}{
-				"cloudflare_v4": h.config.CloudflareNetFile,
-				"cloudflare_v6": h.config.CloudflareNetFile6,
-				"aws_file":      h.config.AWSNetFile,
-			})
-			if err := h.cloudDetector.LoadNetworkRanges(
-				h.config.CloudflareNetFile,
-				h.config.CloudflareNetFile6,
-				h.config.AWSNetFile,
-			); err != nil {
-				h.Logger.Error("❌ [网络段刷新失败] ", map[string]interface{}{
-					"rule":  "NETWORK_REFRESH_FAILED",
-					"error": err.Error(),
-				})
-			} else {
-				h.Logger.Info("✅ [网络段刷新成功] ", map[string]interface{}{
-					"rule": "NETWORK_REFRESH_SUCCESS",
-				})
-			}
-		case <-h.ctx.Done():
-			h.Logger.Info("📋 [网络段刷新任务停止] ", map[string]interface{}{
-				"rule": "NETWORK_REFRESH_STOPPED",
-			})
-			return
-		}
+	return map[string]interface{}{
+		"domain_count": len(dm.domains),
+		"matcher_type": "traditional",
+		"warning":      "建议升级到高性能匹配器以获得更好的性能",
 	}
 }

@@ -16,7 +16,7 @@ func InitResourceFiles(cfg *config.Config) error {
 		fmt.Println("已创建data目录")
 	}
 
-	for _, f := range []string{cfg.WhitelistFile, cfg.DesignatedDomain} {
+	for _, f := range []string{cfg.DesignatedDomain} {
 		if f == "" {
 			continue
 		}

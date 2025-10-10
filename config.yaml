@@ -7,15 +7,13 @@ modern_timeout: "2s" # 现代协议(DoH/DoT/H3)查询超时时间
 
 # 上游DNS服务器（支持多种协议，统一URL scheme）
 upstream:
-  - "udp://119.29.29.29:53" # UDP DNS（阿里）
-  - "https://dns.alidns.com/dns-query" # DoH（阿里DNS）
-  - "h3://cloudflare-dns.com/dns-query" # DoH3（Cloudflare，会降级到DoH）
+  - "udp://10.0.0.1:1053" # UDP DNS（阿里）
 
 cf_cache_time: 24h
-replace_cache_time: 60s
+replace_cache_time: 30m
+no_answer_cache_time: 10s
 
 # 刷新间隔配置（支持30m、1h、2h格式）
-whitelist_refresh: "30m" # 白名单刷新间隔（30分钟）
 designated_refresh: "30m" # 定向域名刷新间隔（30分钟）
 network_refresh: "24h" # 网络段刷新间隔（24小时）
 # Cloudflare和AWS IP段文件
@@ -27,8 +25,10 @@ aws_net_file: "./data/aws.txt"
 replace_cf_domain: "cf-cname.xingpingcn.top" # 检测到Cloudflare IP时替换的CNAME域名
 replace_aws_domain: "cc.cloudfront.182682.xyz" # 检测到AWS IP时替换的CNAME域名
 
+# 默认DNS服务器（用于未匹配到定向域名的情况）
+default_dns: "udp://119.29.29.29:53" # 支持URL scheme格式：udp://IP:PORT, https://domain/path等
+
 # 白名单和定向域名文件
-whitelist_file: "./data/whitelist.txt" # 白名单域名文件：跳过云服务检查的域名列表
 designated_domain: "./data/designated.txt" # 定向域名文件：指定使用特定DNS策略的域名列表
 
 # 日志级别
@@ -37,8 +37,8 @@ log_level: "debug"
 # 缓存配置
 cache:
   max_items: 5000 # 最大缓存条目数
-  ttl: "1m" # 统一缓存TTL：所有DNS响应的缓存时间
-  refresh_threshold: "18s" # 刷新阈值：TTL剩余18秒时开始异步刷新（TTL的30%）
+  ttl: "10m" # 统一缓存TTL：所有DNS响应的缓存时间
+  refresh_threshold: "20s" # 刷新阈值：TTL剩余18秒时开始异步刷新（TTL的30%）
   enable_async_refresh: true # 启用异步刷新：TTL到期前自动刷新DNS记录
-  max_async_workers: 5 # 最大异步工作线程数：并发处理异步刷新任务
+  max_async_workers: 2 # 最大异步工作线程数：并发处理异步刷新任务
   eviction_policy: "user_query_time" # 淘汰策略：user_query_time（用户查询时间）

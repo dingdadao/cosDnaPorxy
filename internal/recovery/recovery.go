@@ -29,7 +29,8 @@ type RecoveryManager struct {
 
 	// 服务管理
 	dnsHandler *dns.RefactoredHandler
-	dnsServer  *dns.Server
+	udpServer  *dns.Server
+	tcpServer  *dns.Server
 
 	// 控制通道
 	ctx         context.Context
@@ -148,15 +149,25 @@ func (rm *RecoveryManager) startDNSService() error {
 	}
 	rm.dnsHandler = handler
 
-	// 创建DNS服务器
-	server, err := dns.NewUDPServer(rm.config, handler)
+	// 创建UDP DNS服务器
+	udpServer, err := dns.NewUDPServer(rm.config, handler)
 	if err != nil {
-		return fmt.Errorf("创建DNS服务器失败: %w", err)
+		return fmt.Errorf("创建UDP DNS服务器失败: %w", err)
 	}
-	rm.dnsServer = server
+	rm.udpServer = udpServer
 
-	// 在单独的goroutine中启动服务器（带panic恢复）
-	go rm.runDNSServer()
+	// 创建TCP DNS服务器
+	tcpServer, err := dns.NewTCPServer(rm.config, handler)
+	if err != nil {
+		return fmt.Errorf("创建TCP DNS服务器失败: %w", err)
+	}
+	rm.tcpServer = tcpServer
+
+	// 在单独的goroutine中启动UDP服务器（带panic恢复）
+	go rm.runDNSServer(udpServer, "UDP")
+
+	// 在单独的goroutine中启动TCP服务器（带panic恢复）
+	go rm.runDNSServer(tcpServer, "TCP")
 
 	rm.running = true
 	rm.logger.Info("✅ [DNS服务启动成功] ", map[string]interface{}{
@@ -167,7 +178,7 @@ func (rm *RecoveryManager) startDNSService() error {
 }
 
 // runDNSServer 运行DNS服务器（带panic恢复）
-func (rm *RecoveryManager) runDNSServer() {
+func (rm *RecoveryManager) runDNSServer(server *dns.Server, serverType string) {
 	defer func() {
 		if r := recover(); r != nil {
 			rm.handlePanic(r)
@@ -179,9 +190,10 @@ func (rm *RecoveryManager) runDNSServer() {
 		}
 	}()
 
-	if err := rm.dnsServer.Start(); err != nil {
+	if err := server.Start(); err != nil {
 		rm.logger.Error("❌ [DNS服务器运行失败] ", map[string]interface{}{
 			"rule":  "DNS_SERVER_FAILED",
+			"type":  serverType,
 			"error": err.Error(),
 		})
 		// 触发重启
@@ -205,10 +217,16 @@ func (rm *RecoveryManager) stopDNSService() {
 		"rule": "DNS_SERVICE_STOP",
 	})
 
-	// 停止DNS服务器
-	if rm.dnsServer != nil {
-		rm.dnsServer.Stop()
-		rm.dnsServer = nil
+	// 停止UDP DNS服务器
+	if rm.udpServer != nil {
+		rm.udpServer.Stop()
+		rm.udpServer = nil
+	}
+
+	// 停止TCP DNS服务器
+	if rm.tcpServer != nil {
+		rm.tcpServer.Stop()
+		rm.tcpServer = nil
 	}
 
 	// 关闭DNS处理器
