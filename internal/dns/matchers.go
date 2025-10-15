@@ -205,24 +205,58 @@ func (dm *DesignatedMatcher) GetDesignatedDomainOrDefault(domain string) (string
 	// 1. 快速精确匹配检查
 	domainLower := strings.ToLower(domain)
 	if dns, exists := dm.exactMap[domainLower]; exists {
+		dm.logger.Debug("🎯 精确匹配成功", map[string]interface{}{
+			"domain": domainLower,
+			"dns":    dns,
+		})
 		return dns, true
 	}
 
 	// 2. 使用前缀树进行快速匹配
 	if dm.trie != nil {
 		if result := dm.trie.Search(domainLower); result.Matched {
+			dm.logger.Debug("🎯 前缀树匹配成功", map[string]interface{}{
+				"domain":  domainLower,
+				"dns":     result.DNS,
+				"pattern": result.Pattern,
+				"type":    result.Type,
+			})
 			return result.DNS, true
 		}
 	}
 
 	// 3. 复杂正则匹配（仅在必要时）
-	for _, dd := range dm.wildcards {
-		if dd != nil && dd.Regex != nil && dd.Regex.MatchString(domainLower) {
-			return dd.DNS, true
+	dm.logger.Debug("🔍 开始正则匹配检查", map[string]interface{}{
+		"domain":         domainLower,
+		"wildcard_count": len(dm.wildcards),
+	})
+
+	for i, dd := range dm.wildcards {
+		if dd != nil && dd.Regex != nil {
+			dm.logger.Debug("🔍 检查正则模式", map[string]interface{}{
+				"domain":  domainLower,
+				"pattern": dd.Pattern,
+				"regex":   dd.Regex.String(),
+				"index":   i,
+			})
+
+			if dd.Regex.MatchString(domainLower) {
+				dm.logger.Debug("🎯 正则匹配成功", map[string]interface{}{
+					"domain":  domainLower,
+					"dns":     dd.DNS,
+					"pattern": dd.Pattern,
+					"type":    dd.MatchType,
+				})
+				return dd.DNS, true
+			}
 		}
 	}
 
 	// 4. 返回默认DNS
+	dm.logger.Debug("🔄 使用默认DNS", map[string]interface{}{
+		"domain": domainLower,
+		"dns":    dm.defaultDNS,
+	})
 	return dm.defaultDNS, dm.defaultDNS != ""
 }
 
@@ -285,7 +319,7 @@ func (dm *DesignatedMatcher) LoadDesignatedDomains(filePath string) error {
 			newTrie.Insert(pattern, dd.DNS, dd.UpstreamType)
 			wildcardCount++
 		} else {
-			// 复杂正则匹配
+			// 其他类型（suffix_wildcard, keyword, regex）存储到正则表达式列表
 			newWildcards = append(newWildcards, dd)
 			regexCount++
 		}
@@ -349,12 +383,32 @@ func (dm *DesignatedMatcher) parseDesignatedLine(line string) (*DesignatedDomain
 	var matchType string
 	var regex *regexp.Regexp
 
-	if !strings.Contains(domainPattern, "*") {
-		// 精确匹配
+	if !strings.Contains(domainPattern, "*") && strings.Contains(domainPattern, ".") {
+		// 精确匹配（包含点号的完整域名）
 		matchType = "exact"
 	} else if strings.HasPrefix(domainPattern, "*.") && !strings.Contains(domainPattern[2:], "*") {
-		// 简单通配符：*.example.com
+		// 前缀通配符：*.example.com
 		matchType = "wildcard"
+	} else if strings.HasSuffix(domainPattern, ".*") && !strings.Contains(domainPattern[:len(domainPattern)-2], "*") {
+		// 后缀通配符：example.*
+		matchType = "suffix_wildcard"
+		// 对于后缀通配符，我们需要使用正则表达式来匹配
+		pattern := "^" + regexp.QuoteMeta(domainPattern[:len(domainPattern)-2]) + `\..*$`
+		var err error
+		regex, err = regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("后缀通配符正则表达式编译失败: %w", err)
+		}
+	} else if !strings.Contains(domainPattern, ".") && !strings.Contains(domainPattern, "*") {
+		// 关键字匹配：aaa（不包含点号和星号的简单关键字）
+		matchType = "keyword"
+		// 对于关键字匹配，我们需要使用正则表达式来匹配包含该关键字的域名
+		pattern := `.*` + regexp.QuoteMeta(domainPattern) + `.*`
+		var err error
+		regex, err = regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("关键字匹配正则表达式编译失败: %w", err)
+		}
 	} else {
 		// 复杂正则匹配
 		matchType = "regex"
@@ -389,11 +443,20 @@ func (dm *DesignatedMatcher) createDefaultFile(filePath string) error {
 # 特殊关键字:
 #   - default_dns: 使用配置文件中设置的默认DNS服务器
 
+# 支持的匹配模式：
+# 1. 精确匹配: example.com
+# 2. 前缀通配符: *.example.com (匹配 www.example.com, mail.example.com 等)
+# 3. 后缀通配符: example.* (匹配 example.com, example.org, example.net 等)
+# 4. 关键字匹配: example (匹配任何包含 example 的域名)
+# 5. 复杂通配符: *example* (匹配任何包含 example 的域名)
+
 # 性能优先级：精确匹配 > 简单通配符 > 正则表达式
 
 # 示例配置
 *.local udp://192.168.1.1:53
 *.bing.com default_dns
+bing.* default_dns
+bing default_dns
 `
 	return os.WriteFile(filePath, []byte(defaultContent), 0644)
 }

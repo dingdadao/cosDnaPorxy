@@ -256,7 +256,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				"dns":     dnsServer,
 			})
 
-			resp, err := h.proxyQueryWithCaching(req, []string{dnsServer}, domain, qtype)
+			resp, err := h.proxyQueryWithCaching(req, []string{dnsServer}, domain, qtype, true) // 跳过云服务检测
 			if err != nil || resp == nil {
 				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
 					"domain": domain,
@@ -267,20 +267,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				return
 			}
 
-			// 检查是否为云服务
-			detection := h.cloudDetector.DetectCloudService(resp)
-			if detection.Type != CloudTypeNone {
-				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
-					"domain":     domain,
-					"cloud_type": detection.Type,
-					"detected":   true,
-				})
-
-				// 执行云IP替换
-				h.handleCloudReplacement(w, req, domain, qtype, int(detection.Type))
-				return
-			}
-
+			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
+			// 只有在使用默认DNS时才进行云服务检测
 			respCopy := resp.Copy()
 			respCopy.Id = req.Id
 			// 确保响应中的 TTL 不小于配置的最小 TTL
@@ -317,7 +305,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				return
 			}
 
-			// 检查是否为云服务
+			// 检查是否为云服务（仅在使用默认DNS时）
 			detection := h.cloudDetector.DetectCloudService(resp)
 			if detection.Type != CloudTypeNone {
 				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
@@ -370,7 +358,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		return
 	}
 
-	// 检查是否为云服务
+	// 检查是否为云服务（仅在没有定向域名匹配时）
 	detection := h.cloudDetector.DetectCloudService(resp)
 	if detection.Type != CloudTypeNone {
 		h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
@@ -428,6 +416,83 @@ func (h *RefactoredHandler) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration
 	}
 }
 
+// processCloudResponse 处理云域名响应，确保符合DNS协议标准
+func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *dns.Msg {
+	if resp == nil {
+		return resp
+	}
+
+	// 创建新的响应
+	processedResp := &dns.Msg{}
+	processedResp.SetReply(&dns.Msg{}) // 创建一个空的请求来设置回复
+	processedResp.Authoritative = resp.Authoritative
+	processedResp.RecursionAvailable = resp.RecursionAvailable
+
+	// 收集所有IP记录（最多4条）
+	var ipRecords []dns.RR
+
+	// 遍历原始响应中的所有记录
+	for _, rr := range resp.Answer {
+		// 如果已经收集了4条记录，停止收集
+		if len(ipRecords) >= 4 {
+			break
+		}
+
+		// 直接处理IP记录
+		switch rr.(type) {
+		case *dns.A, *dns.AAAA:
+			ipRecords = append(ipRecords, rr)
+		}
+	}
+
+	// 如果没有足够的IP记录，尝试递归解析CNAME记录
+	if len(ipRecords) < 4 {
+		// 查找CNAME记录并递归解析
+		for _, rr := range resp.Answer {
+			// 如果已经收集了4条记录，停止收集
+			if len(ipRecords) >= 4 {
+				break
+			}
+
+			if cname, ok := rr.(*dns.CNAME); ok {
+				// 递归解析CNAME目标
+				cnameTargetReq := &dns.Msg{}
+				cnameTargetReq.SetQuestion(cname.Target, dns.TypeA) // 假设是A记录查询
+
+				cnameTargetResp, err := h.proxyQuery(cnameTargetReq, h.config.Upstream)
+				if err == nil && cnameTargetResp != nil {
+					// 处理CNAME目标的响应
+					for _, targetRR := range cnameTargetResp.Answer {
+						// 如果已经收集了4条记录，停止收集
+						if len(ipRecords) >= 4 {
+							break
+						}
+
+						// 只处理IP记录
+						switch targetRR.(type) {
+						case *dns.A, *dns.AAAA:
+							ipRecords = append(ipRecords, targetRR)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 复制IP记录到处理后的响应，修改域名
+	for _, rr := range ipRecords {
+		newRR := dns.Copy(rr)
+		newRR.Header().Name = dns.Fqdn(domain)
+		processedResp.Answer = append(processedResp.Answer, newRR)
+	}
+
+	// 复制其他部分
+	processedResp.Ns = append([]dns.RR{}, resp.Ns...)
+	processedResp.Extra = append([]dns.RR{}, resp.Extra...)
+
+	return processedResp
+}
+
 // handleCloudReplacement 处理云IP替换
 func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int) {
 	var replaceDomain string
@@ -478,17 +543,17 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 		return
 	}
 
-	// 构建响应，将替换域名的IP地址作为原始域名的响应
-	finalResp := &dns.Msg{}
-	finalResp.SetReply(req)
-	finalResp.Authoritative = true
-	finalResp.RecursionAvailable = true
+	// 使用统一的云域名响应处理方法
+	finalResp := h.processCloudResponse(replaceResp, domain)
 
-	// 复制Answer记录，但修改域名
-	for _, rr := range replaceResp.Answer {
-		newRR := dns.Copy(rr)
-		newRR.Header().Name = dns.Fqdn(domain)
-		finalResp.Answer = append(finalResp.Answer, newRR)
+	// 如果处理后的响应没有答案记录，返回错误
+	if len(finalResp.Answer) == 0 {
+		h.Logger.Error("❌ 云IP替换失败：没有解析到有效的IP记录", map[string]interface{}{
+			"replace_domain":  replaceDomain,
+			"original_domain": domain,
+		})
+		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+		return
 	}
 
 	// 解析替换缓存时间配置
@@ -821,7 +886,25 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 		// 直接从缓存中获取云域名信息，避免重复检测
 		_, _, isCloud, cloudType := h.cacheManager.Get(domain, qtype)
 
-		if isCloud {
+		// 检查是否匹配定向域名且不是使用默认DNS
+		dnsServer, hasDesignated := h.designatedMatcher.GetDesignatedDomainOrDefault(domain)
+		useDesignatedDNS := hasDesignated && dnsServer != h.designatedMatcher.GetDefaultDNS()
+
+		if useDesignatedDNS {
+			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
+			// 不进行云服务检测，直接缓存结果
+			h.ensureMinimumTTL(result.SuccessResult.Response, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
+
+			h.Logger.Info("✅ [异步刷新成功] ", map[string]interface{}{
+				"domain":         domain,
+				"qtype":          dns.TypeToString[qtype],
+				"is_cloud":       false,
+				"use_designated": true,
+				"answer_count":   len(result.SuccessResult.Response.Answer),
+				"upstreams":      upstreams,
+			})
+		} else if isCloud {
 			// 对于云域名，使用配置的替换缓存时间
 			replaceCacheTime := h.config.Cache.TTL // 默认使用缓存TTL
 			if h.config.ReplaceCacheTime != "" {
@@ -829,11 +912,15 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 					replaceCacheTime = parsedTime
 				}
 			}
+
+			// 使用统一的云域名响应处理方法
+			processedResponse := h.processCloudResponse(result.SuccessResult.Response, domain)
+
 			// 确保云域名响应的TTL不小于配置的替换缓存时间
-			h.ensureMinimumTTL(result.SuccessResult.Response, replaceCacheTime)
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+			h.ensureMinimumTTL(processedResponse, replaceCacheTime)
+			h.cacheManager.Set(domain, qtype, processedResponse, isCloud, cloudType)
 			// 同时更新云响应缓存
-			h.cacheManager.SetCloudResponse(domain, qtype, result.SuccessResult.Response, cloudType, replaceCacheTime)
+			h.cacheManager.SetCloudResponse(domain, qtype, processedResponse, cloudType, replaceCacheTime)
 		} else {
 			// 确保普通域名响应的TTL不小于配置的最小TTL
 			h.ensureMinimumTTL(result.SuccessResult.Response, h.config.Cache.TTL)
@@ -848,12 +935,18 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 				return fmt.Errorf("cloud detector is nil")
 			}
 
-			// 对于非云域名，检测是否为云服务
+			// 对于非云域名且非定向域名，检测是否为云服务
 			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
 			isCloud = detection.Type != CloudTypeNone
 			cloudType = int(detection.Type)
 
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+			// 如果检测到是云服务，使用统一的云域名响应处理方法
+			if isCloud {
+				processedResponse := h.processCloudResponse(result.SuccessResult.Response, domain)
+				h.cacheManager.Set(domain, qtype, processedResponse, isCloud, cloudType)
+			} else {
+				h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+			}
 		}
 
 		h.Logger.Info("✅ [异步刷新成功] ", map[string]interface{}{

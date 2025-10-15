@@ -44,10 +44,13 @@ func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.M
 }
 
 // proxyQueryWithCaching 带智能缓存的查询（只缓存成功的结果）
-func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16) (*dns.Msg, error) {
+func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, skipCloudDetection ...bool) (*dns.Msg, error) {
 	if len(upstreams) == 0 {
 		return nil, errors.New("no upstream servers available")
 	}
+
+	// 检查是否应该跳过云服务检测
+	shouldSkipCloudDetection := len(skipCloudDetection) > 0 && skipCloudDetection[0]
 
 	// 根据优化器类型选择查询方法
 	var result *ConcurrentQueryResult
@@ -77,14 +80,20 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			"fastest_server": fastestServer,
 		})
 
-		// 检查是否为云服务
-		detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
-		isCloud := detection.Type != CloudTypeNone
-
-		if isCloud {
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, int(detection.Type))
+		// 只有在不跳过云服务检测时才进行云服务检测
+		if shouldSkipCloudDetection {
+			// 对于定向域名，跳过云服务检测，直接缓存结果
+			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false)
 		} else {
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud)
+			// 检查是否为云服务
+			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
+			isCloud := detection.Type != CloudTypeNone
+
+			if isCloud {
+				h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, int(detection.Type))
+			} else {
+				h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud)
+			}
 		}
 	}
 
