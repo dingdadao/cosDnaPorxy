@@ -7,11 +7,12 @@ modern_timeout: "2s" # 现代协议(DoH/DoT/H3)查询超时时间
 
 # 上游DNS服务器（支持多种协议，统一URL scheme）
 upstream:
-  - "udp://10.0.0.1:1053" # UDP DNS（阿里）
+  - "udp://223.5.5.5:53" # UDP DNS（阿里）
 
 cf_cache_time: 24h
 replace_cache_time: 30m
 no_answer_cache_time: 10s
+max_ip_records: 4 # 云域名替换时的最大IP记录数
 
 # 刷新间隔配置（支持30m、1h、2h格式）
 designated_refresh: "30m" # 定向域名刷新间隔（30分钟）

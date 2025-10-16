@@ -236,8 +236,32 @@ func (cd *CloudDetector) loadAWSRanges(filePath string) error {
 	return nil
 }
 
+// IsReplaceDomain 检查域名是否为替换域名
+func (cd *CloudDetector) IsReplaceDomain(domain string) bool {
+	domain = strings.TrimSuffix(domain, ".")
+	cd.mu.RLock()
+	defer cd.mu.RUnlock()
+	return domain == cd.cfReplaceDomain || domain == cd.awsReplaceDomain
+}
+
+// SetReplaceDomains 设置替换域名配置
+func (cd *CloudDetector) SetReplaceDomains(cfReplaceDomain, awsReplaceDomain string) {
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	cd.cfReplaceDomain = cfReplaceDomain
+	cd.awsReplaceDomain = awsReplaceDomain
+}
+
 // DetectCloudService 检测DNS响应中的云服务IP
-func (cd *CloudDetector) DetectCloudService(msg *dns.Msg) *CloudDetectionResult {
+func (cd *CloudDetector) DetectCloudService(msg *dns.Msg, domain string) *CloudDetectionResult {
+	// 如果是替换域名，直接返回无云服务检测结果
+	if cd.IsReplaceDomain(domain) {
+		cd.logger.Debug("⏭️ 跳过云服务检测（替换域名）", map[string]interface{}{
+			"domain": domain,
+		})
+		return &CloudDetectionResult{Type: CloudTypeNone}
+	}
+
 	if msg == nil || len(msg.Answer) == 0 {
 		return &CloudDetectionResult{Type: CloudTypeNone}
 	}

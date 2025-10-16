@@ -76,6 +76,9 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 	cacheManager := NewCacheManager(cfg, logger, nil)
 	cloudDetector := NewCloudDetector(logger, nil)
 
+	// 设置替换域名配置
+	cloudDetector.SetReplaceDomains(cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
+
 	// 根据上游配置选择查询优化器
 	var queryOptimizer interface{}
 	if hasModernProtocols(cfg.Upstream) {
@@ -240,7 +243,42 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		})
 	}
 
-	// 2. 定向域名检查（统一处理所有域名路由）
+	// 2. 缓存未命中，检查是否为替换域名
+	// 如果是替换域名，直接查询并返回结果，避免套娃
+	if h.cloudDetector.IsReplaceDomain(domain) {
+		h.Logger.Debug("⏭️ 跳过云服务检测（替换域名）", map[string]interface{}{
+			"domain": domain,
+		})
+
+		resp, err := h.proxyQuery(req, h.config.Upstream)
+		if err != nil || resp == nil {
+			h.Logger.Error("❌ [替换域名查询失败] ", map[string]interface{}{
+				"domain": domain,
+				"error":  err,
+			})
+			h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+			return
+		}
+
+		respCopy := resp.Copy()
+		respCopy.Id = req.Id
+		// 确保响应中的 TTL 不小于配置的最小 TTL
+		h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+
+		// 缓存替换域名的响应结果
+		h.cacheManager.Set(domain, qtype, respCopy, false)
+
+		w.WriteMsg(respCopy)
+
+		h.Logger.Info("✅ [替换域名查询完成] ", map[string]interface{}{
+			"domain":       domain,
+			"result":       "success",
+			"answer_count": len(resp.Answer),
+		})
+		return
+	}
+
+	// 3. 非替换域名处理逻辑
 	h.Logger.Debug("🎯 开始定向域名检查", map[string]interface{}{
 		"domain": domain,
 		"step":   "DESIGNATED_CHECK",
@@ -306,7 +344,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			}
 
 			// 检查是否为云服务（仅在使用默认DNS时）
-			detection := h.cloudDetector.DetectCloudService(resp)
+			// 注意：这里会自动跳过替换域名的云服务检测
+			detection := h.cloudDetector.DetectCloudService(resp, domain)
 			if detection.Type != CloudTypeNone {
 				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
 					"domain":     domain,
@@ -359,7 +398,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	}
 
 	// 检查是否为云服务（仅在没有定向域名匹配时）
-	detection := h.cloudDetector.DetectCloudService(resp)
+	// 注意：这里会自动跳过替换域名的云服务检测
+	detection := h.cloudDetector.DetectCloudService(resp, domain)
 	if detection.Type != CloudTypeNone {
 		h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
 			"domain":     domain,
@@ -422,19 +462,38 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 		return resp
 	}
 
-	// 创建新的响应
-	processedResp := &dns.Msg{}
-	processedResp.SetReply(&dns.Msg{}) // 创建一个空的请求来设置回复
-	processedResp.Authoritative = resp.Authoritative
-	processedResp.RecursionAvailable = resp.RecursionAvailable
+	// 创建新的响应，不复制原始响应的问题部分以避免Question section mismatch
+	processedResp := &dns.Msg{
+		MsgHdr: resp.MsgHdr,
+		Answer: []dns.RR{},
+		Ns:     append([]dns.RR{}, resp.Ns...),
+		Extra:  append([]dns.RR{}, resp.Extra...),
+	}
 
-	// 收集所有IP记录（最多4条）
+	// 设置正确的问题部分
+	processedResp.Question = []dns.Question{
+		{
+			Name:   dns.Fqdn(domain),
+			Qtype:  resp.Question[0].Qtype,
+			Qclass: resp.Question[0].Qclass,
+		},
+	}
+
+	processedResp.Id = resp.Id // 保持ID一致
+
+	// 获取最大IP记录数配置，默认为4
+	maxIPRecords := h.config.MaxIPRecords
+	if maxIPRecords <= 0 {
+		maxIPRecords = 4 // 默认值
+	}
+
+	// 收集所有IP记录（最多maxIPRecords条）
 	var ipRecords []dns.RR
 
 	// 遍历原始响应中的所有记录
 	for _, rr := range resp.Answer {
-		// 如果已经收集了4条记录，停止收集
-		if len(ipRecords) >= 4 {
+		// 如果已经收集了足够数量的记录，停止收集
+		if len(ipRecords) >= maxIPRecords {
 			break
 		}
 
@@ -446,11 +505,11 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 	}
 
 	// 如果没有足够的IP记录，尝试递归解析CNAME记录
-	if len(ipRecords) < 4 {
+	if len(ipRecords) < maxIPRecords {
 		// 查找CNAME记录并递归解析
 		for _, rr := range resp.Answer {
-			// 如果已经收集了4条记录，停止收集
-			if len(ipRecords) >= 4 {
+			// 如果已经收集了足够数量的记录，停止收集
+			if len(ipRecords) >= maxIPRecords {
 				break
 			}
 
@@ -463,8 +522,8 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 				if err == nil && cnameTargetResp != nil {
 					// 处理CNAME目标的响应
 					for _, targetRR := range cnameTargetResp.Answer {
-						// 如果已经收集了4条记录，停止收集
-						if len(ipRecords) >= 4 {
+						// 如果已经收集了足够数量的记录，停止收集
+						if len(ipRecords) >= maxIPRecords {
 							break
 						}
 
@@ -485,10 +544,6 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 		newRR.Header().Name = dns.Fqdn(domain)
 		processedResp.Answer = append(processedResp.Answer, newRR)
 	}
-
-	// 复制其他部分
-	processedResp.Ns = append([]dns.RR{}, resp.Ns...)
-	processedResp.Extra = append([]dns.RR{}, resp.Extra...)
 
 	return processedResp
 }
@@ -531,6 +586,8 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 	// 查询替换域名
 	replaceReq := &dns.Msg{}
 	replaceReq.SetQuestion(dns.Fqdn(replaceDomain), qtype)
+	// 保持请求ID一致，避免响应匹配问题
+	replaceReq.Id = req.Id
 
 	replaceResp, err := h.proxyQuery(replaceReq, h.config.Upstream)
 	if err != nil || replaceResp == nil {
@@ -692,6 +749,14 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 
 	if h.Logger == nil {
 		return fmt.Errorf("logger is nil")
+	}
+
+	// 检查是否为替换域名，如果是则直接返回，避免套娃
+	if h.cloudDetector.IsReplaceDomain(domain) {
+		h.Logger.Debug("⏭️ 跳过异步刷新（替换域名）", map[string]interface{}{
+			"domain": domain,
+		})
+		return nil
 	}
 
 	h.Logger.Info("🔄 [异步刷新开始] ", map[string]interface{}{
@@ -936,7 +1001,7 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 			}
 
 			// 对于非云域名且非定向域名，检测是否为云服务
-			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
+			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response, domain)
 			isCloud = detection.Type != CloudTypeNone
 			cloudType = int(detection.Type)
 

@@ -86,7 +86,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false)
 		} else {
 			// 检查是否为云服务
-			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response)
+			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response, domain)
 			isCloud := detection.Type != CloudTypeNone
 
 			if isCloud {

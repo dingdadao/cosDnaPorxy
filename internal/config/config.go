@@ -51,6 +51,7 @@ type Config struct {
 	CFMrsFile6URL             string           `yaml:"cf_mrs_file6_url"`
 	ReplaceCacheTime          string           `yaml:"replace_cache_time"`
 	NoAnswerCacheTime         string           `yaml:"no_answer_cache_time"` // 无答案响应的缓存时间
+	MaxIPRecords              int              `yaml:"max_ip_records"`       // 云域名替换时的最大IP记录数
 	AWSMrsFile46              string           `yaml:"aws_mrs_file64"`
 	AWSMrsFile46URL           string           `yaml:"aws_mrs_file64_url"`
 	ReplaceCFDomain           string           `yaml:"replace_cf_domain"`
@@ -116,6 +117,11 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if config.Cache.EvictionPolicy == "" {
 		config.Cache.EvictionPolicy = "user_query_time" // 默认按用户查询时间淘汰
+	}
+
+	// 设置最大IP记录数默认值
+	if config.MaxIPRecords == 0 {
+		config.MaxIPRecords = 4 // 默认4条记录
 	}
 
 	// 设置刷新间隔默认值
