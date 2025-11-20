@@ -286,8 +286,47 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 	// 使用新的统一匹配方法
 	if dnsServer, hasDesignated := h.designatedMatcher.GetDesignatedDomainOrDefault(domain); hasDesignated {
-		// 如果匹配到定向域名且不是使用默认DNS，则使用指定的DNS服务器
-		if dnsServer != h.designatedMatcher.GetDefaultDNS() {
+		// 检查是否使用默认DNS配置
+		if dnsServer == h.designatedMatcher.GetDefaultDNS() {
+			h.Logger.Info("🔄 [使用默认DNS] ", map[string]interface{}{
+				"domain": domain,
+				"dns":    dnsServer,
+			})
+			// 当使用默认DNS时，使用上游配置进行查询
+			h.Logger.Info("🌐 [上游DNS查询] ", map[string]interface{}{
+				"domain":    domain,
+				"upstreams": h.config.Upstream,
+			})
+
+			resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype, true)
+			if err != nil || resp == nil {
+				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
+					"domain":    domain,
+					"source":    "upstream",
+					"upstreams": h.config.Upstream,
+					"error":     err,
+				})
+				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+				return
+			}
+
+			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
+
+			respCopy := resp.Copy()
+			respCopy.Id = req.Id
+			// 确保响应中的 TTL 不小于配置的最小 TTL
+			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+			w.WriteMsg(respCopy)
+
+			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+				"domain":       domain,
+				"result":       "success",
+				"source":       "upstream",
+				"answer_count": len(resp.Answer),
+			})
+			return
+		} else {
+			// 如果匹配到定向域名且不是使用默认DNS，则使用指定的DNS服务器并跳过云服务检测
 			h.Logger.Info("🎯 [定向域名匹配] ", map[string]interface{}{
 				"domain":  domain,
 				"matched": true,
@@ -304,9 +343,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
 				return
 			}
-
 			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
-			// 只有在使用默认DNS时才进行云服务检测
 			respCopy := resp.Copy()
 			respCopy.Id = req.Id
 			// 确保响应中的 TTL 不小于配置的最小 TTL
@@ -317,57 +354,6 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				"domain":       domain,
 				"result":       "success",
 				"source":       "designated",
-				"answer_count": len(resp.Answer),
-			})
-			return
-		} else {
-			h.Logger.Info("🔄 [使用默认DNS] ", map[string]interface{}{
-				"domain": domain,
-				"dns":    dnsServer,
-			})
-			// 当使用默认DNS时，使用上游配置进行查询
-			h.Logger.Info("🌐 [上游DNS查询] ", map[string]interface{}{
-				"domain":    domain,
-				"upstreams": h.config.Upstream,
-			})
-
-			resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype)
-			if err != nil || resp == nil {
-				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
-					"domain":    domain,
-					"source":    "upstream",
-					"upstreams": h.config.Upstream,
-					"error":     err,
-				})
-				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
-				return
-			}
-
-			// 检查是否为云服务（仅在使用默认DNS时）
-			// 注意：这里会自动跳过替换域名的云服务检测
-			detection := h.cloudDetector.DetectCloudService(resp, domain)
-			if detection.Type != CloudTypeNone {
-				h.Logger.Info("☁️ [云服务检测] ", map[string]interface{}{
-					"domain":     domain,
-					"cloud_type": detection.Type,
-					"detected":   true,
-				})
-
-				// 执行云IP替换
-				h.handleCloudReplacement(w, req, domain, qtype, int(detection.Type))
-				return
-			}
-
-			respCopy := resp.Copy()
-			respCopy.Id = req.Id
-			// 确保响应中的 TTL 不小于配置的最小 TTL
-			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
-			w.WriteMsg(respCopy)
-
-			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
-				"domain":       domain,
-				"result":       "success",
-				"source":       "upstream",
 				"answer_count": len(resp.Answer),
 			})
 			return

@@ -8,4 +8,5 @@ payload:
   - DOMAIN-SUFFIX,cloudflare
   - DOMAIN-SUFFIX,push.apple.com
   - DOMAIN-SUFFIX,push-apple.com
+  - DOMAIN-SUFFIX,ntp.org
   #- DOMAIN-SUFFIX,dpdns.org

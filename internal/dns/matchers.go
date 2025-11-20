@@ -25,6 +25,7 @@ type DomainTrie struct {
 	pattern      string
 	upstreamType string
 	isWildcard   bool
+	parent       *DomainTrie // 父节点指针，用于多级通配符匹配
 }
 
 // NewDomainTrie 创建新的域名前缀树
@@ -49,7 +50,9 @@ func (t *DomainTrie) Insert(pattern, dnsServer, upstreamType string) {
 		current := t
 		for _, part := range reverseParts {
 			if current.children[part] == nil {
-				current.children[part] = NewDomainTrie()
+				newNode := NewDomainTrie()
+				newNode.parent = current // 设置父节点指针
+				current.children[part] = newNode
 			}
 			current = current.children[part]
 		}
@@ -68,7 +71,9 @@ func (t *DomainTrie) Insert(pattern, dnsServer, upstreamType string) {
 		current := t
 		for _, part := range reverseParts {
 			if current.children[part] == nil {
-				current.children[part] = NewDomainTrie()
+				newNode := NewDomainTrie()
+				newNode.parent = current // 设置父节点指针
+				current.children[part] = newNode
 			}
 			current = current.children[part]
 		}
@@ -115,6 +120,34 @@ func (t *DomainTrie) Search(domain string) *MatchResult {
 					DNS:     wildcardNode.dnsServer,
 					Pattern: wildcardNode.pattern,
 					Type:    "wildcard",
+				}
+			}
+			// 检查是否有通配符匹配（支持多级子域名）
+			if lastWildcardMatch != nil {
+				return &MatchResult{
+					Matched: true,
+					DNS:     lastWildcardMatch.dnsServer,
+					Pattern: lastWildcardMatch.pattern,
+					Type:    "wildcard",
+				}
+			}
+			// 对于多级子域名，需要检查所有可能的通配符匹配
+			// 遍历所有父级节点，查找通配符匹配
+			tempCurrent := current
+			for j := i; j < len(reverseParts); j++ {
+				if wildcardNode := tempCurrent.children["*"]; wildcardNode != nil && wildcardNode.dnsServer != "" {
+					return &MatchResult{
+						Matched: true,
+						DNS:     wildcardNode.dnsServer,
+						Pattern: wildcardNode.pattern,
+						Type:    "wildcard",
+					}
+				}
+				// 移动到父节点
+				if tempCurrent.parent != nil {
+					tempCurrent = tempCurrent.parent
+				} else {
+					break
 				}
 			}
 			break
