@@ -4,6 +4,7 @@ payload:
   - DOMAIN-SUFFIX,imnks
   - DOMAIN-SUFFIX,synocommunity
   - DOMAIN-SUFFIX,m-team
+  - DOMAIN-SUFFIX,tesla
   - DOMAIN-SUFFIX,cf.xiu2.xyz
   - DOMAIN-SUFFIX,cloudflare
   - DOMAIN-SUFFIX,push.apple.com
