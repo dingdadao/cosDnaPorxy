@@ -292,18 +292,19 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				"domain": domain,
 				"dns":    dnsServer,
 			})
-			// 当使用默认DNS时，使用上游配置进行查询
-			h.Logger.Info("🌐 [上游DNS查询] ", map[string]interface{}{
+			// 当使用默认DNS时，使用配置文件中指定的默认DNS服务器进行查询
+			defaultDNS := []string{dnsServer}
+			h.Logger.Info("🌐 [默认DNS查询] ", map[string]interface{}{
 				"domain":    domain,
-				"upstreams": h.config.Upstream,
+				"upstreams": defaultDNS,
 			})
 
-			resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype, true)
+			resp, err := h.proxyQueryWithCaching(req, defaultDNS, domain, qtype, true)
 			if err != nil || resp == nil {
 				h.Logger.Error("❌ [DNS查询失败] ", map[string]interface{}{
 					"domain":    domain,
-					"source":    "upstream",
-					"upstreams": h.config.Upstream,
+					"source":    "default_dns",
+					"upstreams": defaultDNS,
 					"error":     err,
 				})
 				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
@@ -311,18 +312,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			}
 
 			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
+			// 处理CNAME记录
+			processedResp := h.processDNSResponseWithCNAME(resp, domain, defaultDNS)
 
-			respCopy := resp.Copy()
-			respCopy.Id = req.Id
+			processedResp.Id = req.Id
 			// 确保响应中的 TTL 不小于配置的最小 TTL
-			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
-			w.WriteMsg(respCopy)
+			h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			// 缓存处理后的结果
+			h.cacheManager.Set(domain, qtype, processedResp, false)
+			w.WriteMsg(processedResp)
 
 			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
 				"domain":       domain,
 				"result":       "success",
-				"source":       "upstream",
-				"answer_count": len(resp.Answer),
+				"source":       "default_dns",
+				"answer_count": len(processedResp.Answer),
 			})
 			return
 		} else {
@@ -344,17 +348,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				return
 			}
 			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
-			respCopy := resp.Copy()
-			respCopy.Id = req.Id
+			// 处理CNAME记录
+			processedResp := h.processDNSResponseWithCNAME(resp, domain, []string{dnsServer})
+
+			processedResp.Id = req.Id
 			// 确保响应中的 TTL 不小于配置的最小 TTL
-			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
-			w.WriteMsg(respCopy)
+			h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			// 缓存处理后的结果
+			h.cacheManager.Set(domain, qtype, processedResp, false)
+			w.WriteMsg(processedResp)
 
 			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
 				"domain":       domain,
 				"result":       "success",
 				"source":       "designated",
-				"answer_count": len(resp.Answer),
+				"answer_count": len(processedResp.Answer),
 			})
 			return
 		}
@@ -398,17 +406,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		return
 	}
 
-	respCopy := resp.Copy()
-	respCopy.Id = req.Id
+	// 处理CNAME记录
+	processedResp := h.processDNSResponseWithCNAME(resp, domain, h.config.Upstream)
+
+	processedResp.Id = req.Id
 	// 确保响应中的 TTL 不小于配置的最小 TTL
-	h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
-	w.WriteMsg(respCopy)
+	h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+	// 缓存处理后的结果
+	h.cacheManager.Set(domain, qtype, processedResp, false)
+	w.WriteMsg(processedResp)
 
 	h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
 		"domain":       domain,
 		"result":       "success",
 		"source":       "upstream",
-		"answer_count": len(resp.Answer),
+		"answer_count": len(processedResp.Answer),
 	})
 }
 
@@ -448,6 +460,16 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 		return resp
 	}
 
+	// 使用通用的CNAME处理方法，传入上游DNS服务器为默认上游
+	return h.processDNSResponseWithCNAME(resp, domain, h.config.Upstream)
+}
+
+// processDNSResponseWithCNAME 处理DNS响应并递归解析CNAME记录
+func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
+	if resp == nil {
+		return resp
+	}
+
 	// 创建新的响应，不复制原始响应的问题部分以避免Question section mismatch
 	processedResp := &dns.Msg{
 		MsgHdr: resp.MsgHdr,
@@ -470,13 +492,13 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 	// 获取最大IP记录数配置，默认为4
 	maxIPRecords := h.config.MaxIPRecords
 	if maxIPRecords <= 0 {
-		maxIPRecords = 4 // 默认值
+		maxIPRecords = 2 // 默认值
 	}
 
 	// 收集所有IP记录（最多maxIPRecords条）
 	var ipRecords []dns.RR
 
-	// 遍历原始响应中的所有记录
+	// 第一遍：收集直接的IP记录
 	for _, rr := range resp.Answer {
 		// 如果已经收集了足够数量的记录，停止收集
 		if len(ipRecords) >= maxIPRecords {
@@ -491,32 +513,38 @@ func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *
 	}
 
 	// 如果没有足够的IP记录，尝试递归解析CNAME记录
-	if len(ipRecords) < maxIPRecords {
-		// 查找CNAME记录并递归解析
+	// 优化：只有在需要更多记录时才进行CNAME解析
+	needMoreRecords := len(ipRecords) < maxIPRecords
+	if needMoreRecords {
+		// 串行解析CNAME记录（先简化实现确保正确性）
 		for _, rr := range resp.Answer {
-			// 如果已经收集了足够数量的记录，停止收集
+			// 检查是否已经收集了足够数量的记录
 			if len(ipRecords) >= maxIPRecords {
 				break
 			}
 
 			if cname, ok := rr.(*dns.CNAME); ok {
-				// 递归解析CNAME目标
+				// 递归解析CNAME目标，使用传入的上游DNS服务器
 				cnameTargetReq := &dns.Msg{}
 				cnameTargetReq.SetQuestion(cname.Target, dns.TypeA) // 假设是A记录查询
 
-				cnameTargetResp, err := h.proxyQuery(cnameTargetReq, h.config.Upstream)
+				cnameTargetResp, err := h.proxyQuery(cnameTargetReq, upstreams)
 				if err == nil && cnameTargetResp != nil {
-					// 处理CNAME目标的响应
-					for _, targetRR := range cnameTargetResp.Answer {
-						// 如果已经收集了足够数量的记录，停止收集
-						if len(ipRecords) >= maxIPRecords {
-							break
-						}
+					// 递归处理CNAME目标的响应
+					processedCnameResp := h.processDNSResponseWithCNAME(cnameTargetResp, domain, upstreams)
+					if processedCnameResp != nil {
+						// 从处理后的响应中提取IP记录
+						for _, targetRR := range processedCnameResp.Answer {
+							// 检查是否已经收集了足够数量的记录
+							if len(ipRecords) >= maxIPRecords {
+								break
+							}
 
-						// 只处理IP记录
-						switch targetRR.(type) {
-						case *dns.A, *dns.AAAA:
-							ipRecords = append(ipRecords, targetRR)
+							// 只处理IP记录
+							switch targetRR.(type) {
+							case *dns.A, *dns.AAAA:
+								ipRecords = append(ipRecords, targetRR)
+							}
 						}
 					}
 				}
@@ -944,15 +972,17 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 		if useDesignatedDNS {
 			// 对于定向域名，即使它是云服务域名，也优先使用定向域名指定的DNS服务器
 			// 不进行云服务检测，直接缓存结果
-			h.ensureMinimumTTL(result.SuccessResult.Response, h.config.Cache.TTL)
-			h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
+			// 处理CNAME记录
+			processedResp := h.processDNSResponseWithCNAME(result.SuccessResult.Response, domain, upstreams)
+			h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
 
 			h.Logger.Info("✅ [异步刷新成功] ", map[string]interface{}{
 				"domain":         domain,
 				"qtype":          dns.TypeToString[qtype],
 				"is_cloud":       false,
 				"use_designated": true,
-				"answer_count":   len(result.SuccessResult.Response.Answer),
+				"answer_count":   len(processedResp.Answer),
 				"upstreams":      upstreams,
 			})
 		} else if isCloud {
@@ -974,7 +1004,9 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 			h.cacheManager.SetCloudResponse(domain, qtype, processedResponse, cloudType, replaceCacheTime)
 		} else {
 			// 确保普通域名响应的TTL不小于配置的最小TTL
-			h.ensureMinimumTTL(result.SuccessResult.Response, h.config.Cache.TTL)
+			// 处理CNAME记录
+			processedResp := h.processDNSResponseWithCNAME(result.SuccessResult.Response, domain, upstreams)
+			h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
 
 			// 添加云检测器检查
 			if h.cloudDetector == nil {
@@ -993,10 +1025,11 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 
 			// 如果检测到是云服务，使用统一的云域名响应处理方法
 			if isCloud {
-				processedResponse := h.processCloudResponse(result.SuccessResult.Response, domain)
-				h.cacheManager.Set(domain, qtype, processedResponse, isCloud, cloudType)
+				// 对于云域名，使用专门的云域名处理方法
+				cloudProcessedResp := h.processCloudResponse(result.SuccessResult.Response, domain)
+				h.cacheManager.Set(domain, qtype, cloudProcessedResp, isCloud, cloudType)
 			} else {
-				h.cacheManager.Set(domain, qtype, result.SuccessResult.Response, isCloud, cloudType)
+				h.cacheManager.Set(domain, qtype, processedResp, isCloud, cloudType)
 			}
 		}
 

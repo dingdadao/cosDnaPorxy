@@ -121,7 +121,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	// 设置最大IP记录数默认值
 	if config.MaxIPRecords == 0 {
-		config.MaxIPRecords = 4 // 默认4条记录
+		config.MaxIPRecords = 2 // 默认4条记录
 	}
 
 	// 设置刷新间隔默认值
