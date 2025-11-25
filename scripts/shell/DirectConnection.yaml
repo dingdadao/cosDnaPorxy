@@ -1,5 +1,5 @@
 payload:
-  - DOMAIN-SUFFIX,niao.fun
+  - DOMAIN-KEYWORD,cloudflare
   - DOMAIN-KEYWORD,synology
   - DOMAIN-KEYWORD,tracker
   - DOMAIN-KEYWORD,imnks
@@ -7,7 +7,7 @@ payload:
   - DOMAIN-SUFFIX,m-team
   - DOMAIN-SUFFIX,tesla
   - DOMAIN-SUFFIX,cf.xiu2.xyz
-  - DOMAIN-KEYWORD,cloudflare
+  - DOMAIN-SUFFIX,niao.fun
   - DOMAIN-SUFFIX,push.apple.com
   - DOMAIN-SUFFIX,push-apple.com
   - DOMAIN-SUFFIX,ntp.org
