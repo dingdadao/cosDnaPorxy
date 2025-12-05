@@ -16,101 +16,76 @@ import (
 	"cosDnaPorxy/internal/utils"
 )
 
-// RecoveryManager panic恢复和重启管理器
+// RecoveryManager panic恢复管理器
 type RecoveryManager struct {
-	config *config.Config
-	logger *utils.EnhancedLogger
-
-	// 重启控制
+	config          *config.Config
+	logger          *utils.EnhancedLogger
+	dnsHandler      *dns.RefactoredHandler
+	udpServer       *dns.Server
+	tcpServer       *dns.Server
+	ctx             context.Context
+	cancel          context.CancelFunc
+	mu              sync.RWMutex
+	running         bool
 	restartCount    int
+	panicCount      int
+	lastRestart     time.Time
+	restartChan     chan struct{}
 	maxRestarts     int
 	restartInterval time.Duration
-	lastRestart     time.Time
-
-	// 服务管理
-	dnsHandler *dns.RefactoredHandler
-	udpServer  *dns.Server
-	tcpServer  *dns.Server
-
-	// 控制通道
-	ctx         context.Context
-	cancel      context.CancelFunc
-	restartChan chan struct{}
-
-	// 状态
-	mu      sync.RWMutex
-	running bool
-
-	// 统计
-	panicCount int
-	startTime  time.Time
+	startTime       time.Time
 }
 
-// NewRecoveryManager 创建恢复管理器
+// NewRecoveryManager 创建新的panic恢复管理器
 func NewRecoveryManager(cfg *config.Config, logger *utils.EnhancedLogger) *RecoveryManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &RecoveryManager{
 		config:          cfg,
 		logger:          logger,
-		maxRestarts:     10, // 最大重启10次
-		restartInterval: 5 * time.Second,
 		ctx:             ctx,
 		cancel:          cancel,
 		restartChan:     make(chan struct{}, 1),
-		startTime:       time.Now(),
+		maxRestarts:     100,             // 最大重启次数
+		restartInterval: 5 * time.Second, // 初始重启间隔
+		running:         false,
+		startTime:       time.Now(), // 初始化startTime
 	}
 }
 
-// Start 启动带恢复机制的服务
+// Start 启动带panic恢复的服务
 func (rm *RecoveryManager) Start() error {
-	rm.logger.Info("🛡️ [启动panic恢复管理器] ", map[string]interface{}{
-		"rule":             "RECOVERY_MANAGER_START",
-		"max_restarts":     rm.maxRestarts,
-		"restart_interval": rm.restartInterval.String(),
+	rm.logger.Info("🔄 [启动恢复管理器] ", map[string]interface{}{
+		"rule": "RECOVERY_MANAGER_START",
 	})
-
-	// 设置全局panic恢复
-	rm.setupGlobalPanicRecovery()
 
 	// 设置信号处理
 	rm.setupSignalHandler()
 
-	// 启动主服务循环
-	return rm.serviceLoop()
-}
-
-// setupGlobalPanicRecovery 设置全局panic恢复
-func (rm *RecoveryManager) setupGlobalPanicRecovery() {
-	// 不能直接设置全局panic恢复，需要在关键goroutine中使用defer recover
-	rm.logger.Debug("🛡️ 全局panic恢复机制已设置")
-}
-
-// serviceLoop 主服务循环（带panic恢复）
-func (rm *RecoveryManager) serviceLoop() error {
-	defer func() {
-		if r := recover(); r != nil {
-			rm.handlePanic(r)
-		}
-	}()
-
-	// 首次启动服务
+	// 启动DNS服务
 	if err := rm.startDNSService(); err != nil {
 		return fmt.Errorf("启动DNS服务失败: %w", err)
 	}
 
-	// 监控循环
+	// 主循环
+	rm.mainLoop()
+
+	return nil
+}
+
+// mainLoop 主循环
+func (rm *RecoveryManager) mainLoop() {
+	rm.logger.Info("🔄 [进入主循环] ", map[string]interface{}{
+		"rule": "MAIN_LOOP_START",
+	})
+
 	for {
 		select {
 		case <-rm.ctx.Done():
-			rm.logger.Info("📪 [恢复管理器退出] ", map[string]interface{}{
-				"rule":          "RECOVERY_MANAGER_EXIT",
-				"restart_count": rm.restartCount,
-				"panic_count":   rm.panicCount,
-				"uptime":        time.Since(rm.startTime).String(),
+			rm.logger.Info("🛑 [主循环退出] ", map[string]interface{}{
+				"rule": "MAIN_LOOP_EXIT",
 			})
-			rm.stopDNSService()
-			return nil
+			return
 
 		case <-rm.restartChan:
 			rm.handleRestart()
@@ -120,7 +95,7 @@ func (rm *RecoveryManager) serviceLoop() error {
 			rm.healthCheck()
 			// 检查上下文是否被取消，避免在长时间运行后无法退出
 			if rm.ctx.Err() != nil {
-				return nil
+				return
 			}
 		}
 	}

@@ -221,6 +221,9 @@ func (dm *DesignatedMatcher) GetDefaultDNS() string {
 }
 
 // GetDesignatedDomainOrDefault 高性能匹配方法
+// 返回值：(dnsServer string, isDesignated bool)
+// dnsServer: 匹配到的DNS服务器或默认DNS
+// isDesignated: 是否真正匹配到了定向域名规则
 func (dm *DesignatedMatcher) GetDesignatedDomainOrDefault(domain string) (string, bool) {
 	// 添加空指针检查
 	if dm == nil {
@@ -238,59 +241,39 @@ func (dm *DesignatedMatcher) GetDesignatedDomainOrDefault(domain string) (string
 	// 1. 快速精确匹配检查
 	domainLower := strings.ToLower(domain)
 	if dns, exists := dm.exactMap[domainLower]; exists {
-		dm.logger.Debug("🎯 精确匹配成功", map[string]interface{}{
-			"domain": domainLower,
-			"dns":    dns,
-		})
+		// 检查是否使用默认DNS关键字
+		if dns == "default_dns" {
+			return dm.defaultDNS, true
+		}
 		return dns, true
 	}
 
 	// 2. 使用前缀树进行快速匹配
 	if dm.trie != nil {
 		if result := dm.trie.Search(domainLower); result.Matched {
-			dm.logger.Debug("🎯 前缀树匹配成功", map[string]interface{}{
-				"domain":  domainLower,
-				"dns":     result.DNS,
-				"pattern": result.Pattern,
-				"type":    result.Type,
-			})
+			// 检查是否使用默认DNS关键字
+			if result.DNS == "default_dns" {
+				return dm.defaultDNS, true
+			}
 			return result.DNS, true
 		}
 	}
 
 	// 3. 复杂正则匹配（仅在必要时）
-	dm.logger.Debug("🔍 开始正则匹配检查", map[string]interface{}{
-		"domain":         domainLower,
-		"wildcard_count": len(dm.wildcards),
-	})
-
-	for i, dd := range dm.wildcards {
+	for _, dd := range dm.wildcards {
 		if dd != nil && dd.Regex != nil {
-			dm.logger.Debug("🔍 检查正则模式", map[string]interface{}{
-				"domain":  domainLower,
-				"pattern": dd.Pattern,
-				"regex":   dd.Regex.String(),
-				"index":   i,
-			})
-
 			if dd.Regex.MatchString(domainLower) {
-				dm.logger.Debug("🎯 正则匹配成功", map[string]interface{}{
-					"domain":  domainLower,
-					"dns":     dd.DNS,
-					"pattern": dd.Pattern,
-					"type":    dd.MatchType,
-				})
+				// 检查是否使用默认DNS关键字
+				if dd.DNS == "default_dns" {
+					return dm.defaultDNS, true
+				}
 				return dd.DNS, true
 			}
 		}
 	}
 
-	// 4. 返回默认DNS
-	dm.logger.Debug("🔄 使用默认DNS", map[string]interface{}{
-		"domain": domainLower,
-		"dns":    dm.defaultDNS,
-	})
-	return dm.defaultDNS, dm.defaultDNS != ""
+	// 4. 没有匹配到任何定向域名规则
+	return "", false
 }
 
 // LoadDesignatedDomains 高性能加载定向域名

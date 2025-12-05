@@ -25,8 +25,15 @@ type CacheManager struct {
 	asyncMu    sync.RWMutex
 	workerPool *AsyncWorkerPool
 
+	// 域名处理锁，防止多个worker同时处理同一个域名
+	domainLocks map[string]*sync.Mutex
+	locksMu     sync.RWMutex
+
 	// 刷新回调
 	refreshCallback RefreshCallback
+
+	// 替换域名检测器
+	cloudDetector *CloudDetector
 }
 
 // AsyncRefreshTask 异步刷新任务
@@ -48,11 +55,12 @@ type AsyncWorkerPool struct {
 // NewCacheManager 创建缓存管理器
 func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger, metrics interface{}) *CacheManager {
 	cm := &CacheManager{
-		cache:     NewOptimizedDNSCache(cfg.Cache.MaxItems, cfg.Cache.TTL),
-		config:    cfg,
-		logger:    logger,
-		asyncChan: make(chan *AsyncRefreshTask, 1000),
-		asyncSet:  make(map[string]struct{}),
+		cache:       NewOptimizedDNSCache(cfg.Cache.MaxItems, cfg.Cache.TTL),
+		config:      cfg,
+		logger:      logger,
+		asyncChan:   make(chan *AsyncRefreshTask, 1000),
+		asyncSet:    make(map[string]struct{}),
+		domainLocks: make(map[string]*sync.Mutex),
 		workerPool: &AsyncWorkerPool{
 			workers: cfg.Cache.MaxAsyncWorkers,
 			stopCh:  make(chan struct{}),
@@ -62,10 +70,10 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger, metrics i
 	// 启动异步工作池
 	cm.startAsyncWorkers()
 
-	// 启动定期缓存扫描任务
-	if cfg.Cache.EnableAsyncRefresh {
-		go cm.startCacheScanTask()
-	}
+	// 按需刷新模式下不启动定期扫描任务
+	// if cfg.Cache.EnableAsyncRefresh {
+	// 	go cm.startCacheScanTask()
+	// }
 
 	logger.Info("🗄️ 缓存管理器初始化完成", map[string]interface{}{
 		"max_items":     cfg.Cache.MaxItems,
@@ -77,33 +85,87 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger, metrics i
 	return cm
 }
 
+// SetCloudDetector 设置云检测器
+func (cm *CacheManager) SetCloudDetector(detector *CloudDetector) {
+	cm.cloudDetector = detector
+	cm.logger.Debug("☁️ 云检测器已设置", map[string]interface{}{
+		"type": "cloud_detector_set",
+	})
+}
+
 // Get 获取缓存
 func (cm *CacheManager) Get(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
 	timer := cm.logger.StartTimer("cache_get", map[string]interface{}{
 		"domain": domain,
 		"qtype":  dns.TypeToString[qtype],
+		"type":   "cache_get_operation",
 	})
 	defer timer.End()
 
 	resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype)
 
 	if hit {
-		cm.logger.Debug("💾 缓存命中详细信息", map[string]interface{}{
-			"domain":   domain,
-			"qtype":    dns.TypeToString[qtype],
-			"is_cloud": isCloud,
-			"hit_type": "normal_cache",
+		// 检查是否为替换域名缓存
+		isReplaceDomain := cloudType == int(CloudTypeCloudflare) || cloudType == int(CloudTypeAWS)
+
+		// 添加调试日志，查看cloudType的值
+		cm.logger.Debug("🔍 缓存条目详情", map[string]interface{}{
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"is_cloud":   isCloud,
+			"cloud_type": cloudType,
+			"is_replace": isReplaceDomain,
+			"type":       "cache_entry_details",
 		})
 
-		// 移除此处的异步刷新检查，由定时扫描任务处理
-		// if cm.config.Cache.EnableAsyncRefresh && cm.shouldRefresh(domain, qtype) {
-		//     cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.config.Cache.TTL), 0)
-		// }
+		if isReplaceDomain && !isCloud {
+			// 替换域名缓存命中
+			cloudTypeName := "Unknown"
+			switch CloudType(cloudType) {
+			case CloudTypeCloudflare:
+				cloudTypeName = "Cloudflare"
+			case CloudTypeAWS:
+				cloudTypeName = "AWS"
+			}
+
+			cm.logger.Info("💾 [替换域名缓存命中] ", map[string]interface{}{
+				"domain":          domain,
+				"qtype":           dns.TypeToString[qtype],
+				"cloud_type":      cloudType,
+				"cloud_type_name": cloudTypeName,
+				"hit_type":        "replace_domain_cache",
+				"type":            "replace_cache_hit",
+			})
+		} else if isCloud {
+			cm.logger.Debug("💾 缓存命中详细信息", map[string]interface{}{
+				"domain":     domain,
+				"qtype":      dns.TypeToString[qtype],
+				"is_cloud":   isCloud,
+				"cloud_type": cloudType,
+				"hit_type":   "normal_cache",
+				"type":       "cache_hit",
+			})
+		} else {
+			cm.logger.Debug("💾 缓存命中详细信息", map[string]interface{}{
+				"domain":     domain,
+				"qtype":      dns.TypeToString[qtype],
+				"is_cloud":   isCloud,
+				"cloud_type": cloudType,
+				"hit_type":   "normal_cache",
+				"type":       "cache_hit",
+			})
+		}
+
+		// 检查是否需要按需刷新（缓存已过期但仍有条目）
+		if cm.config.Cache.EnableAsyncRefresh && cm.shouldRefreshOnDemand(domain, qtype) {
+			cm.submitOnDemandRefresh(domain, qtype)
+		}
 	} else {
 		cm.logger.Debug("🔍 缓存未命中详细信息", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"reason": "cache_miss",
+			"type":   "cache_miss",
 		})
 	}
 
@@ -115,6 +177,7 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 	timer := cm.logger.StartTimer("cache_get_cloud", map[string]interface{}{
 		"domain": domain,
 		"qtype":  dns.TypeToString[qtype],
+		"type":   "cache_get_cloud_operation",
 	})
 	defer timer.End()
 
@@ -126,25 +189,27 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 			"qtype":      dns.TypeToString[qtype],
 			"cloud_type": cloudType,
 			"hit_type":   "cloud_response_cache",
+			"type":       "cloud_cache_hit",
 		})
 
-		// 移除此处的异步刷新检查，由定时扫描任务处理
-		// if cm.config.Cache.EnableAsyncRefresh && cm.shouldRefresh(domain, qtype) {
-		//     cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.config.Cache.TTL), 1)
-		// }
+		// 检查是否需要刷新
+		if cm.config.Cache.EnableAsyncRefresh && cm.shouldRefresh(domain, qtype) {
+			cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.config.Cache.TTL), 1)
+		}
 	} else {
 		cm.logger.Debug("☁️ 云响应缓存未命中详细信息", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"reason": "cloud_response_cache_miss",
+			"type":   "cloud_cache_miss",
 		})
 	}
 
 	return resp, hit, cloudType
 }
 
-// SetCloudResponse 设置云域名的替换响应缓存
-func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *dns.Msg, cloudType int, customTTL ...time.Duration) {
+// SetCloudResponse 设置云响应缓存
+func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *dns.Msg, cloudType int, ttl time.Duration) {
 	timer := cm.logger.StartTimer("cache_set_cloud", map[string]interface{}{
 		"domain":     domain,
 		"qtype":      dns.TypeToString[qtype],
@@ -152,20 +217,39 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 	})
 	defer timer.End()
 
+	// 检查响应是否为空
 	if response == nil {
-		cm.logger.Warn("尝试缓存空的云响应", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
+		cm.logger.Debug("⚠️ 空云响应，不缓存", map[string]interface{}{
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": cloudType,
 		})
 		return
 	}
 
-	// 使用自定义TTL或默认TTL
-	var ttl time.Duration
-	if len(customTTL) > 0 {
-		ttl = customTTL[0]
-	} else {
-		ttl = cm.calculateTTL(response)
+	// 只缓存成功的响应（NOERROR）
+	if response.Rcode != dns.RcodeSuccess {
+		cm.logger.Debug("❌ 失败云响应，不缓存详细信息", map[string]interface{}{
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": cloudType,
+			"rcode":      dns.RcodeToString[response.Rcode],
+			"reason":     "failed_cloud_response_not_cached",
+		})
+		return
+	}
+
+	// 验证响应内容是否有效
+	if !cm.isValidDNSResponse(domain, qtype, response) {
+		cm.logger.Warn("⚠️ 无效云响应内容，不缓存", map[string]interface{}{
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": cloudType,
+			"rcode":      dns.RcodeToString[response.Rcode],
+			"answers":    len(response.Answer),
+			"reason":     "invalid_cloud_response_content",
+		})
+		return
 	}
 
 	cm.cache.SetCloudResponse(domain, qtype, response, cloudType, ttl)
@@ -174,6 +258,7 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 		"domain":     domain,
 		"rule":       "CACHE_SET_CLOUD",
 		"cloud_type": cloudType,
+		"type":       "cloud_response_cache",
 	})
 
 	cm.logger.Debug("☁️ 云响应缓存详细信息", map[string]interface{}{
@@ -182,13 +267,9 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 		"cloud_type": cloudType,
 		"ttl":        ttl.String(),
 		"answers":    len(response.Answer),
+		"rcode":      dns.RcodeToString[response.Rcode],
 		"operation":  "cloud_response_cached",
 	})
-
-	// 如果TTL较短，提交异步刷新任务（不再在这里检查，移到Get时检查）
-	// if cm.config.Cache.EnableAsyncRefresh && ttl <= cm.config.Cache.RefreshThreshold {
-	//     cm.submitAsyncRefresh(domain, qtype, time.Now().Add(ttl), 1) // 高优先级
-	// }
 }
 
 // IsCloud 检查域名是否为云服务域名
@@ -205,17 +286,123 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 	})
 	defer timer.End()
 
+	// 检查是否为替换域名
+	isReplaceDomain := false
+	if cm.cloudDetector != nil {
+		isReplaceDomain = cm.cloudDetector.IsReplaceDomain(domain)
+	}
+
 	// 云服务域名特殊处理
 	if isCloud {
-		cm.cache.Set(domain, qtype, nil, true, cloudType...)
+		// 获取云服务类型
+		var cType int
+		if len(cloudType) > 0 {
+			cType = cloudType[0]
+		}
+		cm.cache.Set(domain, qtype, response, true, cType)
+
+		// 记录详细的云域名缓存信息
 		cm.logger.Info("📋 [缓存设置-云标记] ", map[string]interface{}{
-			"domain": domain,
-			"rule":   "CACHE_SET_CLOUD_MARK",
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": cType,
+			"rule":       "CACHE_SET_CLOUD_MARK",
+			"type":       "cloud_domain_cache",
 		})
+
 		cm.logger.Debug("☁️ 云服务域名标记缓存详细信息", map[string]interface{}{
-			"domain":    domain,
-			"qtype":     dns.TypeToString[qtype],
-			"operation": "cloud_domain_marked",
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": cType,
+			"operation":  "cloud_domain_marked",
+		})
+		return
+	}
+
+	// 替换域名特殊处理
+	if isReplaceDomain {
+		// 确定替换域名的具体云服务类型
+		var replaceCloudType int = -1 // 默认值，表示替换域名
+		if cm.cloudDetector != nil {
+			if domain == cm.cloudDetector.cfReplaceDomain {
+				replaceCloudType = int(CloudTypeCloudflare)
+			} else if domain == cm.cloudDetector.awsReplaceDomain {
+				replaceCloudType = int(CloudTypeAWS)
+			}
+		}
+
+		// 检查响应是否为空或失败
+		if response == nil {
+			cm.logger.Debug("⚠️ 空响应，不缓存", map[string]interface{}{
+				"domain": domain,
+				"qtype":  dns.TypeToString[qtype],
+			})
+			return
+		}
+
+		// 只缓存成功的响应（NOERROR）
+		if response.Rcode != dns.RcodeSuccess {
+			cm.logger.Debug("❌ 失败响应，不缓存详细信息", map[string]interface{}{
+				"domain": domain,
+				"qtype":  dns.TypeToString[qtype],
+				"rcode":  dns.RcodeToString[response.Rcode],
+				"reason": "failed_response_not_cached",
+			})
+			return
+		}
+
+		// 验证响应内容是否有效
+		if !cm.isValidDNSResponse(domain, qtype, response) {
+			cm.logger.Warn("⚠️ 无效响应内容，不缓存", map[string]interface{}{
+				"domain":  domain,
+				"qtype":   dns.TypeToString[qtype],
+				"rcode":   dns.RcodeToString[response.Rcode],
+				"answers": len(response.Answer),
+				"reason":  "invalid_response_content",
+			})
+			return
+		}
+
+		// 计算实际TTL
+		actualTTL := cm.calculateTTL(response)
+
+		// 对于没有答案的NOERROR响应，使用配置的缓存时间（默认10秒）
+		if len(response.Answer) == 0 {
+			noAnswerTTL := 10 * time.Second // 默认值
+			if cm.config.NoAnswerCacheTime != "" {
+				if parsedTime, err := time.ParseDuration(cm.config.NoAnswerCacheTime); err == nil {
+					noAnswerTTL = parsedTime
+				}
+			}
+			if noAnswerTTL < actualTTL {
+				actualTTL = noAnswerTTL
+			}
+			cm.logger.Debug("⏱️ 无答案响应使用配置的缓存时间", map[string]interface{}{
+				"domain":    domain,
+				"qtype":     dns.TypeToString[qtype],
+				"cache_ttl": actualTTL.String(),
+				"reason":    "no_answer_response",
+			})
+		}
+
+		// 修复：缓存替换域名响应，isCloud参数设为false，cloudType参数用于标识具体的云服务商
+		cm.cache.Set(domain, qtype, response, false, replaceCloudType)
+
+		cm.logger.Info("📋 [缓存设置-替换域名] ", map[string]interface{}{
+			"domain":     domain,
+			"cloud_type": replaceCloudType,
+			"rule":       "CACHE_SET_REPLACE_DOMAIN",
+			"type":       "replace_domain_cache",
+		})
+
+		cm.logger.Debug("💾 替换域名缓存详细信息", map[string]interface{}{
+			"domain":     domain,
+			"qtype":      dns.TypeToString[qtype],
+			"cloud_type": replaceCloudType,
+			"ttl":        actualTTL.String(),
+			"answers":    len(response.Answer),
+			"rcode":      dns.RcodeToString[response.Rcode],
+			"operation":  "replace_domain_cached",
 		})
 		return
 	}
@@ -279,6 +466,7 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 	cm.logger.Info("📋 [缓存设置-成功响应] ", map[string]interface{}{
 		"domain": domain,
 		"rule":   "CACHE_SET_SUCCESS",
+		"type":   "normal_domain_cache",
 	})
 
 	cm.logger.Debug("💾 成功响应缓存详细信息", map[string]interface{}{
@@ -405,6 +593,25 @@ func (cm *CacheManager) shouldRefresh(domain string, qtype uint16) bool {
 	return shouldRefresh
 }
 
+// shouldRefreshOnDemand 检查是否应该按需刷新（缓存已过期）
+func (cm *CacheManager) shouldRefreshOnDemand(domain string, qtype uint16) bool {
+	// 检查缓存是否已过期
+	_, hit, _, _ := cm.cache.Get(domain, qtype)
+
+	// 如果缓存未命中，说明已经过期，需要刷新
+	shouldRefresh := !hit
+
+	// 添加调试日志
+	cm.logger.Debug("🔍 shouldRefreshOnDemand检查", map[string]interface{}{
+		"domain":         domain,
+		"qtype":          dns.TypeToString[qtype],
+		"should_refresh": shouldRefresh,
+		"async_enabled":  cm.config.Cache.EnableAsyncRefresh,
+	})
+
+	return shouldRefresh
+}
+
 // submitAsyncRefresh 提交异步刷新任务
 func (cm *CacheManager) submitAsyncRefresh(domain string, qtype uint16, expireTime time.Time, priority int) {
 	key := fmt.Sprintf("%s:%d", domain, qtype)
@@ -430,6 +637,48 @@ func (cm *CacheManager) submitAsyncRefresh(domain string, qtype uint16, expireTi
 			"domain":   domain,
 			"qtype":    dns.TypeToString[qtype],
 			"priority": priority,
+			"type":     "async_refresh_task",
+		})
+	default:
+		cm.logger.Warn("⚠️ 异步刷新队列已满", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"type":   "async_queue_full",
+		})
+		cm.asyncMu.Lock()
+		delete(cm.asyncSet, key)
+		cm.asyncMu.Unlock()
+	}
+}
+
+// submitOnDemandRefresh 提交按需刷新任务
+func (cm *CacheManager) submitOnDemandRefresh(domain string, qtype uint16) {
+	key := fmt.Sprintf("%s:%d", domain, qtype)
+
+	cm.asyncMu.Lock()
+	if _, exists := cm.asyncSet[key]; exists {
+		cm.asyncMu.Unlock()
+		return
+	}
+	cm.asyncSet[key] = struct{}{}
+	cm.asyncMu.Unlock()
+
+	// 设置一个较短的过期时间，确保任务能尽快执行
+	expireTime := time.Now().Add(10 * time.Second)
+
+	task := &AsyncRefreshTask{
+		Domain:     domain,
+		QType:      qtype,
+		ExpireTime: expireTime,
+		Priority:   2, // 按需刷新具有较高优先级
+	}
+
+	select {
+	case cm.asyncChan <- task:
+		cm.logger.Debug("📋 按需刷新任务已提交", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"type":   "on_demand_refresh_task",
 		})
 	default:
 		cm.logger.Warn("⚠️ 异步刷新队列已满", map[string]interface{}{
@@ -443,6 +692,8 @@ func (cm *CacheManager) submitAsyncRefresh(domain string, qtype uint16, expireTi
 }
 
 // startCacheScanTask 启动定期缓存扫描任务（带panic恢复）
+// 按需刷新模式下已禁用此功能
+/*
 func (cm *CacheManager) startCacheScanTask() {
 	// panic恢复机制
 	defer func() {
@@ -477,8 +728,11 @@ func (cm *CacheManager) startCacheScanTask() {
 		}
 	}
 }
+*/
 
 // scanCacheForRefresh 扫描缓存并提交需要刷新的条目
+// 按需刷新模式下已禁用此功能
+/*
 func (cm *CacheManager) scanCacheForRefresh() {
 	stats := cm.cache.GetStats()
 	if stats.Size == 0 {
@@ -533,6 +787,7 @@ func (cm *CacheManager) scanCacheForRefresh() {
 		})
 	}
 }
+*/
 
 // CacheEntryInfo 缓存条目信息
 type CacheEntryInfo struct {
@@ -623,7 +878,21 @@ func (cm *CacheManager) asyncWorker(workerID int) {
 func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 	key := fmt.Sprintf("%s:%d", task.Domain, task.QType)
 
+	// 获取域名锁，防止多个worker同时处理同一个域名
+	cm.locksMu.Lock()
+	lock, exists := cm.domainLocks[task.Domain]
+	if !exists {
+		lock = &sync.Mutex{}
+		cm.domainLocks[task.Domain] = lock
+	}
+	cm.locksMu.Unlock()
+
+	// 获取锁
+	lock.Lock()
 	defer func() {
+		// 释放锁
+		lock.Unlock()
+
 		// 添加panic恢复机制
 		if r := recover(); r != nil {
 			cm.logger.Error("💥 [异步任务处理panic] ", map[string]interface{}{
@@ -674,6 +943,13 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 				"qtype":     dns.TypeToString[task.QType],
 				"worker_id": workerID,
 				"error":     err.Error(),
+			})
+
+			// 刷新失败时，删除过期缓存条目
+			cm.cache.Delete(task.Domain, task.QType)
+			cm.logger.Debug("🗑️ 缓存条目已删除", map[string]interface{}{
+				"domain": task.Domain,
+				"qtype":  dns.TypeToString[task.QType],
 			})
 		} else {
 			timer.End()

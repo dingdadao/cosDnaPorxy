@@ -7,7 +7,9 @@ modern_timeout: "2s" # 现代协议(DoH/DoT/H3)查询超时时间
 
 # 上游DNS服务器（支持多种协议，统一URL scheme）
 upstream:
-  - "udp://223.5.5.5:53" # UDP DNS（阿里）
+  # - "udp://223.5.5.5:53" # UDP DNS（阿里）
+  - "https://223.6.6.6/dns-query" # DoH aliyun
+  #- "https://doh.pub/dns-query" # DoH tx
 
 cf_cache_time: 24h
 replace_cache_time: 30m
@@ -38,7 +40,7 @@ log_level: "debug"
 # 缓存配置
 cache:
   max_items: 5000 # 最大缓存条目数
-  ttl: "10m" # 统一缓存TTL：所有DNS响应的缓存时间
+  ttl: "1m" # 统一缓存TTL：所有DNS响应的缓存时间
   refresh_threshold: "20s" # 刷新阈值：TTL剩余18秒时开始异步刷新（TTL的30%）
   enable_async_refresh: true # 启用异步刷新：TTL到期前自动刷新DNS记录
   max_async_workers: 2 # 最大异步工作线程数：并发处理异步刷新任务

@@ -23,7 +23,7 @@ build/
 *.dll
 *.so
 *.dylib
-
+logs
 # IDE files
 .idea/
 .vscode/

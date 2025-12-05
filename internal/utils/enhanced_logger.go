@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"time"
 )
@@ -33,9 +34,10 @@ type LogEntry struct {
 
 // EnhancedLogger 增强的结构化日志器
 type EnhancedLogger struct {
-	level     LogLevel
-	component string
-	useJSON   bool
+	level      LogLevel
+	component  string
+	useJSON    bool
+	fileLogger *FileLogger
 }
 
 // NewEnhancedLogger 创建增强日志器
@@ -52,11 +54,59 @@ func NewEnhancedLogger(levelStr, component string, useJSON bool) *EnhancedLogger
 		level = LogError
 	}
 
-	return &EnhancedLogger{
-		level:     level,
-		component: component,
-		useJSON:   useJSON,
+	// 创建文件日志管理器
+	fileLogger, err := NewFileLogger("./logs")
+	if err != nil {
+		// 如果创建文件日志失败，继续使用标准日志
+		log.Printf("Warning: failed to create file logger: %v", err)
 	}
+
+	logger := &EnhancedLogger{
+		level:      level,
+		component:  component,
+		useJSON:    useJSON,
+		fileLogger: fileLogger,
+	}
+
+	// 如果文件日志管理器创建成功，设置日志输出到文件
+	if fileLogger != nil {
+		log.SetOutput(&logMultiWriter{stdout: os.Stdout, fileLogger: fileLogger})
+	}
+
+	return logger
+}
+
+// logMultiWriter 多输出写入器
+type logMultiWriter struct {
+	stdout     *os.File
+	fileLogger *FileLogger
+}
+
+// Write 实现io.Writer接口
+func (mw *logMultiWriter) Write(p []byte) (n int, err error) {
+	// 写入标准输出
+	stdoutN, stdoutErr := mw.stdout.Write(p)
+
+	// 写入文件日志
+	fileN, fileErr := mw.fileLogger.Write(p)
+
+	// 返回较大的写入字节数和可能的错误
+	if stdoutErr != nil {
+		return stdoutN, stdoutErr
+	}
+	if fileErr != nil {
+		return fileN, fileErr
+	}
+
+	return max(stdoutN, fileN), nil
+}
+
+// max 返回两个整数中的较大值
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // getCallerInfo 获取调用者信息

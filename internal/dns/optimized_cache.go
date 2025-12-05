@@ -128,13 +128,37 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 
 	// 检查是否过期
 	if time.Now().After(entry.ExpireAt) {
-		// 异步删除过期条目
+		// 缓存已过期，返回过期的内容并在返回后立即删除
+		// 更新最后访问时间（用于LRU淘汰策略）
+		c.mu.Lock()
+		entry.LastAccess = time.Now()
+		c.mu.Unlock()
+
+		// 异步删除过期条目，确保只删除一次
 		go func() {
 			c.mu.Lock()
-			delete(c.store, key)
-			c.mu.Unlock()
+			defer c.mu.Unlock()
+			// 再次检查确保条目仍然存在
+			if existingEntry, stillExists := c.store[key]; stillExists && existingEntry == entry {
+				delete(c.store, key)
+			}
 		}()
-		return nil, false, false, 0
+
+		// 云服务域名特殊处理
+		if entry.IsCloud {
+			// 返回云响应缓存
+			if entry.CloudResponse != nil {
+				return entry.CloudResponse.Copy(), true, entry.IsCloud, entry.CloudType
+			}
+			// 无云响应缓存，返回云标记
+			return nil, true, entry.IsCloud, entry.CloudType
+		}
+
+		// 返回缓存的响应副本
+		if entry.Response != nil {
+			return entry.Response.Copy(), true, entry.IsCloud, entry.CloudType
+		}
+		return nil, true, entry.IsCloud, entry.CloudType
 	}
 
 	// 更新最后访问时间（用于LRU淘汰策略）
@@ -206,14 +230,14 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 			CloudResponse:    existingCloudResponse,          // 保留已有的云响应或为空
 			ExpireAt:         time.Now().Add(24 * time.Hour), // 云服务标记缓存24小时
 			IsCloud:          true,
-			CloudType:        cType,
+			CloudType:        cType,         // 使用传入的云服务类型
 			RefreshThreshold: 6 * time.Hour, // 云标记外6小时后刷新
 			LastAccess:       time.Now(),
 		}
 		return
 	}
 
-	// 普通域名缓存处理
+	// 普通域名缓存处理（包括替换域名）
 	if response == nil {
 		return
 	}
@@ -255,10 +279,15 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 		Response:         responseCopy,
 		CloudResponse:    nil,
 		ExpireAt:         expireAt,
-		IsCloud:          isCloud,
-		CloudType:        0,
+		IsCloud:          isCloud, // 对于替换域名，isCloud为false
+		CloudType:        0,       // 默认值
 		RefreshThreshold: refreshThreshold,
 		LastAccess:       time.Now(),
+	}
+
+	// 如果传入了cloudType参数，使用它（用于标识替换域名的具体云服务商）
+	if len(cloudType) > 0 {
+		entry.CloudType = cloudType[0]
 	}
 
 	c.mu.Lock()
@@ -344,13 +373,6 @@ func (c *OptimizedDNSCache) ShouldRefresh(domain string, qType uint16) bool {
 	// 如果剩余TTL小于刷新阈值，则需要刷新
 	shouldRefresh := remainingTTL <= refreshThreshold
 
-	// 添加调试日志
-	if shouldRefresh {
-		// 可以在这里添加日志输出，但为了避免过多日志，暂时注释
-		// fmt.Printf("刷新检查: domain=%s, remainingTTL=%v, threshold=%v, shouldRefresh=%v\n",
-		//     domain, remainingTTL, refreshThreshold, shouldRefresh)
-	}
-
 	return shouldRefresh
 }
 
@@ -412,6 +434,15 @@ func (c *OptimizedDNSCache) cleanupRoutine() {
 func (c *OptimizedDNSCache) Clear() {
 	c.mu.Lock()
 	c.store = make(map[string]*CacheEntry)
+	c.mu.Unlock()
+}
+
+// Delete 删除指定的缓存条目
+func (c *OptimizedDNSCache) Delete(domain string, qType uint16) {
+	key := c.key(domain, qType)
+
+	c.mu.Lock()
+	delete(c.store, key)
 	c.mu.Unlock()
 }
 

@@ -60,18 +60,18 @@ func TestCloudDomainWithoutDesignatedRule(t *testing.T) {
 	// 设置默认DNS
 	matcher.SetDefaultDNS("udp://119.29.29.29:53")
 
-	// 测试没有定向规则的云域名应该返回默认DNS
+	// 测试没有定向规则的云域名应该不匹配
 	dnsServer, matched := matcher.GetDesignatedDomainOrDefault("amazonaws.com")
 
-	if !matched {
-		t.Errorf("Expected domain to be matched with default DNS, but it wasn't")
+	if matched {
+		t.Errorf("Expected domain not to be matched, but it was matched to '%s'", dnsServer)
 	}
 
-	if dnsServer != "udp://119.29.29.29:53" {
-		t.Errorf("Expected DNS server to be default 'udp://119.29.29.29:53', but got '%s'", dnsServer)
+	if dnsServer != "" {
+		t.Errorf("Expected DNS server to be empty, but got '%s'", dnsServer)
 	}
 
-	t.Logf("amazonaws.com matched to default DNS: %s", dnsServer)
+	t.Logf("amazonaws.com not matched to any designated rule, as expected")
 }
 
 // TestDesignatedDomainPriorityInCacheRefresh 测试缓存刷新时定向域名优先于云域名
@@ -104,10 +104,9 @@ func TestDesignatedDomainPriorityInCacheRefresh(t *testing.T) {
 
 	// 测试确定上游服务器的逻辑
 	dnsServer, hasDesignated := matcher.GetDesignatedDomainOrDefault("cloudflare.com")
-	useDesignatedDNS := hasDesignated && dnsServer != matcher.GetDefaultDNS()
 
-	if !useDesignatedDNS {
-		t.Errorf("Expected to use designated DNS for cloudflare.com, but it didn't")
+	if !hasDesignated {
+		t.Errorf("Expected cloudflare.com to be matched as designated domain, but it wasn't")
 	}
 
 	if dnsServer != "udp://10.0.0.1:53" {
