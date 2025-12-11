@@ -789,13 +789,6 @@ func (cm *CacheManager) scanCacheForRefresh() {
 }
 */
 
-// CacheEntryInfo 缓存条目信息
-type CacheEntryInfo struct {
-	Domain  string
-	QType   uint16
-	IsCloud bool
-}
-
 // startAsyncWorkers 启动异步工作器
 func (cm *CacheManager) startAsyncWorkers() {
 	workers := cm.config.Cache.MaxAsyncWorkers
@@ -945,9 +938,9 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 				"error":     err.Error(),
 			})
 
-			// 刷新失败时，删除过期缓存条目
-			cm.cache.Delete(task.Domain, task.QType)
-			cm.logger.Debug("🗑️ 缓存条目已删除", map[string]interface{}{
+			// 刷新失败时，将缓存TTL设置为较短时间（10秒），让用户在10秒后重新查询
+			cm.cache.SetShortTTL(task.Domain, task.QType, 10*time.Second)
+			cm.logger.Debug("🕒 缓存TTL已设置为10秒", map[string]interface{}{
 				"domain": task.Domain,
 				"qtype":  dns.TypeToString[task.QType],
 			})
@@ -965,6 +958,13 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 			"domain":    task.Domain,
 			"qtype":     dns.TypeToString[task.QType],
 			"worker_id": workerID,
+		})
+
+		// 刷新回调未设置时，也将缓存TTL设置为较短时间（10秒）
+		cm.cache.SetShortTTL(task.Domain, task.QType, 10*time.Second)
+		cm.logger.Debug("🕒 缓存TTL已设置为10秒", map[string]interface{}{
+			"domain": task.Domain,
+			"qtype":  dns.TypeToString[task.QType],
 		})
 	}
 }

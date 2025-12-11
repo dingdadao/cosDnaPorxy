@@ -266,29 +266,11 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				return
 			}
 
-			// 没有云响应缓存，但有云域名标记，检查是否需要异步刷新
-			// 如果缓存已过期，先返回现有结果并异步刷新
-			h.Logger.Info("🔍 [无云响应缓存，检查是否需要异步刷新] ", map[string]interface{}{
+			// 没有云响应缓存，执行云IP替换
+			h.Logger.Info("🔍 [无云响应缓存，执行云IP替换] ", map[string]interface{}{
 				"domain":     domain,
 				"cloud_type": cloudType,
-				"type":       "check_async_refresh",
-			})
-			
-			// 检查是否需要按需刷新
-			if h.cacheManager.shouldRefreshOnDemand(domain, qtype) {
-				h.Logger.Info("🔄 [提交按需刷新任务] ", map[string]interface{}{
-					"domain":     domain,
-					"cloud_type": cloudType,
-					"type":       "submit_on_demand_refresh",
-				})
-				h.cacheManager.submitOnDemandRefresh(domain, qtype)
-			}
-
-			// 执行云IP替换
-			h.Logger.Info("🔍 [执行云IP替换] ", map[string]interface{}{
-				"domain":     domain,
-				"cloud_type": cloudType,
-				"type":       "execute_cloud_replacement",
+				"type":       "no_cloud_response_execute_replacement",
 			})
 			h.handleCloudReplacement(w, req, domain, qtype, cloudType)
 			return
@@ -549,8 +531,21 @@ func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain st
 		"upstreams":      upstreams,
 	})
 
-	// 收集所有IP记录（最多maxIPRecords条）
-	var ipRecords []dns.RR
+	// 收集所有IP记录（最多maxIPRecords条），使用map来避免重复IP
+	ipRecords := []dns.RR{}
+	ipSet := make(map[string]struct{}) // 用于去重的集合，使用空结构体更节省内存
+
+	// 辅助函数：获取IP记录的唯一标识
+	getIPKey := func(rr dns.RR) string {
+		switch v := rr.(type) {
+		case *dns.A:
+			return "A:" + v.A.String()
+		case *dns.AAAA:
+			return "AAAA:" + v.AAAA.String()
+		default:
+			return ""
+		}
+	}
 
 	// 第一遍：收集直接的IP记录
 	for _, rr := range resp.Answer {
@@ -562,7 +557,14 @@ func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain st
 		// 直接处理IP记录
 		switch rr.(type) {
 		case *dns.A, *dns.AAAA:
-			ipRecords = append(ipRecords, rr)
+			// 检查是否已存在该IP记录
+			ipKey := getIPKey(rr)
+			if ipKey != "" {
+				if _, exists := ipSet[ipKey]; !exists {
+					ipRecords = append(ipRecords, rr)
+					ipSet[ipKey] = struct{}{}
+				}
+			}
 		}
 	}
 
@@ -616,10 +618,16 @@ func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain st
 								break
 							}
 
-							// 只处理IP记录
+							// 只处理IP记录并去重
 							switch targetRR.(type) {
 							case *dns.A, *dns.AAAA:
-								ipRecords = append(ipRecords, targetRR)
+								ipKey := getIPKey(targetRR)
+								if ipKey != "" {
+									if _, exists := ipSet[ipKey]; !exists {
+										ipRecords = append(ipRecords, targetRR)
+										ipSet[ipKey] = struct{}{}
+									}
+								}
 							}
 						}
 					}

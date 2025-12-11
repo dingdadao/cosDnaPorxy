@@ -1,7 +1,6 @@
 package dns
 
 import (
-	"strings"
 	"sync"
 	"time"
 
@@ -128,21 +127,11 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 
 	// 检查是否过期
 	if time.Now().After(entry.ExpireAt) {
-		// 缓存已过期，返回过期的内容并在返回后立即删除
+		// 缓存已过期，但仍返回过期的内容，不立即删除
 		// 更新最后访问时间（用于LRU淘汰策略）
 		c.mu.Lock()
 		entry.LastAccess = time.Now()
 		c.mu.Unlock()
-
-		// 异步删除过期条目，确保只删除一次
-		go func() {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			// 再次检查确保条目仍然存在
-			if existingEntry, stillExists := c.store[key]; stillExists && existingEntry == entry {
-				delete(c.store, key)
-			}
-		}()
 
 		// 云服务域名特殊处理
 		if entry.IsCloud {
@@ -446,44 +435,6 @@ func (c *OptimizedDNSCache) Delete(domain string, qType uint16) {
 	c.mu.Unlock()
 }
 
-// GetExpiringSoonEntries 获取即将过期的缓存条目列表
-func (c *OptimizedDNSCache) GetExpiringSoonEntries(refreshThreshold time.Duration) []CacheEntryInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	var expiringSoon []CacheEntryInfo
-	now := time.Now()
-
-	for key, entry := range c.store {
-		// 计算剩余TTL
-		remainingTTL := entry.ExpireAt.Sub(now)
-
-		// 如果剩余TTL小于或等于刷新阈值，则添加到列表
-		if remainingTTL > 0 && remainingTTL <= refreshThreshold {
-			// 解析缓存键获取domain和qtype
-			parts := strings.Split(key, "|")
-			if len(parts) == 2 {
-				domain := parts[0]
-				qtypeStr := parts[1]
-
-				// 将qtype字符串转换为uint16
-				for qtype, qtypeString := range dns.TypeToString {
-					if qtypeString == qtypeStr {
-						expiringSoon = append(expiringSoon, CacheEntryInfo{
-							Domain:  domain,
-							QType:   qtype,
-							IsCloud: entry.IsCloud,
-						})
-						break
-					}
-				}
-			}
-		}
-	}
-
-	return expiringSoon
-}
-
 // GetStats 获取缓存统计
 type CacheStats struct {
 	Size int
@@ -530,11 +481,22 @@ func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time
 	}
 }
 
-// DebugCache 输出缓存内容用于调试
-func (c *OptimizedDNSCache) DebugCache() {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, _ = range c.store {
-		// 仅作为调试接口，实际应用中可能需要记录缓存内容
+// SetShortTTL 将缓存条目的过期时间设置为较短时间
+func (c *OptimizedDNSCache) SetShortTTL(domain string, qType uint16, duration time.Duration) {
+	// 添加空指针检查
+	if c == nil {
+		return
+	}
+
+	key := c.key(domain, qType)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, exists := c.store[key]; exists {
+		// 将过期时间设置为较短时间（如10秒）
+		entry.ExpireAt = time.Now().Add(duration)
+		// 更新最后访问时间
+		entry.LastAccess = time.Now()
 	}
 }
