@@ -3,7 +3,7 @@ payload:
   - DOMAIN,api.m-team.cc
   - DOMAIN,kp.m-team.cc
   - DOMAIN,next.m-team.cc
-  - DOMAIN-SUFFIX tipatipa.xyz
+  - DOMAIN-SUFFIX,tipatipa.xyz
   - DOMAIN,efd0e8b4-0d77-4f5d-b267-b4ec9307f1fc.dingdadao.dpdns.org
   - IP-CIDR,1.1.1.1/32
   - IP-CIDR,8.8.8.8/32
