@@ -174,6 +174,9 @@ func (s *Server) Stop() {
 		}
 	}
 
+	// 确保连接完全关闭后等待一段时间，避免端口立即被重用
+	time.Sleep(200 * time.Millisecond)
+
 	s.running = false
 	s.cancel()
 

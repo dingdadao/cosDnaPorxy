@@ -171,7 +171,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			answerCount = len(result.Response.Answer)
 		}
 
-		qo.logger.Info("✅ 单一服务器查询完成", map[string]interface{}{
+		qo.logger.Debug("✅ 单一服务器查询完成", map[string]interface{}{
 			"server":      server,
 			"time":        result.ResponseTime.String(),
 			"has_success": hasSuccess,
@@ -378,7 +378,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	// 记录统计信息
 	totalQueryTime := time.Since(start)
 	if hasValidResponse && fastestValidResult != nil {
-		qo.logger.Info("✅ 简化并发查询成功（有效结果）", map[string]interface{}{
+		qo.logger.Debug("✅ 简化并发查询成功（有效结果）", map[string]interface{}{
 			"fastest_server":      fastestResult.Server,
 			"fastest_time":        fastestTime.String(),
 			"valid_result_server": fastestValidResult.Server,
@@ -388,7 +388,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"total_time":          totalQueryTime.String(),
 		})
 	} else if hasSuccess && successResult != nil {
-		qo.logger.Info("🥈 简化并发查询成功（无答案）", map[string]interface{}{
+		qo.logger.Debug("🥈 简化并发查询成功（无答案）", map[string]interface{}{
 			"fastest_server": fastestResult.Server,
 			"fastest_time":   fastestTime.String(),
 			"success_server": successResult.Server,

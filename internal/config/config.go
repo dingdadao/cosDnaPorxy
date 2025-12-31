@@ -59,6 +59,7 @@ type Config struct {
 	DefaultDNS                 string           `yaml:"default_dns"` // 默认DNS服务器（支持URL scheme格式）
 	WhitelistFile              string           `yaml:"whitelist_file"`
 	DesignatedDomain           string           `yaml:"designated_domain"`
+	DesignatedDomainURL        string           `yaml:"designated_domain_url"` // 定向域名文件URL
 	LogLevel                   string           `yaml:"log_level"`
 	LogFormat                  string           `yaml:"log_format"` // 添加日志格式配置
 	TLSCertFile                string           `yaml:"tls_cert_file"`

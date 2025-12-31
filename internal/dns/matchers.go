@@ -79,6 +79,12 @@ func (node *DomainTrieNode) Search(domain string) *MatchResult {
 		return &MatchResult{Matched: false}
 	}
 
+	// 反向遍历域名部分
+	reverseParts := make([]string, len(parts))
+	for i, j := 0, len(parts)-1; i < len(parts); i, j = i+1, j-1 {
+		reverseParts[i] = strings.ToLower(parts[j])
+	}
+
 	current := node
 	var lastWildcardMatch *DomainTrieNode
 
@@ -153,23 +159,6 @@ func (node *DomainTrieNode) Search(domain string) *MatchResult {
 	}
 
 	return &MatchResult{Matched: false}
-}
-
-// reverseParts 反向域名部分的全局变量
-var reverseParts []string
-
-// init 初始化时设置反向域名部分
-func init() {
-	reverseParts = []string{}
-}
-
-// setReverseParts 设置反向域名部分
-func setReverseParts(domain string) {
-	parts := strings.Split(domain, ".")
-	reverseParts = make([]string, len(parts))
-	for i, j := 0, len(parts)-1; i < len(parts); i, j = i+1, j-1 {
-		reverseParts[i] = strings.ToLower(parts[j])
-	}
 }
 
 // YAMLMatcher YAML格式域名匹配器（支持mihomo风格规则）

@@ -3,10 +3,12 @@ package recovery
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -129,13 +131,43 @@ func (rm *RecoveryManager) startDNSService() error {
 	if err != nil {
 		return fmt.Errorf("创建UDP DNS服务器失败: %w", err)
 	}
-	rm.udpServer = udpServer
 
 	// 创建TCP DNS服务器
 	tcpServer, err := dns.NewTCPServer(rm.config, handler)
 	if err != nil {
 		return fmt.Errorf("创建TCP DNS服务器失败: %w", err)
 	}
+
+	// 创建一个临时的UDP连接来验证端口可用性
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", rm.config.ListenPort))
+	if err != nil {
+		return fmt.Errorf("解析UDP地址失败: %w", err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		rm.logger.Error("❌ [UDP端口检查失败] ", map[string]interface{}{
+			"rule":  "PORT_CHECK_FAILED",
+			"type":  "UDP",
+			"error": err.Error(),
+		})
+		return fmt.Errorf("UDP端口 %d 已被占用: %w", rm.config.ListenPort, err)
+	}
+	udpConn.Close()
+
+	// 创建一个临时的TCP连接来验证端口可用性
+	tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", rm.config.ListenPort))
+	if err != nil {
+		rm.logger.Error("❌ [TCP端口检查失败] ", map[string]interface{}{
+			"rule":  "PORT_CHECK_FAILED",
+			"type":  "TCP",
+			"error": err.Error(),
+		})
+		return fmt.Errorf("TCP端口 %d 已被占用: %w", rm.config.ListenPort, err)
+	}
+	tcpListener.Close()
+
+	// 设置服务器实例
+	rm.udpServer = udpServer
 	rm.tcpServer = tcpServer
 
 	// 在单独的goroutine中启动UDP服务器（带panic恢复）
@@ -171,6 +203,17 @@ func (rm *RecoveryManager) runDNSServer(server *dns.Server, serverType string) {
 			"type":  serverType,
 			"error": err.Error(),
 		})
+
+		// 检查错误是否是端口被占用
+		if strings.Contains(err.Error(), "address already in use") ||
+			strings.Contains(err.Error(), "bind: address already in use") {
+			rm.logger.Warn("⚠️ [端口已被占用，不触发重启] ", map[string]interface{}{
+				"rule": "PORT_ALREADY_IN_USE_NO_RESTART",
+				"type": serverType,
+			})
+			return // 端口被占用时不触发重启
+		}
+
 		// 触发重启
 		select {
 		case rm.restartChan <- struct{}{}:
@@ -203,6 +246,9 @@ func (rm *RecoveryManager) stopDNSService() {
 		rm.tcpServer.Stop()
 		rm.tcpServer = nil
 	}
+
+	// 确保服务器完全停止后等待一段时间，避免端口立即被重用
+	time.Sleep(100 * time.Millisecond)
 
 	// 关闭DNS处理器
 	if rm.dnsHandler != nil {
@@ -273,6 +319,9 @@ func (rm *RecoveryManager) handleRestart() {
 
 	// 停止当前服务
 	rm.stopDNSService()
+
+	// 额外等待一段时间确保端口完全释放
+	time.Sleep(500 * time.Millisecond)
 
 	// 等待一段时间后重启
 	rm.logger.Debug("⏱️ 等待重启间隔", map[string]interface{}{
@@ -421,6 +470,8 @@ func (rm *RecoveryManager) gracefulShutdown() {
 		defer close(done)
 		// 停止服务
 		rm.stopDNSService()
+		// 额外等待一段时间确保端口完全释放
+		time.Sleep(500 * time.Millisecond)
 		// 取消上下文
 		rm.cancel()
 	}()

@@ -135,9 +135,10 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 
 	// 加载所有数据
 	if err := handler.loadAllData(); err != nil {
-		logger.Error("加载数据失败", map[string]interface{}{
+		logger.Error("加载数据失败，但继续启动", map[string]interface{}{
 			"error": err.Error(),
 		})
+		// 即使加载失败也继续启动，确保服务可用
 	}
 
 	// 启动后台任务
@@ -196,25 +197,10 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 // processQuery 处理单个DNS查询
 func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
-	h.Logger.Info("🔍 [DNS查询开始] ", map[string]interface{}{
-		"domain":      domain,
-		"qtype":       dns.TypeToString[qtype],
-		"client_addr": w.RemoteAddr().String(),
-		"request_id":  req.Id,
-		"rule":        "DNS_QUERY_START",
-	})
-
 	// 1. 缓存检查
 	if resp, hit, isCloud, cloudType := h.cacheManager.Get(domain, qtype); hit {
-		h.Logger.Info("✅ [DNS查询结果-缓存命中] ", map[string]interface{}{
-			"domain":     domain,
-			"type":       "cache_hit",
-			"is_cloud":   isCloud,
-			"cloud_type": cloudType,
-		})
-
+		// 云域名缓存命中
 		if isCloud {
-			// 云域名缓存命中
 			// 云域名需要特殊处理
 			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponse(domain, qtype); cloudHit {
 				respCopy := cloudResp.Copy()
@@ -223,11 +209,22 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 				w.WriteMsg(respCopy)
 
-				h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+				cloudTypeName := "unknown"
+				switch CloudType(cloudType) {
+				case CloudTypeCloudflare:
+					cloudTypeName = "Cloudflare"
+				case CloudTypeAWS:
+					cloudTypeName = "AWS"
+				}
+
+				h.Logger.Info("✅ [DNS查询完成-云域名缓存] ", map[string]interface{}{
 					"domain":       domain,
-					"result":       "success",
+					"qtype":        dns.TypeToString[qtype],
+					"client_addr":  w.RemoteAddr().String(),
 					"source":       "cloud_cache",
+					"cloud_type":   cloudTypeName,
 					"answer_count": len(cloudResp.Answer),
+					"result":       "success",
 				})
 				return
 			}
@@ -243,19 +240,16 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 			w.WriteMsg(respCopy)
 
-			h.Logger.Info("✅ [DNS查询完成] ", map[string]interface{}{
+			h.Logger.Info("✅ [DNS查询完成-普通缓存] ", map[string]interface{}{
 				"domain":       domain,
-				"result":       "success",
+				"qtype":        dns.TypeToString[qtype],
+				"client_addr":  w.RemoteAddr().String(),
 				"source":       "normal_cache",
 				"answer_count": len(resp.Answer),
+				"result":       "success",
 			})
 			return
 		}
-	} else {
-		h.Logger.Info("❌ [缓存未命中] ", map[string]interface{}{
-			"domain": domain,
-			"type":   "cache_miss",
-		})
 	}
 
 	// 2. YAML定向域名检查（最高优先级）
@@ -281,15 +275,16 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		h.ensureMinimumTTL(resp, h.config.Cache.TTL)
 		w.WriteMsg(resp)
 
-		h.Logger.Info("✅ [YAML定向域名处理完成] ", map[string]interface{}{
+		h.Logger.Info("✅ [DNS查询完成-YAML定向域名] ", map[string]interface{}{
 			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"client_addr":  w.RemoteAddr().String(),
+			"source":       "designated",
+			"dns_server":   dnsServer,
 			"answer_count": len(resp.Answer),
+			"result":       "success",
 		})
 		return
-	} else {
-		h.Logger.Info("❌ [YAML定向域名未匹配] ", map[string]interface{}{
-			"domain": domain,
-		})
 	}
 
 	// 3. 替换域名检查
@@ -318,10 +313,13 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 		w.WriteMsg(respCopy)
 
-		h.Logger.Info("✅ [替换域名查询完成] ", map[string]interface{}{
+		h.Logger.Info("✅ [DNS查询完成-替换域名] ", map[string]interface{}{
 			"domain":       domain,
-			"result":       "success",
+			"qtype":        dns.TypeToString[qtype],
+			"client_addr":  w.RemoteAddr().String(),
+			"source":       "replace_domain",
 			"answer_count": len(resp.Answer),
+			"result":       "success",
 		})
 		return
 	}
@@ -355,29 +353,25 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		h.ensureMinimumTTL(resp, h.config.Cache.TTL)
 		w.WriteMsg(resp)
 
-		h.Logger.Info("✅ [中国域名处理完成] ", map[string]interface{}{
+		h.Logger.Info("✅ [DNS查询完成-中国域名] ", map[string]interface{}{
 			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"client_addr":  w.RemoteAddr().String(),
+			"source":       "china_domain",
 			"answer_count": len(resp.Answer),
+			"result":       "success",
 		})
 		return
-	} else {
-		h.Logger.Info("❌ [中国域名未匹配] ", map[string]interface{}{
-			"domain": domain,
-		})
 	}
 
 	// 5. 普通域名处理逻辑
-	h.Logger.Info("🌐 [普通域名处理开始] ", map[string]interface{}{
-		"domain":    domain,
-		"upstreams": h.config.Upstream,
-	})
-
 	resp, err := h.proxyQueryWithCaching(req, h.config.Upstream, domain, qtype)
 	if err != nil || resp == nil {
 		h.Logger.Error("❌ [普通域名处理失败] ", map[string]interface{}{
-			"domain":    domain,
-			"upstreams": h.config.Upstream,
-			"error":     err,
+			"domain":      domain,
+			"qtype":       dns.TypeToString[qtype],
+			"client_addr": w.RemoteAddr().String(),
+			"error":       err,
 		})
 		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
 		return
@@ -388,9 +382,13 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	h.ensureMinimumTTL(resp, h.config.Cache.TTL)
 	w.WriteMsg(resp)
 
-	h.Logger.Info("✅ [普通域名处理完成] ", map[string]interface{}{
+	h.Logger.Info("✅ [DNS查询完成-普通域名] ", map[string]interface{}{
 		"domain":       domain,
+		"qtype":        dns.TypeToString[qtype],
+		"client_addr":  w.RemoteAddr().String(),
+		"source":       "normal",
 		"answer_count": len(resp.Answer),
+		"result":       "success",
 	})
 }
 
@@ -675,23 +673,16 @@ func (h *RefactoredHandler) handleCloudReplacement(w dns.ResponseWriter, req *dn
 	// 缓存替换后的响应，使用配置的替换缓存时间
 	h.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType, replaceCacheTime)
 
-	h.Logger.Info("✅ [云IP替换成功] ", map[string]interface{}{
+	h.Logger.Info("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
 		"domain":         domain,
-		"rule":           "CLOUD_REPLACED",
-		"replace_domain": replaceDomain,
+		"qtype":          dns.TypeToString[qtype],
+		"client_addr":    w.RemoteAddr().String(),
+		"source":         "cloud_replacement",
 		"cloud_type":     cloudTypeName,
+		"replace_domain": replaceDomain,
 		"answer_count":   len(finalResp.Answer),
 		"cache_ttl":      replaceCacheTime.String(),
-	})
-
-	h.Logger.Debug("云IP替换详细信息", map[string]interface{}{
-		"original_domain":  domain,
-		"replace_domain":   replaceDomain,
-		"cloud_type":       cloudTypeName,
-		"original_answers": len(replaceResp.Answer),
-		"final_answers":    len(finalResp.Answer),
-		"cached_as_cloud":  true,
-		"cache_ttl":        replaceCacheTime.String(),
+		"result":         "success",
 	})
 
 	finalResp.Id = req.Id
@@ -751,7 +742,7 @@ func (h *RefactoredHandler) loadAllData() error {
 	}
 
 	// 加载定向域名（包含原白名单内容）
-	if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
+	if err := h.loadDesignatedDomains(); err != nil { // 使用loadDesignatedDomains方法，确保下载失败时保留旧文件
 		h.Logger.Error("加载定向域名失败", map[string]interface{}{
 			"error": err.Error(),
 		})
@@ -776,25 +767,61 @@ func (h *RefactoredHandler) loadChinaDomains() error {
 		return nil
 	}
 
-	// 检查文件是否存在，如果不存在则尝试下载
-	if _, err := os.Stat(h.config.ChinaDomainFile); os.IsNotExist(err) {
-		h.Logger.Info("中国域名文件不存在，尝试下载", map[string]interface{}{
+	// 如果配置了URL，尝试下载更新文件
+	if h.config.ChinaDomainFileURL != "" {
+		h.Logger.Info("尝试下载更新中国域名文件", map[string]interface{}{
 			"file": h.config.ChinaDomainFile,
 			"url":  h.config.ChinaDomainFileURL,
 		})
-		if h.config.ChinaDomainFileURL != "" {
-			err := h.downloadFile(h.config.ChinaDomainFileURL, h.config.ChinaDomainFile)
-			if err != nil {
-				h.Logger.Error("下载中国域名文件失败", map[string]interface{}{
-					"error": err.Error(),
-				})
-				return err
-			}
-			h.Logger.Info("成功下载中国域名文件", map[string]interface{}{
-				"file": h.config.ChinaDomainFile,
+
+		// 创建临时文件下载更新
+		tempFile := h.config.ChinaDomainFile + ".tmp"
+		err := h.downloadFile(h.config.ChinaDomainFileURL, tempFile)
+		if err != nil {
+			h.Logger.Error("下载中国域名文件失败，使用现有文件", map[string]interface{}{
+				"error": err.Error(),
+				"file":  h.config.ChinaDomainFile,
 			})
+			// 删除临时文件
+			os.Remove(tempFile)
 		} else {
-			// 创建空文件
+			// 检查下载的文件是否为空
+			fileInfo, err := os.Stat(tempFile)
+			if err != nil {
+				h.Logger.Error("获取临时文件信息失败，使用现有文件", map[string]interface{}{
+					"error": err.Error(),
+					"file":  tempFile,
+				})
+				os.Remove(tempFile)
+			} else if fileInfo.Size() == 0 {
+				h.Logger.Warn("下载的中国域名文件为空，使用现有文件", map[string]interface{}{
+					"file": tempFile,
+				})
+				// 删除空的临时文件
+				os.Remove(tempFile)
+			} else {
+				h.Logger.Info("成功下载中国域名文件，准备替换", map[string]interface{}{
+					"temp_file":   tempFile,
+					"target_file": h.config.ChinaDomainFile,
+					"size":        fileInfo.Size(),
+				})
+				// 用新文件替换旧文件
+				if err := os.Rename(tempFile, h.config.ChinaDomainFile); err != nil {
+					h.Logger.Error("替换中国域名文件失败", map[string]interface{}{
+						"error": err.Error(),
+					})
+					// 删除临时文件
+					os.Remove(tempFile)
+				} else {
+					h.Logger.Info("成功更新中国域名文件", map[string]interface{}{
+						"file": h.config.ChinaDomainFile,
+					})
+				}
+			}
+		}
+	} else {
+		// 检查文件是否存在，如果不存在则创建空文件
+		if _, err := os.Stat(h.config.ChinaDomainFile); os.IsNotExist(err) {
 			h.Logger.Info("创建空的中国域名文件", map[string]interface{}{
 				"file": h.config.ChinaDomainFile,
 			})
@@ -817,6 +844,90 @@ func (h *RefactoredHandler) loadChinaDomains() error {
 	return nil
 }
 
+// loadDesignatedDomains 加载定向域名列表
+func (h *RefactoredHandler) loadDesignatedDomains() error {
+	if h.config.DesignatedDomain == "" {
+		h.Logger.Warn("定向域名文件路径为空，跳过加载")
+		return nil
+	}
+
+	// 如果配置了URL，尝试下载更新文件
+	if h.config.DesignatedDomainURL != "" {
+		h.Logger.Info("尝试下载更新定向域名文件", map[string]interface{}{
+			"file": h.config.DesignatedDomain,
+			"url":  h.config.DesignatedDomainURL,
+		})
+
+		// 创建临时文件下载更新
+		tempFile := h.config.DesignatedDomain + ".tmp"
+		err := h.downloadFile(h.config.DesignatedDomainURL, tempFile)
+		if err != nil {
+			h.Logger.Error("下载定向域名文件失败，使用现有文件", map[string]interface{}{
+				"error": err.Error(),
+				"file":  h.config.DesignatedDomain,
+			})
+			// 删除临时文件
+			os.Remove(tempFile)
+		} else {
+			// 检查下载的文件是否为空
+			fileInfo, err := os.Stat(tempFile)
+			if err != nil {
+				h.Logger.Error("获取临时文件信息失败，使用现有文件", map[string]interface{}{
+					"error": err.Error(),
+					"file":  tempFile,
+				})
+				os.Remove(tempFile)
+			} else if fileInfo.Size() == 0 {
+				h.Logger.Warn("下载的定向域名文件为空，使用现有文件", map[string]interface{}{
+					"file": tempFile,
+				})
+				// 删除空的临时文件
+				os.Remove(tempFile)
+			} else {
+				h.Logger.Info("成功下载定向域名文件，准备替换", map[string]interface{}{
+					"temp_file":   tempFile,
+					"target_file": h.config.DesignatedDomain,
+					"size":        fileInfo.Size(),
+				})
+				// 用新文件替换旧文件
+				if err := os.Rename(tempFile, h.config.DesignatedDomain); err != nil {
+					h.Logger.Error("替换定向域名文件失败", map[string]interface{}{
+						"error": err.Error(),
+					})
+					// 删除临时文件
+					os.Remove(tempFile)
+				} else {
+					h.Logger.Info("成功更新定向域名文件", map[string]interface{}{
+						"file": h.config.DesignatedDomain,
+					})
+				}
+			}
+		}
+	} else {
+		// 检查文件是否存在，如果不存在则创建空文件
+		if _, err := os.Stat(h.config.DesignatedDomain); os.IsNotExist(err) {
+			h.Logger.Info("创建空的定向域名文件", map[string]interface{}{
+				"file": h.config.DesignatedDomain,
+			})
+			if err := os.WriteFile(h.config.DesignatedDomain, []byte{}, 0644); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 使用定向域名匹配器加载配置
+	err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain)
+	if err != nil {
+		return fmt.Errorf("加载定向域名配置失败: %w", err)
+	}
+
+	h.Logger.Info("定向域名加载完成", map[string]interface{}{
+		"file": h.config.DesignatedDomain,
+	})
+
+	return nil
+}
+
 // downloadFile 下载文件
 func (h *RefactoredHandler) downloadFile(url, filePath string) error {
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -833,6 +944,15 @@ func (h *RefactoredHandler) downloadFile(url, filePath string) error {
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+
+	// 检查下载的数据是否为空
+	if len(data) == 0 {
+		h.Logger.Warn("下载的文件内容为空", map[string]interface{}{
+			"url":  url,
+			"file": filePath,
+		})
+		return fmt.Errorf("downloaded file is empty")
 	}
 
 	return os.WriteFile(filePath, data, 0644)
@@ -1086,9 +1206,10 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 			h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
 			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
 
-			h.Logger.Info("✅ [异步刷新-定向域名处理完成] ", map[string]interface{}{
+			h.Logger.Debug("🔄 [异步刷新完成-定向域名] ", map[string]interface{}{
 				"domain":       domain,
 				"qtype":        dns.TypeToString[qtype],
+				"source":       "designated",
 				"answer_count": len(processedResp.Answer),
 				"upstreams":    []string{dnsServer},
 			})
@@ -1137,9 +1258,11 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 				// 只更新云响应缓存，不更新普通缓存
 				h.cacheManager.SetCloudResponse(domain, qtype, processedResponse, cloudType, replaceCacheTime)
 
-				h.Logger.Info("✅ [异步刷新-云服务处理完成] ", map[string]interface{}{
+				h.Logger.Debug("🔄 [异步刷新完成-云域名] ", map[string]interface{}{
 					"domain":       domain,
 					"qtype":        dns.TypeToString[qtype],
+					"source":       "cloud",
+					"cloud_type":   detection.Type,
 					"answer_count": len(processedResponse.Answer),
 					"upstreams":    upstreams,
 				})
@@ -1153,9 +1276,10 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 				h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
 				h.cacheManager.Set(domain, qtype, processedResp, isCloud, cloudType)
 
-				h.Logger.Info("✅ [异步刷新-普通域名处理完成] ", map[string]interface{}{
+				h.Logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
 					"domain":       domain,
 					"qtype":        dns.TypeToString[qtype],
+					"source":       "normal",
 					"answer_count": len(processedResp.Answer),
 					"upstreams":    upstreams,
 				})
@@ -1216,15 +1340,25 @@ func (h *RefactoredHandler) determineUpstreamsForDomain(domain string) []string 
 
 // startBackgroundTasks 启动后台任务
 func (h *RefactoredHandler) startBackgroundTasks() {
-	// 定向域名刷新任务
-	if h.config.DesignatedDomain != "" && h.config.DesignatedRefreshInterval > 0 {
-		go h.designatedRefreshTask()
-	}
+	// 延迟启动定时任务，避免与DNS服务器启动冲突
+	go func() {
+		time.Sleep(2 * time.Second) // 等待DNS服务器启动完成
 
-	// 网络段刷新任务
-	if h.config.NetworkRefreshInterval > 0 {
-		go h.networkRefreshTask()
-	}
+		// 定向域名刷新任务
+		if h.config.DesignatedDomain != "" && h.config.DesignatedRefreshInterval > 0 {
+			go h.designatedRefreshTask()
+		}
+
+		// 中国域名刷新任务
+		if h.config.ChinaDomainFile != "" && h.config.ChinaDomainRefreshInterval > 0 {
+			go h.chinaDomainRefreshTask()
+		}
+
+		// 网络段刷新任务
+		if h.config.NetworkRefreshInterval > 0 {
+			go h.networkRefreshTask()
+		}
+	}()
 }
 
 // designatedRefreshTask 定向域名刷新任务
@@ -1242,8 +1376,9 @@ func (h *RefactoredHandler) designatedRefreshTask() {
 		case <-ticker.C:
 			h.Logger.Debug("开始定时定向域名刷新", map[string]interface{}{
 				"file": h.config.DesignatedDomain,
+				"url":  h.config.DesignatedDomainURL,
 			})
-			if err := h.designatedMatcher.LoadDesignatedDomains(h.config.DesignatedDomain); err != nil {
+			if err := h.loadDesignatedDomains(); err != nil { // 使用loadDesignatedDomains方法，确保下载失败时保留旧文件
 				h.Logger.Error("❌ [定向域名刷新失败] ", map[string]interface{}{
 					"rule":  "DESIGNATED_REFRESH_FAILED",
 					"error": err.Error(),
@@ -1256,6 +1391,42 @@ func (h *RefactoredHandler) designatedRefreshTask() {
 		case <-h.ctx.Done():
 			h.Logger.Info("📋 [定向域名刷新任务停止] ", map[string]interface{}{
 				"rule": "DESIGNATED_REFRESH_STOPPED",
+			})
+			return
+		}
+	}
+}
+
+// chinaDomainRefreshTask 中国域名刷新任务
+func (h *RefactoredHandler) chinaDomainRefreshTask() {
+	ticker := time.NewTicker(h.config.ChinaDomainRefreshInterval)
+	defer ticker.Stop()
+
+	h.Logger.Info("🔄 [中国域名定时刷新启动] ", map[string]interface{}{
+		"rule":     "CHINA_DOMAIN_REFRESH_TASK",
+		"interval": h.config.ChinaDomainRefreshInterval.String(),
+	})
+
+	for {
+		select {
+		case <-ticker.C:
+			h.Logger.Debug("开始定时中国域名刷新", map[string]interface{}{
+				"file": h.config.ChinaDomainFile,
+				"url":  h.config.ChinaDomainFileURL,
+			})
+			if err := h.loadChinaDomains(); err != nil {
+				h.Logger.Error("❌ [中国域名刷新失败] ", map[string]interface{}{
+					"rule":  "CHINA_DOMAIN_REFRESH_FAILED",
+					"error": err.Error(),
+				})
+			} else {
+				h.Logger.Info("✅ [中国域名刷新成功] ", map[string]interface{}{
+					"rule": "CHINA_DOMAIN_REFRESH_SUCCESS",
+				})
+			}
+		case <-h.ctx.Done():
+			h.Logger.Info("📋 [中国域名刷新任务停止] ", map[string]interface{}{
+				"rule": "CHINA_DOMAIN_REFRESH_STOPPED",
 			})
 			return
 		}

@@ -7,9 +7,7 @@ modern_timeout: "2s" # 现代协议(DoH/DoT/H3)查询超时时间
 
 # 上游DNS服务器（支持多种协议，统一URL scheme）
 upstream:
-  # - "udp://223.5.5.5:53" # UDP DNS（阿里）
-  - "https://223.6.6.6/dns-query" # DoH aliyun
-  #- "https://doh.pub/dns-query" # DoH tx
+  - "udp://10.0.0.1:1053" # DoH aliyun
 
 cf_cache_time: 24h
 replace_cache_time: 30m
@@ -27,22 +25,22 @@ cloudflare_net_file6: "./data/cf_mrs_file6.txt"
 aws_net_file: "./data/aws.txt"
 
 # 替换域名配置
-replace_cf_domain: "cf-cname.xingpingcn.top" # 检测到Cloudflare IP时替换的CNAME域名
+replace_cf_domain: "gotocf.niao.fun" # 检测到Cloudflare IP时替换的CNAME域名
 replace_aws_domain: "cc.cloudfront.182682.xyz" # 检测到AWS IP时替换的CNAME域名
 
 # DNS服务器配置
-default_dns: "udp://10.0.0.1:1053" # 默认DNS服务器（用于未匹配到定向域名的情况）
-china_dns: "udp://119.29.29.29:53" # 中国DNS服务器（用于China域名解析）
-backup_dns: "udp://223.5.5.5:53" # 备用DNS服务器（用于防污染验证）
+default_dns: "udp://119.29.29.29:53" # 默认DNS服务器（用于未匹配到定向域名的情况）
+china_dns: "udp://223.5.5.5:53" # 中国DNS服务器（用于China域名解析）
+backup_dns: "udp://114.114.114.114:53" # 备用DNS服务器（用于防污染验证）
 
 # 域名文件配置
 designated_domain: "./data/designated.yaml" # 定向域名文件：支持YAML格式（mihomo风格）
-designated_domain_url: "" # 定向域名文件URL（优先使用此配置）
+designated_domain_url: "https://raw.githubusercontent.com/dingdadao/cosDnaPorxy/refs/heads/master/scripts/shell/designated.yaml" # 定向域名文件URL（优先使用此配置）
 china_domain_file: "./data/china_domains.yaml" # 中国域名列表文件
 china_domain_file_url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China_Domain.yaml" # 中国域名列表文件URL（优先使用此配置）
 
 # 日志级别
-log_level: "debug"
+log_level: "info"
 
 # 缓存配置
 cache:
