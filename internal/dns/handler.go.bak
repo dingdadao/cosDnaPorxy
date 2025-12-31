@@ -109,6 +109,12 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 		})
 	}
 
+	designatedMatcher := NewDesignatedMatcher(logger)
+	// 设置默认DNS
+	if cfg.DefaultDNS != "" {
+		designatedMatcher.SetDefaultDNS(cfg.DefaultDNS)
+	}
+
 	// 初始化YAML格式匹配器
 	yamlMatcher := NewYAMLMatcher(logger)
 	if cfg.DefaultDNS != "" {

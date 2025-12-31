@@ -39,37 +39,41 @@ type UpstreamServer struct {
 
 // Config 配置结构体
 type Config struct {
-	ListenPort                int              `yaml:"listen_port"`
-	Upstream                  []string         `yaml:"upstream"`         // 保留兼容性
-	UpstreamServers           []UpstreamServer `yaml:"upstream_servers"` // 新的上游服务器配置
-	Timeout                   time.Duration    `yaml:"timeout"`          // DNS查询超时（支持2s、2m、2h格式）
-	ModernTimeout             time.Duration    `yaml:"modern_timeout"`   // 现代协议超时（支持2s、2m、2h格式）
-	CFMrsFile4                string           `yaml:"cf_mrs_file4"`
-	CFMrsFile4URL             string           `yaml:"cf_mrs_file4_url"`
-	CFMrsFile6                string           `yaml:"cf_mrs_file6"`
-	CFCacheTime               string           `yaml:"cf_cache_time"`
-	CFMrsFile6URL             string           `yaml:"cf_mrs_file6_url"`
-	ReplaceCacheTime          string           `yaml:"replace_cache_time"`
-	NoAnswerCacheTime         string           `yaml:"no_answer_cache_time"` // 无答案响应的缓存时间
-	MaxIPRecords              int              `yaml:"max_ip_records"`       // 云域名替换时的最大IP记录数
-	AWSMrsFile46              string           `yaml:"aws_mrs_file64"`
-	AWSMrsFile46URL           string           `yaml:"aws_mrs_file64_url"`
-	ReplaceCFDomain           string           `yaml:"replace_cf_domain"`
-	ReplaceAWSDomain          string           `yaml:"replace_aws_domain"`
-	DefaultDNS                string           `yaml:"default_dns"` // 默认DNS服务器（支持URL scheme格式）
-	WhitelistFile             string           `yaml:"whitelist_file"`
-	DesignatedDomain          string           `yaml:"designated_domain"`
-	LogLevel                  string           `yaml:"log_level"`
-	LogFormat                 string           `yaml:"log_format"` // 添加日志格式配置
-	TLSCertFile               string           `yaml:"tls_cert_file"`
-	TLSKeyFile                string           `yaml:"tls_key_file"`
-	Cache                     CacheConfig      `yaml:"cache"`
-	CloudflareNetFile         string           `yaml:"cloudflare_net_file"`
-	CloudflareNetFile6        string           `yaml:"cloudflare_net_file6"`
-	AWSNetFile                string           `yaml:"aws_net_file"`
-	WhitelistRefreshInterval  time.Duration    `yaml:"whitelist_refresh"`  // 白名单刷新间隔（支持30m、1h格式）
-	DesignatedRefreshInterval time.Duration    `yaml:"designated_refresh"` // 定向域名刷新间隔（支持30m、1h格式）
-	NetworkRefreshInterval    time.Duration    `yaml:"network_refresh"`    // 网络段刷新间隔（支持24h、1d格式）
+	ListenPort                 int              `yaml:"listen_port"`
+	Upstream                   []string         `yaml:"upstream"`         // 保留兼容性
+	UpstreamServers            []UpstreamServer `yaml:"upstream_servers"` // 新的上游服务器配置
+	Timeout                    time.Duration    `yaml:"timeout"`          // DNS查询超时（支持2s、2m、2h格式）
+	ModernTimeout              time.Duration    `yaml:"modern_timeout"`   // 现代协议超时（支持2s、2m、2h格式）
+	CFMrsFile4                 string           `yaml:"cf_mrs_file4"`
+	CFMrsFile4URL              string           `yaml:"cf_mrs_file4_url"`
+	CFMrsFile6                 string           `yaml:"cf_mrs_file6"`
+	CFCacheTime                string           `yaml:"cf_cache_time"`
+	CFMrsFile6URL              string           `yaml:"cf_mrs_file6_url"`
+	ReplaceCacheTime           string           `yaml:"replace_cache_time"`
+	NoAnswerCacheTime          string           `yaml:"no_answer_cache_time"` // 无答案响应的缓存时间
+	MaxIPRecords               int              `yaml:"max_ip_records"`       // 云域名替换时的最大IP记录数
+	AWSMrsFile46               string           `yaml:"aws_mrs_file64"`
+	AWSMrsFile46URL            string           `yaml:"aws_mrs_file64_url"`
+	ReplaceCFDomain            string           `yaml:"replace_cf_domain"`
+	ReplaceAWSDomain           string           `yaml:"replace_aws_domain"`
+	DefaultDNS                 string           `yaml:"default_dns"` // 默认DNS服务器（支持URL scheme格式）
+	WhitelistFile              string           `yaml:"whitelist_file"`
+	DesignatedDomain           string           `yaml:"designated_domain"`
+	LogLevel                   string           `yaml:"log_level"`
+	LogFormat                  string           `yaml:"log_format"` // 添加日志格式配置
+	TLSCertFile                string           `yaml:"tls_cert_file"`
+	TLSKeyFile                 string           `yaml:"tls_key_file"`
+	Cache                      CacheConfig      `yaml:"cache"`
+	CloudflareNetFile          string           `yaml:"cloudflare_net_file"`
+	CloudflareNetFile6         string           `yaml:"cloudflare_net_file6"`
+	AWSNetFile                 string           `yaml:"aws_net_file"`
+	WhitelistRefreshInterval   time.Duration    `yaml:"whitelist_refresh"`     // 白名单刷新间隔（支持30m、1h格式）
+	DesignatedRefreshInterval  time.Duration    `yaml:"designated_refresh"`    // 定向域名刷新间隔（支持30m、1h格式）
+	NetworkRefreshInterval     time.Duration    `yaml:"network_refresh"`       // 网络段刷新间隔（支持24h、1d格式）
+	ChinaDomainFile            string           `yaml:"china_domain_file"`     // 中国域名列表文件
+	ChinaDomainFileURL         string           `yaml:"china_domain_file_url"` // 中国域名列表文件URL
+	ChinaDomainRefreshInterval time.Duration    `yaml:"china_domain_refresh"`  // 中国域名刷新间隔（支持24h、1d格式）
+	ChinaDNS                   string           `yaml:"china_dns"`             // 中国DNS服务器
 }
 
 // LoadConfig 加载配置文件

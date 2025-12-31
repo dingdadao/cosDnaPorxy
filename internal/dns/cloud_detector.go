@@ -79,20 +79,6 @@ const (
 	CloudTypeAWS
 )
 
-// String 返回云服务类型的字符串表示
-func (ct CloudType) String() string {
-	switch ct {
-	case CloudTypeNone:
-		return "None"
-	case CloudTypeCloudflare:
-		return "Cloudflare"
-	case CloudTypeAWS:
-		return "AWS"
-	default:
-		return "Unknown"
-	}
-}
-
 // CloudDetectionResult 云服务检测结果
 type CloudDetectionResult struct {
 	Type          CloudType
@@ -255,17 +241,7 @@ func (cd *CloudDetector) IsReplaceDomain(domain string) bool {
 	domain = strings.TrimSuffix(domain, ".")
 	cd.mu.RLock()
 	defer cd.mu.RUnlock()
-	isReplace := domain == cd.cfReplaceDomain || domain == cd.awsReplaceDomain
-
-	// 添加日志以便调试
-	if isReplace {
-		cd.logger.Debug("🔄 域名匹配替换域名", map[string]interface{}{
-			"domain": domain,
-			"type":   "replace_domain_match",
-		})
-	}
-
-	return isReplace
+	return domain == cd.cfReplaceDomain || domain == cd.awsReplaceDomain
 }
 
 // SetReplaceDomains 设置替换域名配置
@@ -282,7 +258,6 @@ func (cd *CloudDetector) DetectCloudService(msg *dns.Msg, domain string) *CloudD
 	if cd.IsReplaceDomain(domain) {
 		cd.logger.Debug("⏭️ 跳过云服务检测（替换域名）", map[string]interface{}{
 			"domain": domain,
-			"type":   "skip_cloud_detection",
 		})
 		return &CloudDetectionResult{Type: CloudTypeNone}
 	}

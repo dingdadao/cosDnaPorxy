@@ -22,3 +22,4 @@ payload:
   - DOMAIN-SUFFIX,ntp.org
   - DOMAIN-SUFFIX,dension.dpdns.org
   - DOMAIN-SUFFIX,cmliussss.net
+  - DOMAIN,v20251104.dension.dpdns.org

@@ -82,7 +82,6 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			"qtype":          dns.TypeToString[qtype],
 			"success_server": result.SuccessResult.Server,
 			"fastest_server": fastestServer,
-			"type":           "success_result_processed",
 		})
 
 		// 设置初始响应
@@ -97,22 +96,39 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			// 更新返回给客户端的响应
 			responseToReturn = processedResp
 		} else {
-			// 对于普通查询，不在此处进行任何处理，而是在processQuery中统一处理
-			// 不处理CNAME记录，不缓存结果
-			// 保持原始响应不变
+			// 检查是否为云服务
+			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response, domain)
+			isCloud := detection.Type != CloudTypeNone
+
+			if isCloud {
+				// 对于云域名，使用专门的云域名处理方法
+				cloudProcessedResp := h.processCloudResponse(result.SuccessResult.Response, domain)
+				h.cacheManager.Set(domain, qtype, cloudProcessedResp, isCloud, int(detection.Type))
+				// 更新返回给客户端的响应
+				responseToReturn = cloudProcessedResp
+				h.Logger.Debug("☁️ 云服务检测并处理完成", map[string]interface{}{
+					"domain": domain,
+					"type":   detection.Type,
+				})
+			} else {
+				// 对于普通域名，处理CNAME记录
+				processedResp := h.processDNSResponseWithCNAME(responseToReturn, domain, upstreams)
+				h.cacheManager.Set(domain, qtype, processedResp, isCloud)
+				// 更新返回给客户端的响应
+				responseToReturn = processedResp
+			}
 		}
 	}
 
 	// 确定最终返回给客户端的响应
 	if h.IsValidDNSResult(result) {
-		// 有有效结果，记录处理后的结果
-		h.Logger.Debug("✅ 处理后的查询结果", map[string]interface{}{
+		// 有有效结果，返回处理后的结果
+		h.Logger.Debug("✅ 返回处理后的结果给客户端", map[string]interface{}{
 			"domain":         domain,
 			"success_server": result.SuccessResult.Server,
 			"success_time":   result.SuccessResult.ResponseTime.String(),
 			"rcode":          dns.RcodeToString[responseToReturn.Rcode],
 			"answers":        len(responseToReturn.Answer),
-			"type":           "processed_query_result",
 		})
 	} else {
 		// 没有有效结果，返回最快结果（可能是错误）
@@ -123,7 +139,6 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 					"domain":         domain,
 					"fastest_server": result.FastestResult.Server,
 					"error":          result.FastestResult.Error.Error(),
-					"type":           "fastest_error_result",
 				})
 			} else {
 				responseToReturn = result.FastestResult.Response
@@ -131,7 +146,6 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 					"domain":         domain,
 					"fastest_server": result.FastestResult.Server,
 					"fastest_time":   result.FastestResult.ResponseTime.String(),
-					"type":           "fastest_result_no_success",
 				})
 			}
 		} else {
@@ -145,55 +159,33 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 // ValidateDNSResult 验证查询结果是否包含有效的 DNS 记录
 func (h *RefactoredHandler) ValidateDNSResult(result *ConcurrentQueryResult) (bool, string) {
 	if result == nil {
-		h.Logger.Debug("DNS 验证失败", map[string]interface{}{
-			"reason": "result == nil",
-			"type":   "dns_validation_failed",
-		})
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "result == nil"})
 		return false, "result == nil"
 	}
 	if result.SuccessResult == nil {
-		h.Logger.Debug("DNS 验证失败", map[string]interface{}{
-			"reason": "SuccessResult == nil",
-			"type":   "dns_validation_failed",
-		})
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "SuccessResult == nil"})
 		return false, "SuccessResult == nil"
 	}
 	r := result.SuccessResult
 	if r.Error != nil {
-		h.Logger.Debug("DNS 响应错误", map[string]interface{}{
-			"error": r.Error.Error(),
-			"type":  "dns_response_error",
-		})
+		h.Logger.Debug("DNS 响应错误", map[string]interface{}{"error": r.Error.Error()})
 		return false, r.Error.Error()
 	}
 	if r.Response == nil {
-		h.Logger.Debug("DNS 验证失败", map[string]interface{}{
-			"reason": "Response == nil",
-			"type":   "dns_validation_failed",
-		})
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Response == nil"})
 		return false, "Response == nil"
 	}
 	resp := r.Response
 	if resp.Rcode != dns.RcodeSuccess {
-		h.Logger.Debug("DNS 验证失败", map[string]interface{}{
-			"reason": "Rcode != Success",
-			"rcode":  resp.Rcode,
-			"type":   "dns_validation_failed",
-		})
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Rcode != Success", "rcode": resp.Rcode})
 		return false, fmt.Sprintf("Rcode=%d", resp.Rcode)
 	}
 	if len(resp.Answer) == 0 {
-		h.Logger.Debug("DNS 验证失败", map[string]interface{}{
-			"reason": "Answer 为空",
-			"type":   "dns_validation_failed",
-		})
+		h.Logger.Debug("DNS 验证失败", map[string]interface{}{"reason": "Answer 为空"})
 		return false, "Answer 为空"
 	}
 
-	h.Logger.Debug("DNS 验证成功", map[string]interface{}{
-		"answer_count": len(resp.Answer),
-		"type":         "dns_validation_success",
-	})
+	h.Logger.Debug("DNS 验证成功", map[string]interface{}{"answer_count": len(resp.Answer)})
 	return true, "验证成功"
 }
 

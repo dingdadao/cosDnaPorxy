@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -127,27 +128,13 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 
 	// 检查是否过期
 	if time.Now().After(entry.ExpireAt) {
-		// 缓存已过期，但仍返回过期的内容，不立即删除
-		// 更新最后访问时间（用于LRU淘汰策略）
-		c.mu.Lock()
-		entry.LastAccess = time.Now()
-		c.mu.Unlock()
-
-		// 云服务域名特殊处理
-		if entry.IsCloud {
-			// 返回云响应缓存
-			if entry.CloudResponse != nil {
-				return entry.CloudResponse.Copy(), true, entry.IsCloud, entry.CloudType
-			}
-			// 无云响应缓存，返回云标记
-			return nil, true, entry.IsCloud, entry.CloudType
-		}
-
-		// 返回缓存的响应副本
-		if entry.Response != nil {
-			return entry.Response.Copy(), true, entry.IsCloud, entry.CloudType
-		}
-		return nil, true, entry.IsCloud, entry.CloudType
+		// 异步删除过期条目
+		go func() {
+			c.mu.Lock()
+			delete(c.store, key)
+			c.mu.Unlock()
+		}()
+		return nil, false, false, 0
 	}
 
 	// 更新最后访问时间（用于LRU淘汰策略）
@@ -219,14 +206,14 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 			CloudResponse:    existingCloudResponse,          // 保留已有的云响应或为空
 			ExpireAt:         time.Now().Add(24 * time.Hour), // 云服务标记缓存24小时
 			IsCloud:          true,
-			CloudType:        cType,         // 使用传入的云服务类型
+			CloudType:        cType,
 			RefreshThreshold: 6 * time.Hour, // 云标记外6小时后刷新
 			LastAccess:       time.Now(),
 		}
 		return
 	}
 
-	// 普通域名缓存处理（包括替换域名）
+	// 普通域名缓存处理
 	if response == nil {
 		return
 	}
@@ -268,15 +255,10 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 		Response:         responseCopy,
 		CloudResponse:    nil,
 		ExpireAt:         expireAt,
-		IsCloud:          isCloud, // 对于替换域名，isCloud为false
-		CloudType:        0,       // 默认值
+		IsCloud:          isCloud,
+		CloudType:        0,
 		RefreshThreshold: refreshThreshold,
 		LastAccess:       time.Now(),
-	}
-
-	// 如果传入了cloudType参数，使用它（用于标识替换域名的具体云服务商）
-	if len(cloudType) > 0 {
-		entry.CloudType = cloudType[0]
 	}
 
 	c.mu.Lock()
@@ -435,6 +417,44 @@ func (c *OptimizedDNSCache) Delete(domain string, qType uint16) {
 	c.mu.Unlock()
 }
 
+// GetExpiringSoonEntries 获取即将过期的缓存条目列表
+func (c *OptimizedDNSCache) GetExpiringSoonEntries(refreshThreshold time.Duration) []CacheEntryInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var expiringSoon []CacheEntryInfo
+	now := time.Now()
+
+	for key, entry := range c.store {
+		// 计算剩余TTL
+		remainingTTL := entry.ExpireAt.Sub(now)
+
+		// 如果剩余TTL小于或等于刷新阈值，则添加到列表
+		if remainingTTL > 0 && remainingTTL <= refreshThreshold {
+			// 解析缓存键获取domain和qtype
+			parts := strings.Split(key, "|")
+			if len(parts) == 2 {
+				domain := parts[0]
+				qtypeStr := parts[1]
+
+				// 将qtype字符串转换为uint16
+				for qtype, qtypeString := range dns.TypeToString {
+					if qtypeString == qtypeStr {
+						expiringSoon = append(expiringSoon, CacheEntryInfo{
+							Domain:  domain,
+							QType:   qtype,
+							IsCloud: entry.IsCloud,
+						})
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return expiringSoon
+}
+
 // GetStats 获取缓存统计
 type CacheStats struct {
 	Size int
@@ -481,22 +501,11 @@ func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time
 	}
 }
 
-// SetShortTTL 将缓存条目的过期时间设置为较短时间
-func (c *OptimizedDNSCache) SetShortTTL(domain string, qType uint16, duration time.Duration) {
-	// 添加空指针检查
-	if c == nil {
-		return
-	}
-
-	key := c.key(domain, qType)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if entry, exists := c.store[key]; exists {
-		// 将过期时间设置为较短时间（如10秒）
-		entry.ExpireAt = time.Now().Add(duration)
-		// 更新最后访问时间
-		entry.LastAccess = time.Now()
+// DebugCache 输出缓存内容用于调试
+func (c *OptimizedDNSCache) DebugCache() {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, _ = range c.store {
+		// 仅作为调试接口，实际应用中可能需要记录缓存内容
 	}
 }

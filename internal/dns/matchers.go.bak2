@@ -250,26 +250,20 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 		// 解析规则
 		dnsServer := ym.defaultDNS // 默认使用默认DNS
 		originalRulePattern := rule
+		rulePattern := rule
 
 		// 处理带有DNS指定的规则（格式：'DOMAIN,example.com,DNS' 或 'DOMAIN-SUFFIX,google.com,DNS'）
 		if strings.Contains(rule, ",") {
 			parts := strings.Split(rule, ",")
-			if len(parts) >= 3 {
-				dnsServer = strings.TrimSpace(parts[2])
-				// 处理 default_dns 关键字
-				if dnsServer == "default_dns" {
-					dnsServer = ym.defaultDNS
-				}
-			}
-		}
-
-		// rulePattern 用于类型识别，应该是规则类型+域名部分
-		rulePattern := rule
-		if strings.Contains(rule, ",") {
-			parts := strings.Split(rule, ",")
 			if len(parts) >= 2 {
-				// 保留规则类型和域名部分，去掉DNS服务器部分
-				rulePattern = strings.TrimSpace(parts[0] + "," + parts[1])
+				rulePattern = strings.TrimSpace(parts[0])
+				if len(parts) >= 3 {
+					dnsServer = strings.TrimSpace(parts[2])
+					// 处理 default_dns 关键字
+					if dnsServer == "default_dns" {
+						dnsServer = ym.defaultDNS
+					}
+				}
 			}
 		}
 
@@ -457,7 +451,7 @@ func (cm *ChinaDomainMatcher) LoadChinaDomains(configPath string) error {
 	newSuffixes := make(map[string]bool)
 	newKeywords := make(map[string]bool)
 	newRegexRules := make(map[string]*regexp.Regexp)
-	newTrie := NewDomainTrieNode()
+	newTrie := NewDomainTrie()
 
 	var exactCount, suffixCount, keywordCount, regexCount int
 

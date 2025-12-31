@@ -18,7 +18,9 @@ max_ip_records: 2 # 云域名替换时的最大IP记录数
 
 # 刷新间隔配置（支持30m、1h、2h格式）
 designated_refresh: "30m" # 定向域名刷新间隔（30分钟）
+china_domain_refresh: "24h" # 中国域名刷新间隔（24小时）
 network_refresh: "24h" # 网络段刷新间隔（24小时）
+
 # Cloudflare和AWS IP段文件
 cloudflare_net_file: "./data/cf_mrs_file4.txt"
 cloudflare_net_file6: "./data/cf_mrs_file6.txt"
@@ -28,11 +30,16 @@ aws_net_file: "./data/aws.txt"
 replace_cf_domain: "cf-cname.xingpingcn.top" # 检测到Cloudflare IP时替换的CNAME域名
 replace_aws_domain: "cc.cloudfront.182682.xyz" # 检测到AWS IP时替换的CNAME域名
 
-# 默认DNS服务器（用于未匹配到定向域名的情况）
-default_dns: "udp://119.29.29.29:53" # 支持URL scheme格式：udp://IP:PORT, https://domain/path等
+# DNS服务器配置
+default_dns: "udp://10.0.0.1:1053" # 默认DNS服务器（用于未匹配到定向域名的情况）
+china_dns: "udp://119.29.29.29:53" # 中国DNS服务器（用于China域名解析）
+backup_dns: "udp://223.5.5.5:53" # 备用DNS服务器（用于防污染验证）
 
-# 白名单和定向域名文件
-designated_domain: "./data/designated.txt" # 定向域名文件：指定使用特定DNS策略的域名列表
+# 域名文件配置
+designated_domain: "./data/designated.yaml" # 定向域名文件：支持YAML格式（mihomo风格）
+designated_domain_url: "" # 定向域名文件URL（优先使用此配置）
+china_domain_file: "./data/china_domains.yaml" # 中国域名列表文件
+china_domain_file_url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China_Domain.yaml" # 中国域名列表文件URL（优先使用此配置）
 
 # 日志级别
 log_level: "debug"
