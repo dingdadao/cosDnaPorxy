@@ -12,6 +12,7 @@ payload:
   - DOMAIN-KEYWORD,synology
   - DOMAIN-KEYWORD,tracker
   - DOMAIN-KEYWORD,imnks
+  - DOMAIN-KEYWORD,makerworld
   - DOMAIN-KEYWORD,synocommunity
   - DOMAIN-SUFFIX,m-team
   - DOMAIN-SUFFIX,tesla
