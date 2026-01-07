@@ -1,0 +1,408 @@
+package dns
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"cosDnaPorxy/internal/config"
+	"cosDnaPorxy/internal/utils"
+)
+
+// FileLoader 处理文件加载相关功能
+type FileLoader struct {
+	config       *config.Config
+	logger       *utils.EnhancedLogger
+	cloudDetector *CloudDetector  // 直接使用cloudDetector
+	matcherHandler *MatcherHandler
+}
+
+// NewFileLoader 创建新的文件加载处理器
+func NewFileLoader(config *config.Config, logger *utils.EnhancedLogger, cloudDetector *CloudDetector, matcherHandler *MatcherHandler) *FileLoader {
+	return &FileLoader{
+		config:        config,
+		logger:        logger,
+		cloudDetector: cloudDetector,
+		matcherHandler: matcherHandler,
+	}
+}
+
+// LoadAllData 加载所有数据
+func (fl *FileLoader) LoadAllData() error {
+	// 仅在文件存在时才加载云服务网段
+	if fl.shouldLoadCloudFiles() {
+		if err := fl.cloudDetector.LoadNetworkRanges(
+			fl.config.CloudflareNetFile,
+			fl.config.CloudflareNetFile6,
+			fl.config.AWSNetFile,
+		); err != nil {
+			fl.logger.Error("❌ 云服务网段加载失败", map[string]interface{}{
+				"error": err.Error(),
+			})
+			// 继续执行，不返回错误，确保服务可用
+		}
+	} else {
+		fl.logger.Info("📋 云服务网段文件不存在，等待定时任务下载", map[string]interface{}{
+			"cloudflare_v4": fl.config.CloudflareNetFile,
+			"cloudflare_v6": fl.config.CloudflareNetFile6,
+			"aws_file":      fl.config.AWSNetFile,
+		})
+	}
+
+	// 仅在文件存在时才加载中国域名
+	if fl.shouldLoadChinaDomainFile() {
+		if err := fl.LoadChinaDomains(); err != nil {
+			fl.logger.Error("❌ 中国域名加载失败", map[string]interface{}{
+				"error": err.Error(),
+			})
+			// 继续执行，不返回错误，确保服务可用
+		}
+	} else {
+		fl.logger.Info("📋 中国域名文件不存在，等待定时任务下载", map[string]interface{}{
+			"file": fl.config.ChinaDomainFile,
+		})
+	}
+
+	// 仅在文件存在时才加载定向域名
+	if fl.shouldLoadDesignatedDomainFile() {
+		if err := fl.LoadDesignatedDomains(); err != nil {
+			fl.logger.Error("❌ 定向域名加载失败", map[string]interface{}{
+				"error": err.Error(),
+			})
+			// 继续执行，不返回错误，确保服务可用
+		}
+	} else {
+		fl.logger.Info("📋 定向域名文件不存在，等待定时任务下载", map[string]interface{}{
+			"file": fl.config.DesignatedDomain,
+		})
+	}
+
+	return nil
+}
+
+// shouldLoadCloudFiles 检查是否应该加载云服务文件
+func (fl *FileLoader) shouldLoadCloudFiles() bool {
+	// 检查任一云服务文件是否存在
+	if fl.config.CloudflareNetFile != "" {
+		if _, err := os.Stat(fl.config.CloudflareNetFile); err == nil {
+			return true
+		}
+	}
+	if fl.config.CloudflareNetFile6 != "" {
+		if _, err := os.Stat(fl.config.CloudflareNetFile6); err == nil {
+			return true
+		}
+	}
+	if fl.config.AWSNetFile != "" {
+		if _, err := os.Stat(fl.config.AWSNetFile); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldLoadChinaDomainFile 检查是否应该加载中国域名文件
+func (fl *FileLoader) shouldLoadChinaDomainFile() bool {
+	if fl.config.ChinaDomainFile == "" {
+		return false
+	}
+	if _, err := os.Stat(fl.config.ChinaDomainFile); err == nil {
+		return true
+	}
+	return false
+}
+
+// shouldLoadDesignatedDomainFile 检查是否应该加载定向域名文件
+func (fl *FileLoader) shouldLoadDesignatedDomainFile() bool {
+	if fl.config.DesignatedDomain == "" {
+		return false
+	}
+	if _, err := os.Stat(fl.config.DesignatedDomain); err == nil {
+		return true
+	}
+	return false
+}
+
+// downloadFile 下载文件
+func (fl *FileLoader) downloadFile(url, targetFile string) error {
+	// 创建目录
+	dir := filepath.Dir(targetFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	// 创建临时文件
+	tempFile := targetFile + ".tmp"
+
+	// 下载文件
+	if err := utils.DownloadFile(url, tempFile); err != nil {
+		return err
+	}
+
+	// 检查下载的文件是否有效
+	if !fl.isFileValid(tempFile) {
+		// 删除无效的临时文件
+		os.Remove(tempFile)
+		return fmt.Errorf("下载的文件内容无效")
+	}
+
+	// 替换原文件
+	return os.Rename(tempFile, targetFile)
+}
+
+// LoadChinaDomains 加载中国域名列表
+	// 如果配置文件不存在，直接返回，等待定时任务下载
+	if fl.config.ChinaDomainFile == "" {
+		fl.logger.Info("📋 中国域名配置文件路径为空，跳过加载", map[string]interface{}{
+			"file": fl.config.ChinaDomainFile,
+		})
+		return nil
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(fl.config.ChinaDomainFile); os.IsNotExist(err) {
+		fl.logger.Info("📋 中国域名配置文件不存在，开始下载", map[string]interface{}{
+			"file": fl.config.ChinaDomainFile,
+			"url":  fl.config.ChinaDomainFileURL,
+		})
+
+		// 文件不存在，尝试下载
+		if fl.config.ChinaDomainFileURL != "" {
+			if err := fl.downloadWithRetry(fl.config.ChinaDomainFileURL, fl.config.ChinaDomainFile); err != nil {
+				fl.logger.Error("❌ 下载中国域名文件失败，创建空文件", map[string]interface{}{
+					"file":  fl.config.ChinaDomainFile,
+					"url":   fl.config.ChinaDomainFileURL,
+					"error": err.Error(),
+				})
+				// 创建空文件以避免后续重复尝试下载
+				if createErr := fl.createEmptyFile(fl.config.ChinaDomainFile); createErr != nil {
+					fl.logger.Error("❌ 创建空文件失败", map[string]interface{}{
+						"file":  fl.config.ChinaDomainFile,
+						"error": createErr.Error(),
+					})
+				}
+				return err
+			}
+			fl.logger.Info("✅ 下载中国域名文件成功", map[string]interface{}{
+				"file": fl.config.ChinaDomainFile,
+			})
+		} else {
+			fl.logger.Warn("⚠️ 中国域名文件URL未配置", map[string]interface{}{
+				"file": fl.config.ChinaDomainFile,
+			})
+			return nil
+		}
+	} else {
+		fl.logger.Info("📋 中国域名配置文件已存在，直接加载", map[string]interface{}{
+			"file": fl.config.ChinaDomainFile,
+		})
+	}
+
+	// 检查文件内容是否有效
+	if !fl.isFileValid(fl.config.ChinaDomainFile) {
+		fl.logger.Warn("⚠️ 中国域名配置文件内容无效，跳过加载", map[string]interface{}{
+			"file": fl.config.ChinaDomainFile,
+		})
+		return nil
+	}
+
+	// 加载中国域名列表
+	if err := fl.matcherHandler.GetChinaMatcher().LoadChinaDomains(fl.config.ChinaDomainFile); err != nil {
+		fl.logger.Error("❌ 加载中国域名失败", map[string]interface{}{
+			"file":  fl.config.ChinaDomainFile,
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	fl.logger.Info("✅ 中国域名加载完成", map[string]interface{}{
+		"file": fl.config.ChinaDomainFile,
+	})
+
+	return nil
+}
+
+// LoadDesignatedDomains 加载定向域名列表
+func (fl *FileLoader) LoadDesignatedDomains() error {
+	// 如果配置文件不存在，直接返回，等待定时任务下载
+	if fl.config.DesignatedDomain == "" {
+		fl.logger.Info("📋 定向域名配置文件路径为空，跳过加载", map[string]interface{}{
+			"file": fl.config.DesignatedDomain,
+		})
+		return nil
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(fl.config.DesignatedDomain); os.IsNotExist(err) {
+		fl.logger.Info("📋 定向域名配置文件不存在，开始下载", map[string]interface{}{
+			"file": fl.config.DesignatedDomain,
+			"url":  fl.config.DesignatedDomainURL,
+		})
+
+		// 文件不存在，尝试下载
+		if fl.config.DesignatedDomainURL != "" {
+			if err := fl.downloadWithRetry(fl.config.DesignatedDomainURL, fl.config.DesignatedDomain); err != nil {
+				fl.logger.Error("❌ 下载定向域名文件失败，创建空文件", map[string]interface{}{
+					"file":  fl.config.DesignatedDomain,
+					"url":   fl.config.DesignatedDomainURL,
+					"error": err.Error(),
+				})
+				// 创建空文件以避免后续重复尝试下载
+				if createErr := fl.createEmptyFile(fl.config.DesignatedDomain); createErr != nil {
+					fl.logger.Error("❌ 创建空文件失败", map[string]interface{}{
+						"file":  fl.config.DesignatedDomain,
+						"error": createErr.Error(),
+					})
+				}
+				return err
+			}
+			fl.logger.Info("✅ 下载定向域名文件成功", map[string]interface{}{
+				"file": fl.config.DesignatedDomain,
+			})
+		} else {
+			fl.logger.Warn("⚠️ 定向域名文件URL未配置", map[string]interface{}{
+				"file": fl.config.DesignatedDomain,
+			})
+			return nil
+		}
+	} else {
+		fl.logger.Info("📋 定向域名配置文件已存在，直接加载", map[string]interface{}{
+			"file": fl.config.DesignatedDomain,
+		})
+	}
+
+	// 检查文件内容是否有效
+	if !fl.isFileValid(fl.config.DesignatedDomain) {
+		fl.logger.Warn("⚠️ 定向域名配置文件内容无效，跳过加载", map[string]interface{}{
+			"file": fl.config.DesignatedDomain,
+		})
+		return nil
+	}
+
+	// 加载定向域名列表
+	if err := fl.matcherHandler.GetYAMLMatcher().LoadYAMLConfig(fl.config.DesignatedDomain); err != nil {
+		fl.logger.Error("❌ 加载定向域名失败", map[string]interface{}{
+			"file":  fl.config.DesignatedDomain,
+			"error": err.Error(),
+		})
+		return err
+	}
+
+	fl.logger.Info("✅ 定向域名加载完成", map[string]interface{}{
+		"file": fl.config.DesignatedDomain,
+	})
+
+	return nil
+}
+
+// downloadWithRetry 带重试的下载功能
+func (fl *FileLoader) downloadWithRetry(url, targetFile string) error {
+	// 重试次数
+	maxRetries := 3
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		fl.logger.Debug("尝试下载文件", map[string]interface{}{
+			"url":     url,
+			"file":    targetFile,
+			"attempt": i + 1,
+		})
+
+		if err := fl.downloadFile(url, targetFile); err != nil {
+			lastErr = err
+			fl.logger.Warn("下载失败，准备重试", map[string]interface{}{
+				"url":         url,
+				"file":        targetFile,
+				"attempt":     i + 1,
+				"max_retries": maxRetries,
+				"error":       err.Error(),
+			})
+			// 等待一段时间再重试
+			time.Sleep(time.Duration(i+1) * time.Second)
+			continue
+		}
+
+		// 下载成功，检查文件内容是否有效
+		if fl.isFileValid(targetFile) {
+			fl.logger.Info("下载成功且文件内容有效", map[string]interface{}{
+				"url":  url,
+				"file": targetFile,
+			})
+			return nil
+		} else {
+			lastErr = fmt.Errorf("下载的文件内容无效")
+			fl.logger.Warn("下载的文件内容无效，准备重试", map[string]interface{}{
+				"url":         url,
+				"file":        targetFile,
+				"attempt":     i + 1,
+				"max_retries": maxRetries,
+			})
+			// 等待一段时间再重试
+			time.Sleep(time.Duration(i+1) * time.Second)
+		}
+	}
+
+	return fmt.Errorf("下载失败，已重试 %d 次: %w", maxRetries, lastErr)
+}
+
+// isFileValid 检查文件内容是否有效
+func (fl *FileLoader) isFileValid(filePath string) bool {
+	// 检查文件是否存在
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return false
+	}
+
+	// 读取文件内容
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		fl.logger.Warn("读取文件失败", map[string]interface{}{
+			"file":  filePath,
+			"error": err.Error(),
+		})
+		return false
+	}
+
+	// 检查文件是否为空
+	if len(content) == 0 {
+		fl.logger.Debug("文件为空", map[string]interface{}{
+			"file": filePath,
+		})
+		return false
+	}
+
+	// 检查文件内容是否包含有效数据（非纯空白字符）
+	trimmedContent := strings.TrimSpace(string(content))
+	if len(trimmedContent) == 0 {
+		fl.logger.Debug("文件内容为空白字符", map[string]interface{}{
+			"file": filePath,
+		})
+		return false
+	}
+
+	return true
+}
+
+// createEmptyFile 创建空文件
+func (fl *FileLoader) createEmptyFile(filePath string) error {
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	// 创建一个基本的YAML结构，避免完全空文件
+	var emptyContent []byte
+	if strings.Contains(filePath, "designated") {
+		// 为designated.yaml创建基本结构
+		emptyContent = []byte("# Empty designated domains configuration\npayload: []\n")
+	} else if strings.Contains(filePath, "china") {
+		// 为china_domains.yaml创建基本结构
+		emptyContent = []byte("# Empty china domains configuration\npayload: []\n")
+	} else {
+		// 默认空内容
+		emptyContent = []byte{}
+	}
+
+	return os.WriteFile(filePath, emptyContent, 0644)
+}

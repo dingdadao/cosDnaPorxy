@@ -17,12 +17,9 @@ const (
 
 // CacheConfig 缓存配置
 type CacheConfig struct {
-	MaxItems           int           `yaml:"max_items"`            // 最大缓存条目数
-	TTL                time.Duration `yaml:"ttl"`                  // 统一缓存TTL
-	RefreshThreshold   time.Duration `yaml:"refresh_threshold"`    // 刷新阈值（TTL剩余时间）
-	EnableAsyncRefresh bool          `yaml:"enable_async_refresh"` // 启用异步刷新
-	MaxAsyncWorkers    int           `yaml:"max_async_workers"`    // 最大异步工作线程数
-	EvictionPolicy     string        `yaml:"eviction_policy"`      // 淘汰策略：user_query_time（用户查询时间）
+	MaxItems        int           `yaml:"max_items"`         // 最大缓存条目数
+	TTL             time.Duration `yaml:"ttl"`               // 最小缓存TTL
+	MaxAsyncWorkers int           `yaml:"max_async_workers"` // 最大异步工作线程数
 }
 
 // UpstreamServer 上游服务器配置
@@ -113,15 +110,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if config.Cache.TTL == 0 {
 		config.Cache.TTL = 300 * time.Second // 5分钟默认TTL
-	}
-	if config.Cache.RefreshThreshold == 0 {
-		config.Cache.RefreshThreshold = 30 * time.Second
-	}
-	if config.Cache.MaxAsyncWorkers == 0 {
-		config.Cache.MaxAsyncWorkers = 5
-	}
-	if config.Cache.EvictionPolicy == "" {
-		config.Cache.EvictionPolicy = "user_query_time" // 默认按用户查询时间淘汰
 	}
 
 	// 设置最大IP记录数默认值

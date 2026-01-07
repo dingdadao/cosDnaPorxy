@@ -127,14 +127,27 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 	}
 
 	// 检查是否过期
-	if time.Now().After(entry.ExpireAt) {
-		// 异步删除过期条目
-		go func() {
-			c.mu.Lock()
-			delete(c.store, key)
-			c.mu.Unlock()
-		}()
-		return nil, false, false, 0
+	isExpired := time.Now().After(entry.ExpireAt)
+	if isExpired {
+		// 对于已过期的条目，我们仍然返回它，但设置一个很小的TTL给客户端
+		// 不立即删除，而是返回过期的响应，让调用者处理
+		c.mu.Lock()
+		entry.LastAccess = time.Now()
+		c.mu.Unlock()
+
+		// 云服务域名特殊处理
+		if entry.IsCloud && entry.CloudResponse != nil {
+			// 创建响应副本并调整TTL
+			resp := entry.CloudResponse.Copy()
+			c.adjustExpiredResponseTTL(resp, 5*time.Second)
+			return resp, true, true, entry.CloudType
+		} else if !entry.IsCloud && entry.Response != nil {
+			// 普通域名响应
+			resp := entry.Response.Copy()
+			c.adjustExpiredResponseTTL(resp, 5*time.Second)
+			return resp, true, false, 0
+		}
+		return nil, true, entry.IsCloud, entry.CloudType
 	}
 
 	// 更新最后访问时间（用于LRU淘汰策略）
@@ -144,19 +157,45 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 
 	// 云服务域名特殊处理
 	if entry.IsCloud {
-		// 返回云响应缓存
-		if entry.CloudResponse != nil {
-			return entry.CloudResponse.Copy(), true, entry.IsCloud, entry.CloudType
-		}
-		// 无云响应缓存，返回云标记
-		return nil, true, entry.IsCloud, entry.CloudType
+		return entry.CloudResponse, true, true, entry.CloudType
 	}
 
-	// 返回缓存的响应副本
-	if entry.Response != nil {
-		return entry.Response.Copy(), true, entry.IsCloud, entry.CloudType
+	return entry.Response, true, false, 0
+}
+
+// adjustExpiredResponseTTL 调整过期响应的TTL值
+func (c *OptimizedDNSCache) adjustExpiredResponseTTL(resp *dns.Msg, newTTL time.Duration) {
+	if resp == nil {
+		return
 	}
-	return nil, true, entry.IsCloud, entry.CloudType
+
+	// 将新的TTL值应用到所有RR记录
+	newTTLValue := uint32(newTTL.Seconds())
+
+	for _, rr := range resp.Answer {
+		rr.Header().Ttl = newTTLValue
+	}
+	for _, rr := range resp.Ns {
+		rr.Header().Ttl = newTTLValue
+	}
+	for _, rr := range resp.Extra {
+		rr.Header().Ttl = newTTLValue
+	}
+}
+
+// GetExpireTime 获取缓存条目的过期时间
+func (c *OptimizedDNSCache) GetExpireTime(domain string, qType uint16) time.Time {
+	key := c.key(domain, qType)
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.store[key]
+	if !exists {
+		return time.Time{} // 返回零时间
+	}
+
+	return entry.ExpireAt
 }
 
 // IsCloud 检查域名是否为云服务域名（即使缓存已过期）
@@ -241,6 +280,88 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 				actualTTL = upstreamTTL
 			}
 		}
+	}
+
+	// 计算过期时间和刷新阈值
+	expireAt := time.Now().Add(actualTTL)
+	refreshThreshold := time.Duration(float64(actualTTL) * 0.3) // 30%作为刷新阈值
+
+	// 生成缓存键
+	key := c.key(domain, qType)
+
+	// 创建缓存条目
+	entry := &CacheEntry{
+		Response:         responseCopy,
+		CloudResponse:    nil,
+		ExpireAt:         expireAt,
+		IsCloud:          isCloud,
+		CloudType:        0,
+		RefreshThreshold: refreshThreshold,
+		LastAccess:       time.Now(),
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 检查容量，如果达到上限，删除最少访问的条目
+	if len(c.store) >= c.maxSize && c.maxSize > 0 {
+		c.evictLeastRecentlyUsed()
+	}
+
+	// 存储缓存条目
+	c.store[key] = entry
+}
+
+// SetWithTTL 设置缓存响应（使用自定义TTL）
+func (c *OptimizedDNSCache) SetWithTTL(domain string, qType uint16, response *dns.Msg, isCloud bool, customTTL time.Duration, cloudType ...int) {
+	// 如果是云服务域名，只缓存标记，不缓存响应内容
+	if isCloud {
+		key := c.key(domain, qType)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		// 检查是否需要清理缓存
+		if len(c.store) >= c.maxSize {
+			c.evictLeastRecentlyUsed()
+		}
+
+		// 获取云服务类型
+		var cType int
+		if len(cloudType) > 0 {
+			cType = cloudType[0]
+		}
+
+		// 检查是否已经存在云标记，如果存在则保留CloudResponse
+		var existingCloudResponse *dns.Msg
+		if existingEntry, exists := c.store[key]; exists && existingEntry.IsCloud {
+			existingCloudResponse = existingEntry.CloudResponse
+		}
+
+		// 只存储云服务标记，不存储原始响应内容
+		c.store[key] = &CacheEntry{
+			Response:         nil,                            // 不缓存原始响应内容
+			CloudResponse:    existingCloudResponse,          // 保留已有的云响应或为空
+			ExpireAt:         time.Now().Add(24 * time.Hour), // 云服务标记缓存24小时
+			IsCloud:          true,
+			CloudType:        cType,
+			RefreshThreshold: 6 * time.Hour, // 云标记外6小时后刷新
+			LastAccess:       time.Now(),
+		}
+		return
+	}
+
+	// 普通域名缓存处理
+	if response == nil {
+		return
+	}
+
+	// 深拷贝响应对象
+	responseCopy := response.Copy()
+
+	// 使用自定义TTL，但确保不低于默认TTL
+	actualTTL := customTTL
+	if customTTL < c.defaultTTL {
+		actualTTL = c.defaultTTL
 	}
 
 	// 计算过期时间和刷新阈值

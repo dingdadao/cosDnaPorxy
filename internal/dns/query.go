@@ -103,7 +103,8 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			if isCloud {
 				// 对于云域名，使用专门的云域名处理方法
 				cloudProcessedResp := h.processCloudResponse(result.SuccessResult.Response, domain)
-				h.cacheManager.Set(domain, qtype, cloudProcessedResp, isCloud, int(detection.Type))
+				// 将整个域名标记为云服务域名（确保A/AAAA记录一致性）
+				h.cacheManager.MarkDomainAsCloud(domain, qtype, int(detection.Type))
 				// 更新返回给客户端的响应
 				responseToReturn = cloudProcessedResp
 				h.Logger.Debug("☁️ 云服务检测并处理完成", map[string]interface{}{

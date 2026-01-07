@@ -7,12 +7,11 @@ modern_timeout: "2s" # 现代协议(DoH/DoT/H3)查询超时时间
 
 # 上游DNS服务器（支持多种协议，统一URL scheme）
 upstream:
-  - "udp://10.0.0.1:1053" # DoH aliyun
+  - "udp://10.0.0.1:1053" # clash 提供的dns
 
-cf_cache_time: 24h
 replace_cache_time: 30m
 no_answer_cache_time: 10s
-max_ip_records: 2 # 云域名替换时的最大IP记录数
+max_ip_records: 4 # 云域名替换时的最大IP记录数
 
 # 刷新间隔配置（支持30m、1h、2h格式）
 designated_refresh: "30m" # 定向域名刷新间隔（30分钟）
@@ -40,13 +39,10 @@ china_domain_file: "./data/china_domains.yaml" # 中国域名列表文件
 china_domain_file_url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China_Domain.yaml" # 中国域名列表文件URL（优先使用此配置）
 
 # 日志级别
-log_level: "info"
+log_level: "debug"
 
 # 缓存配置
 cache:
   max_items: 5000 # 最大缓存条目数
-  ttl: "1m" # 统一缓存TTL：所有DNS响应的缓存时间
-  refresh_threshold: "20s" # 刷新阈值：TTL剩余18秒时开始异步刷新（TTL的30%）
-  enable_async_refresh: true # 启用异步刷新：TTL到期前自动刷新DNS记录
+  ttl: "50m" # 最小缓存TTL：当DNS响应的TTL小于该值时，使用此配置值
   max_async_workers: 2 # 最大异步工作线程数：并发处理异步刷新任务
-  eviction_policy: "user_query_time" # 淘汰策略：user_query_time（用户查询时间）
