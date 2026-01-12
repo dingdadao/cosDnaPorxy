@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -49,11 +48,10 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("  已保存: %s\n", outputPath)
+		fmt.Printf("  已保存: %s (已彻底清理尾部非标准注释)\n", outputPath)
 	}
 
-	fmt.Println("\n全部转换完成！输出目录:", filepath.Join(".", outputDir))
-	fmt.Println("现在 IP-CIDR 规则已自动补 /32，不会再报 payloadRule error")
+	fmt.Println("\n转换完成！现在所有 IP-CIDR 规则都是纯净格式，不会再报 payloadRule error")
 }
 
 func download(url string) (string, error) {
@@ -75,20 +73,17 @@ func download(url string) (string, error) {
 func convertToYAML(raw string, title string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("# %s.yaml - Aegis 转换版（自动补 IP-CIDR /32）\n", title))
+	sb.WriteString(fmt.Sprintf("# %s.yaml - Aegis 纯净转换版\n", title))
 	sb.WriteString(fmt.Sprintf("# 来源: %s\n", ruleFiles[findIndex(title)].URL))
-	sb.WriteString("# 转换时间: 自动生成\n\n")
+	sb.WriteString("# 说明: 自动补 IPv4 /32，已强制移除所有规则尾部注释/描述（包括中文无#描述）\n\n")
 	sb.WriteString("payload:\n")
 
 	scanner := bufio.NewScanner(strings.NewReader(raw))
-	commentRe := regexp.MustCompile(`\s*#.*$`)                 // 移除行尾注释
-	ipCidrRe := regexp.MustCompile(`^IP-CIDR,([\d.]+)(/.*)?$`) // 匹配 IPv4 IP-CIDR
 
 	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), " \t")
+		line := strings.TrimRight(scanner.Text(), " \t\r")
 
 		if line == "" {
-			sb.WriteString("\n")
 			continue
 		}
 
@@ -97,21 +92,20 @@ func convertToYAML(raw string, title string) string {
 			continue
 		}
 
-		// 移除行尾注释
-		cleaned := commentRe.ReplaceAllString(line, "")
-		cleaned = strings.TrimSpace(cleaned)
+		// 强制清理：从第一个空格开始截断（处理无#的尾部中文描述）
+		parts := strings.SplitN(line, " ", 2)
+		cleaned := strings.TrimSpace(parts[0])
 
 		if cleaned == "" {
 			continue
 		}
 
-		// 自动补 /32 for IP-CIDR (IPv4)
-		if match := ipCidrRe.FindStringSubmatch(cleaned); match != nil {
-			ip := match[1]
-			cidr := match[2]
-			if cidr == "" {
-				// 验证是有效 IPv4
-				if net.ParseIP(ip) != nil {
+		// 自动补 /32 for IPv4 IP-CIDR
+		if strings.HasPrefix(cleaned, "IP-CIDR,") {
+			ipPart := strings.TrimPrefix(cleaned, "IP-CIDR,")
+			if !strings.Contains(ipPart, "/") {
+				ip := ipPart
+				if net.ParseIP(ip) != nil && !strings.Contains(ip, ":") {
 					cleaned = fmt.Sprintf("IP-CIDR,%s/32", ip)
 				}
 			}

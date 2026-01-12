@@ -1,6 +1,6 @@
-# ChinaMedia.yaml - Aegis 转换版（自动补 IP-CIDR /32）
+# ChinaMedia.yaml - Aegis 纯净转换版
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/ChinaMedia.list
-# 转换时间: 自动生成
+# 说明: 自动补 IPv4 /32，已强制移除所有规则尾部注释/描述（包括中文无#描述）
 
 payload:
 # > ChinaMedia.list（国内流媒体平台规则集）
@@ -10,9 +10,7 @@ payload:
 # - 用途：本规则集用于防御性安全研究，禁止用于任何非法用途
 # - 维护：https://github.com/Thoseyearsbrian/Aegis
 # - 更新时间：2026-01-09
-
 # > 小红书 相关域名
-
   - DOMAIN-SUFFIX,xiaohongshu.com
   - DOMAIN-SUFFIX,xhslink.com
   - DOMAIN-SUFFIX,picasso-static.xiaohongshu.com
@@ -74,9 +72,7 @@ payload:
   - IP-CIDR,117.88.123.99/32
   - IP-CIDR,101.227.133.99/32
   - IP-CIDR,61.170.100.65/32
-
 # > Bilibili 相关域名
-
   - DOMAIN-SUFFIX,bilibili.com
   - DOMAIN-SUFFIX,hdslb.com
   - DOMAIN-SUFFIX,acg.tv
@@ -115,9 +111,7 @@ payload:
   - DOMAIN-SUFFIX,upos-sz-mirroralib.bilivideo.com
   - IP-CIDR,203.107.1.65/32
   - IP-CIDR,61.170.65.76/32
-
 # > 视频平台
-
   - DOMAIN-SUFFIX,iqiyi.com
   - DOMAIN-SUFFIX,iq.com
   - DOMAIN-SUFFIX,tudou.com
@@ -136,9 +130,7 @@ payload:
   - DOMAIN-SUFFIX,joy.cn
   - DOMAIN-SUFFIX,acfun.cn
   - DOMAIN-SUFFIX,cdn.aixifan.com
-
 # > 音乐平台
-
   - DOMAIN-SUFFIX,kuwo.cn
   - DOMAIN-SUFFIX,kuwo.com
   - DOMAIN-SUFFIX,kwimgs.com
@@ -149,17 +141,13 @@ payload:
   - DOMAIN-SUFFIX,music.163.com
   - DOMAIN-SUFFIX,music.126.net
   - DOMAIN-SUFFIX,tingapi.com
-
 # > 电台 / 播客平台
-
   - DOMAIN-SUFFIX,qingting.fm
   - DOMAIN-SUFFIX,ximalaya.com
   - DOMAIN-SUFFIX,himalaya.com
   - DOMAIN-SUFFIX,lrts.me
   - DOMAIN-SUFFIX,lishi.fm
-
 # > 短视频平台
-
   - DOMAIN-SUFFIX,amemv.com
   - DOMAIN-SUFFIX,snssdk.com
   - DOMAIN-SUFFIX,pstatp.com
@@ -168,8 +156,6 @@ payload:
   - DOMAIN-SUFFIX,kuaishou.com
   - DOMAIN-SUFFIX,ksyun.com
   - DOMAIN-SUFFIX,static.yximgs.com
-
 # > Mudu.TV（目睹直播）资源与通信域名
-
   - DOMAIN-SUFFIX,msg-ws.mudu.tv
   - DOMAIN-SUFFIX,static.mudu.tv

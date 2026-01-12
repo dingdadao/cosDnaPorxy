@@ -1,6 +1,6 @@
-# Apple.yaml - Aegis 转换版（自动补 IP-CIDR /32）
+# Apple.yaml - Aegis 纯净转换版
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/Apple.list
-# 转换时间: 自动生成
+# 说明: 自动补 IPv4 /32，已强制移除所有规则尾部注释/描述（包括中文无#描述）
 
 payload:
 # > Apple.list（苹果服务识别与策略规则集）
@@ -11,9 +11,7 @@ payload:
 # - 用途：本规则集用于防御性安全研究，禁止用于任何非法用途
 # - 维护：https://github.com/Thoseyearsbrian/Aegis
 # - 更新时间：2026-01-11
-
 # > 系统服务（System Services）
-
   - DOMAIN-SUFFIX,apple.com
   - DOMAIN-SUFFIX,apple.cn
   - DOMAIN-SUFFIX,appleid.apple.com
@@ -71,21 +69,15 @@ payload:
   - DOMAIN-SUFFIX,ampaeservices.com
   - IP-CIDR,17.253.86.211/32
   - IP-CIDR,17.253.150.10/32
-
 # > Siri / Dictation / 智能语音
-
   - DOMAIN-SUFFIX,siri.apple.com
   - DOMAIN-SUFFIX,dictation.apple.com
   - DOMAIN-SUFFIX,guzzoni.smoot.apple.com
-
 # > Private Cloud Compute（苹果云端 AI 安全沙箱）
-
   - DOMAIN-SUFFIX,pcc.apple.com
   - DOMAIN-SUFFIX,pcc-cdn.apple.com
   - DOMAIN-SUFFIX,pcc-support.apple.com
-
 # > iCloud / 备份同步服务（iCloud Services）
-
   - DOMAIN-SUFFIX,icloud.com
   - DOMAIN-SUFFIX,icloud-content.com
   - DOMAIN-SUFFIX,icloud.com.cn
@@ -105,9 +97,7 @@ payload:
   - DOMAIN-SUFFIX,p212-imap.mail.icloud.com.cn
   - IP-CIDR,139.178.128.0/18
   - IP-CIDR,17.252.203.148/32
-
 # > App Store / 内容分发与媒体（App Store & Media）
-
   - DOMAIN-SUFFIX,itunes.apple.com
   - DOMAIN-SUFFIX,itunes.com
   - DOMAIN-SUFFIX,apps.apple.com
@@ -148,9 +138,7 @@ payload:
   - DOMAIN-SUFFIX,partiality.itunes.apple.com
   - DOMAIN-SUFFIX,play.itunes.apple.com
   - DOMAIN-SUFFIX,cma.itunes.apple.com
-
 # > 推送与通知服务（Push Services）
-
   - DOMAIN-SUFFIX,push.apple.com
   - DOMAIN-SUFFIX,courier.push.apple.com
   - DOMAIN-SUFFIX,18-courier.push.apple.com
@@ -162,9 +150,7 @@ payload:
   - DOMAIN-SUFFIX,gateway.push.apple.com
   - DOMAIN-SUFFIX,init.push.apple.com
   - DOMAIN-SUFFIX,2-courier.push.apple.com
-
 # > Relay / 隐私保护服务（Relay & Privacy Services）
-
   - DOMAIN-SUFFIX,apple-relay.fastly-edge.com
   - DOMAIN-SUFFIX,ohttp-relay1.fastly-edge.com
   - DOMAIN-SUFFIX,apple-relay.cloudflare.com
@@ -172,9 +158,7 @@ payload:
   - DOMAIN-SUFFIX,apple-dns.net
   - DOMAIN-SUFFIX,apple-dns.cn
   - IP-CIDR,65.199.22.0/23
-
 # > 开发者与测试服务（Developer & Beta Services）
-
   - DOMAIN-SUFFIX,download.developer.apple.com
   - DOMAIN-SUFFIX,swdownload.apple.com
   - DOMAIN-SUFFIX,updates-http.cdn-apple.com
@@ -189,14 +173,10 @@ payload:
   - DOMAIN-SUFFIX,apple-darwin.com
   - DOMAIN-SUFFIX,wps.apple.com
   - DOMAIN-SUFFIX,gsa.apple.com
-
 # > 支付与钱包（Payment & Wallet）
-
   - DOMAIN-SUFFIX,apple-pay.com
   - DOMAIN-SUFFIX,passkit.apple.com
-
 # > CDN 与资源分发节点（CDN & Static Resources）
-
   - DOMAIN-SUFFIX,apple-com.akamaized.net
   - DOMAIN-SUFFIX,apple.com.edgekey.net
   - DOMAIN-SUFFIX,lookup-api.apple.com.edgekey.net
@@ -224,9 +204,7 @@ payload:
   - IP-CIDR,104.83.196.219/32
   - IP-CIDR,23.220.75.249/32
   - IP-CIDR,59.82.43.60/32
-
 # > 地图与定位服务（Maps & Location）
-
   - DOMAIN-SUFFIX,apple-mapkit.com
   - DOMAIN-SUFFIX,mapkitjs.apple.com
   - DOMAIN-SUFFIX,gspe1-ssl.ls.apple.com
@@ -241,47 +219,33 @@ payload:
   - IP-CIDR,23.202.34.232/32
   - IP-CIDR,184.26.91.30/32
   - IP-CIDR,23.61.202.17/32
-
 # > Game Center / 游戏社交服务（GameKit）
-
   - DOMAIN-SUFFIX,gamecenter.apple.com
   - DOMAIN-SUFFIX,gk.apple.com
   - DOMAIN-SUFFIX,init.gc.apple.com
   - DOMAIN-SUFFIX,static.gc.apple.com
   - DOMAIN-SUFFIX,profile.gc.apple.com
-
 # > Apple Support / 用户支持与文档服务（Support Services）
-
   - DOMAIN-SUFFIX,support.apple.com
   - DOMAIN-SUFFIX,getsupport.apple.com
-
 # > Apple News / Stocks 新闻服务（News & Stocks）
-
   - DOMAIN-SUFFIX,news.apple.com
   - DOMAIN-SUFFIX,stocks.apple.com
   - DOMAIN-SUFFIX,news-events.apple.com
-
 # > 健康 / 健身与 Apple Watch 服务（Health & Fitness）
-
   - DOMAIN-SUFFIX,health.apple.com
   - DOMAIN-SUFFIX,fitness.apple.com
   - DOMAIN-SUFFIX,activity.apple.com
-
 # > 教育服务（Education Services）
-
   - DOMAIN-SUFFIX,classroom.apple.com
   - DOMAIN-SUFFIX,school.apple.com
   - DOMAIN-SUFFIX,education.apple.com
-
 # > 已列入AdDomain.list明细:
-
 # DOMAIN-SUFFIX,api-adservices.apple.com # Apple 广告服务 API 接口（AdServices 平台，追踪归因用途）
 # DOMAIN-SUFFIX,iadsdk.apple.com # Apple 广告 SDK 服务域名（iAd 平台，已停用但可能残留请求）
 # DOMAIN-SUFFIX,iad.apple.com # Apple 广告平台主域（iAd，iOS 系统早期内置广告服务）
 # DOMAIN-SUFFIX,ca.iadsdk.apple.com # Apple iAd 广告 SDK 子域，用于广告归因/跟踪服务
-
 # > 已列入 BehaviorDomain.list明细:
-
 # DOMAIN-SUFFIX,analytics.edge.apple # Apple 分析数据上报服务
 # DOMAIN-SUFFIX,feedbackws.apple.com # 用户反馈与错误日志上报
 # DOMAIN-SUFFIX,crashlytics.apple.com # 应用崩溃日志收集服务
