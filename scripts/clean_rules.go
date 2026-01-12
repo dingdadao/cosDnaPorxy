@@ -12,7 +12,6 @@ import (
 )
 
 var (
-	// 要处理的规则文件列表
 	ruleFiles = []struct {
 		Name string
 		URL  string
@@ -21,33 +20,28 @@ var (
 		{"Apple", "https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/Apple.list"},
 		{"Telegram", "https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/Telegram.list"},
 		{"ChinaMedia", "https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/ChinaMedia.list"},
-		{"OpenAI", "https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/OpenAI.list"},
 	}
 
 	outputDir = "shell/rules"
 )
 
 func main() {
-	// 创建输出目录
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("创建输出目录失败: %v\n", err)
+		fmt.Printf("创建目录失败: %v\n", err)
 		return
 	}
 
 	for _, rf := range ruleFiles {
 		fmt.Printf("处理: %s ...\n", rf.Name)
 
-		// 下载文件内容
 		content, err := download(rf.URL)
 		if err != nil {
 			fmt.Printf("  下载失败: %v\n", err)
 			continue
 		}
 
-		// 清理并转换为 YAML
 		yamlContent := convertToYAML(content, rf.Name)
 
-		// 保存到文件
 		outputPath := filepath.Join(outputDir, rf.Name+".yaml")
 		if err := os.WriteFile(outputPath, []byte(yamlContent), 0644); err != nil {
 			fmt.Printf("  保存失败: %v\n", err)
@@ -57,9 +51,7 @@ func main() {
 		fmt.Printf("  已保存: %s\n", outputPath)
 	}
 
-	fmt.Println("\n全部转换完成！")
-	fmt.Printf("输出目录: %s\n", filepath.Join(".", outputDir))
-	fmt.Println("可在 Mihomo 中使用 type: file + format: yaml + behavior: classical")
+	fmt.Println("\n转换完成！使用 type: file + format: yaml + behavior: classical")
 }
 
 func download(url string) (string, error) {
@@ -69,7 +61,7 @@ func download(url string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
@@ -83,13 +75,13 @@ func download(url string) (string, error) {
 func convertToYAML(raw string, title string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("# %s.yaml - 从 Aegis 转换\n", title))
+	sb.WriteString(fmt.Sprintf("# %s.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）\n", title))
 	sb.WriteString(fmt.Sprintf("# 来源: %s\n", ruleFiles[findIndex(title)].URL))
-	sb.WriteString("# 转换时间: 自动生成\n\n")
+	sb.WriteString("# 转换时间: 自动\n\n")
 	sb.WriteString("payload:\n")
 
 	scanner := bufio.NewScanner(strings.NewReader(raw))
-	commentRe := regexp.MustCompile(`\s*#.*$`) // 匹配行尾注释
+	commentRe := regexp.MustCompile(`\s*#.*$`) // 移除行尾 #注释
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), " \t")
@@ -100,21 +92,39 @@ func convertToYAML(raw string, title string) string {
 		}
 
 		if strings.HasPrefix(line, "#") {
-			// 保留整行注释（YAML 注释用 #）
 			sb.WriteString(line + "\n")
 			continue
 		}
 
-		// 移除行尾注释
+		// 移除标准 #注释
 		cleaned := commentRe.ReplaceAllString(line, "")
-		cleaned = strings.TrimSpace(cleaned)
 
-		if cleaned == "" {
-			continue // 整行其实是注释但没以#开头，跳过
+		// 处理无 # 但有尾随文本（如空格 + 中文）
+		parts := regexp.MustCompile(`\s+`).Split(cleaned, -1)
+		rulePart := parts[0] // 取第一个部分（规则）
+
+		if !strings.Contains(rulePart, ",") {
+			continue // 无效行
 		}
 
-		// 输出为 YAML 列表项
-		sb.WriteString("  - " + cleaned + "\n")
+		typVal := strings.SplitN(rulePart, ",", 2)
+		if len(typVal) != 2 {
+			continue
+		}
+		ruleType := strings.TrimSpace(typVal[0])
+		value := strings.TrimSpace(typVal[1])
+
+		// 自动补全 CIDR mask
+		if (ruleType == "IP-CIDR" || ruleType == "IP-CIDR6") && !strings.Contains(value, "/") {
+			if ruleType == "IP-CIDR" {
+				value += "/32" // 单 IPv4 IP
+			} else {
+				value += "/128" // 单 IPv6 IP
+			}
+		}
+
+		// 输出有效规则
+		sb.WriteString(fmt.Sprintf("  - %s,%s\n", ruleType, value))
 	}
 
 	return sb.String()

@@ -1,6 +1,6 @@
-# ChinaMedia.yaml - 从 Aegis 转换
+# ChinaMedia.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/ChinaMedia.list
-# 转换时间: 自动生成
+# 转换时间: 自动
 
 payload:
 # > ChinaMedia.list（国内流媒体平台规则集）
@@ -48,32 +48,32 @@ payload:
   - DOMAIN-SUFFIX,sns-na-i3.xhscdn.com
   - DOMAIN-SUFFIX,sns-na-i2.xhscdn.com
   - DOMAIN-SUFFIX,sns-na-i1.xhscdn.com
-  - IP-CIDR,115.227.40.106
-  - IP-CIDR,222.73.33.13
-  - IP-CIDR,180.153.82.67
-  - IP-CIDR,61.170.100.69
-  - IP-CIDR,222.73.33.12
-  - IP-CIDR,222.73.33.15
-  - IP-CIDR,111.172.236.90
-  - IP-CIDR,61.170.100.67
-  - IP-CIDR,114.80.252.202
-  - IP-CIDR,222.73.33.9
-  - IP-CIDR,114.80.26.88
-  - IP-CIDR,61.170.100.68
-  - IP-CIDR,115.223.25.191
-  - IP-CIDR,114.80.252.212
-  - IP-CIDR,61.170.66.199
+  - IP-CIDR,115.227.40.106/32
+  - IP-CIDR,222.73.33.13/32
+  - IP-CIDR,180.153.82.67/32
+  - IP-CIDR,61.170.100.69/32
+  - IP-CIDR,222.73.33.12/32
+  - IP-CIDR,222.73.33.15/32
+  - IP-CIDR,111.172.236.90/32
+  - IP-CIDR,61.170.100.67/32
+  - IP-CIDR,114.80.252.202/32
+  - IP-CIDR,222.73.33.9/32
+  - IP-CIDR,114.80.26.88/32
+  - IP-CIDR,61.170.100.68/32
+  - IP-CIDR,115.223.25.191/32
+  - IP-CIDR,114.80.252.212/32
+  - IP-CIDR,61.170.66.199/32
   - IP-CIDR,47.97.192.58/32
-  - IP-CIDR,106.15.236.125
-  - IP-CIDR,1.13.111.166
-  - IP-CIDR,121.46.45.31
-  - IP-CIDR,222.73.33.11
-  - IP-CIDR,101.132.183.67
-  - IP-CIDR,140.249.108.28
-  - IP-CIDR,1.13.117.181
-  - IP-CIDR,117.88.123.99
-  - IP-CIDR,101.227.133.99
-  - IP-CIDR,61.170.100.65
+  - IP-CIDR,106.15.236.125/32
+  - IP-CIDR,1.13.111.166/32
+  - IP-CIDR,121.46.45.31/32
+  - IP-CIDR,222.73.33.11/32
+  - IP-CIDR,101.132.183.67/32
+  - IP-CIDR,140.249.108.28/32
+  - IP-CIDR,1.13.117.181/32
+  - IP-CIDR,117.88.123.99/32
+  - IP-CIDR,101.227.133.99/32
+  - IP-CIDR,61.170.100.65/32
 
 # > Bilibili 相关域名
 
@@ -113,8 +113,8 @@ payload:
   - DOMAIN-SUFFIX,upos-sz-mirrorzos.bilivideo.com
   - DOMAIN-SUFFIX,upos-sz-estgoss.bilivideo.com
   - DOMAIN-SUFFIX,upos-sz-mirroralib.bilivideo.com
-  - IP-CIDR,203.107.1.65
-  - IP-CIDR,61.170.65.76
+  - IP-CIDR,203.107.1.65/32
+  - IP-CIDR,61.170.65.76/32
 
 # > 视频平台
 

@@ -1,6 +1,6 @@
-# WeChat.yaml - 从 Aegis 转换
+# WeChat.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/WeChat.list
-# 转换时间: 自动生成
+# 转换时间: 自动
 
 payload:
 # > WeChat.list（微信相关域名规则集）
@@ -120,7 +120,7 @@ payload:
   - IP-CIDR,61.151.230.185/32
   - IP-CIDR,117.89.182.0/32
   - IP-CIDR,101.227.131.0/24
-  - IP-CIDR,61.151.230.226/32 微信 MMTLS 加密通信节点（江苏电信）
+  - IP-CIDR,61.151.230.226/32
   - IP-CIDR,1.13.36.127/32
   - IP-CIDR,1.13.36.122/32
   - IP-CIDR,117.89.176.0/24
