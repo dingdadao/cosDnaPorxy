@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,7 +28,7 @@ var (
 
 func main() {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("创建目录失败: %v\n", err)
+		fmt.Printf("创建输出目录失败: %v\n", err)
 		return
 	}
 
@@ -51,7 +52,8 @@ func main() {
 		fmt.Printf("  已保存: %s\n", outputPath)
 	}
 
-	fmt.Println("\n转换完成！使用 type: file + format: yaml + behavior: classical")
+	fmt.Println("\n全部转换完成！输出目录:", filepath.Join(".", outputDir))
+	fmt.Println("现在 IP-CIDR 规则已自动补 /32，不会再报 payloadRule error")
 }
 
 func download(url string) (string, error) {
@@ -60,11 +62,9 @@ func download(url string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -75,13 +75,14 @@ func download(url string) (string, error) {
 func convertToYAML(raw string, title string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("# %s.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）\n", title))
+	sb.WriteString(fmt.Sprintf("# %s.yaml - Aegis 转换版（自动补 IP-CIDR /32）\n", title))
 	sb.WriteString(fmt.Sprintf("# 来源: %s\n", ruleFiles[findIndex(title)].URL))
-	sb.WriteString("# 转换时间: 自动\n\n")
+	sb.WriteString("# 转换时间: 自动生成\n\n")
 	sb.WriteString("payload:\n")
 
 	scanner := bufio.NewScanner(strings.NewReader(raw))
-	commentRe := regexp.MustCompile(`\s*#.*$`) // 移除行尾 #注释
+	commentRe := regexp.MustCompile(`\s*#.*$`)                 // 移除行尾注释
+	ipCidrRe := regexp.MustCompile(`^IP-CIDR,([\d.]+)(/.*)?$`) // 匹配 IPv4 IP-CIDR
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), " \t")
@@ -96,35 +97,27 @@ func convertToYAML(raw string, title string) string {
 			continue
 		}
 
-		// 移除标准 #注释
+		// 移除行尾注释
 		cleaned := commentRe.ReplaceAllString(line, "")
+		cleaned = strings.TrimSpace(cleaned)
 
-		// 处理无 # 但有尾随文本（如空格 + 中文）
-		parts := regexp.MustCompile(`\s+`).Split(cleaned, -1)
-		rulePart := parts[0] // 取第一个部分（规则）
-
-		if !strings.Contains(rulePart, ",") {
-			continue // 无效行
-		}
-
-		typVal := strings.SplitN(rulePart, ",", 2)
-		if len(typVal) != 2 {
+		if cleaned == "" {
 			continue
 		}
-		ruleType := strings.TrimSpace(typVal[0])
-		value := strings.TrimSpace(typVal[1])
 
-		// 自动补全 CIDR mask
-		if (ruleType == "IP-CIDR" || ruleType == "IP-CIDR6") && !strings.Contains(value, "/") {
-			if ruleType == "IP-CIDR" {
-				value += "/32" // 单 IPv4 IP
-			} else {
-				value += "/128" // 单 IPv6 IP
+		// 自动补 /32 for IP-CIDR (IPv4)
+		if match := ipCidrRe.FindStringSubmatch(cleaned); match != nil {
+			ip := match[1]
+			cidr := match[2]
+			if cidr == "" {
+				// 验证是有效 IPv4
+				if net.ParseIP(ip) != nil {
+					cleaned = fmt.Sprintf("IP-CIDR,%s/32", ip)
+				}
 			}
 		}
 
-		// 输出有效规则
-		sb.WriteString(fmt.Sprintf("  - %s,%s\n", ruleType, value))
+		sb.WriteString("  - " + cleaned + "\n")
 	}
 
 	return sb.String()

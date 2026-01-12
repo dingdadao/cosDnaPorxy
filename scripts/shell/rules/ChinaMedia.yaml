@@ -1,6 +1,6 @@
-# ChinaMedia.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）
+# ChinaMedia.yaml - Aegis 转换版（自动补 IP-CIDR /32）
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/ChinaMedia.list
-# 转换时间: 自动
+# 转换时间: 自动生成
 
 payload:
 # > ChinaMedia.list（国内流媒体平台规则集）

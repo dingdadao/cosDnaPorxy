@@ -1,6 +1,6 @@
-# Telegram.yaml - Aegis 转换（修复 IP-CIDR / 尾随文本）
+# Telegram.yaml - Aegis 转换版（自动补 IP-CIDR /32）
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/Telegram.list
-# 转换时间: 自动
+# 转换时间: 自动生成
 
 payload:
 # > Telegram.list（Telegram 服务识别规则集）

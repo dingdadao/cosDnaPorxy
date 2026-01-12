@@ -1,4 +1,4 @@
-# Apple.yaml - 从 Aegis 转换
+# Apple.yaml - Aegis 转换版（自动补 IP-CIDR /32）
 # 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/Apple.list
 # 转换时间: 自动生成
 
@@ -69,8 +69,8 @@ payload:
   - DOMAIN-SUFFIX,musicstatus.itunes.apple.com
   - DOMAIN-SUFFIX,weather-edge.apple.com
   - DOMAIN-SUFFIX,ampaeservices.com
-  - IP-CIDR,17.253.86.211
-  - IP-CIDR,17.253.150.10
+  - IP-CIDR,17.253.86.211/32
+  - IP-CIDR,17.253.150.10/32
 
 # > Siri / Dictation / 智能语音
 
@@ -104,7 +104,7 @@ payload:
   - DOMAIN-SUFFIX,mail.icloud.com.cn
   - DOMAIN-SUFFIX,p212-imap.mail.icloud.com.cn
   - IP-CIDR,139.178.128.0/18
-  - IP-CIDR,17.252.203.148
+  - IP-CIDR,17.252.203.148/32
 
 # > App Store / 内容分发与媒体（App Store & Media）
 
@@ -213,7 +213,7 @@ payload:
   - DOMAIN-SUFFIX,updates.cdn-apple.com
   - DOMAIN-SUFFIX,cdn-apple.com
   - DOMAIN-SUFFIX,cdsassets.apple.com
-  - IP-CIDR,151.101.3.8
+  - IP-CIDR,151.101.3.8/32
   - IP-CIDR,17.248.0.0/16
   - IP-CIDR,144.178.0.0/19
   - IP-CIDR,144.178.36.0/22
@@ -221,9 +221,9 @@ payload:
   - IP-CIDR,192.35.50.0/24
   - IP-CIDR,198.183.17.0/24
   - IP-CIDR,205.180.175.0/24
-  - IP-CIDR,104.83.196.219
-  - IP-CIDR,23.220.75.249
-  - IP-CIDR,59.82.43.60
+  - IP-CIDR,104.83.196.219/32
+  - IP-CIDR,23.220.75.249/32
+  - IP-CIDR,59.82.43.60/32
 
 # > 地图与定位服务（Maps & Location）
 
