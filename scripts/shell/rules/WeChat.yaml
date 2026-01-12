@@ -1,0 +1,126 @@
+# WeChat.yaml - 从 Aegis 转换
+# 来源: https://raw.githubusercontent.com/Thoseyearsbrian/Aegis/refs/heads/main/rules/WeChat.list
+# 转换时间: 自动生成
+
+payload:
+# > WeChat.list（微信相关域名规则集）
+# - 分类：即时通信平台 / 加密通讯服务 / 策略分流用途
+# - 来源：微信客户端抓包分析 / 实机通信日志 / 安全社区研究报告
+# - 特征：识别微信主域名、通信节点、功能接口与遥测通道，覆盖核心服务、SDK 回传、小程序行为及长连接机制
+# - 说明：微信域名结构庞大，通信行为复杂，部分服务采用自研加密协议 mmtls（区别于标准 HTTPS），具有规避检测与指纹识别的特征。因此本规则集单独列出，便于持续追踪、行为识别与分类更新。
+# - 用途：本规则集用于防御性安全研究，禁止用于任何非法用途
+# - 维护：https://github.com/Thoseyearsbrian/Aegis
+# - 更新时间：2026-01-12
+
+# > 核心通信服务（Core Communication）
+
+  - DOMAIN-SUFFIX,weixin.qq.com
+  - DOMAIN-SUFFIX,connect.wechat.com
+  - DOMAIN-SUFFIX,routerlong.weixin.qq.com
+  - DOMAIN-SUFFIX,notifylong.weixin.qq.com
+  - DOMAIN-SUFFIX,es.wx.qq.com
+  - DOMAIN-SUFFIX,add-pcdnwxlogin.teg.tencent-cloud.net
+  - DOMAIN-SUFFIX,sglong.weixin.qq.com
+  - DOMAIN-SUFFIX,frlong.weixin.qq.com
+  - DOMAIN-SUFFIX,dns.weixin.qq.com.cn
+  - DOMAIN-SUFFIX,paydns.wechatpay.cn
+  - DOMAIN-SUFFIX,wxsmw.wxs.qq.com
+  - DOMAIN-SUFFIX,res.servicewechat.com
+  - DOMAIN-SUFFIX,launchwxacode.wxqcloud.qq.com.cn
+  - DOMAIN-SUFFIX,mp.weixin.qq.com
+  - DOMAIN-SUFFIX,dldir1v6.qq.com
+  - DOMAIN-SUFFIX,res.wx.qq.com
+  - DOMAIN-SUFFIX,gtimg.wechatpay.cn
+  - DOMAIN-SUFFIX,wxaintpcos.wxqcloud.qq.com.cn
+  - DOMAIN-SUFFIX,dldir1.qq.com
+  - DOMAIN-SUFFIX,tenpay.wechatpay.cn
+  - DOMAIN-SUFFIX,wx.gtimg.com
+  - DOMAIN-SUFFIX,prewxacode.wxqcloud.qq.com.cn
+  - DOMAIN-SUFFIX,wxapp.tc.qq.com
+  - DOMAIN-SUFFIX,marscdnbypass-wxapp.tc.qq.com
+  - DOMAIN-SUFFIX,wx.qlogo.cn
+  - DOMAIN-SUFFIX,cmmsns.qpic.cn
+  - DOMAIN-SUFFIX,wechatpay.cn
+
+# > 多媒体与文件传输（Media & File Transfer）
+
+  - DOMAIN-SUFFIX,mmcdn.qpic.cn
+  - DOMAIN-SUFFIX,mmchatpic.qpic.cn
+  - DOMAIN-SUFFIX,vd.qq.com
+  - DOMAIN-SUFFIX,video.store.qq.com
+  - DOMAIN-SUFFIX,audio.chat.qq.com
+  - DOMAIN-SUFFIX,dl.stream.qqmusic.qq.com
+  - DOMAIN-SUFFIX,dl.music.qq.com
+  - DOMAIN-SUFFIX,cdn-wechat.com
+  - DOMAIN-SUFFIX,staticwechat.com
+  - DOMAIN-SUFFIX,cdnwechat.net
+
+# > 微信 PC / Web（WeChat Desktop & Web）
+
+  - DOMAIN-SUFFIX,login.weixin.qq.com
+  - DOMAIN-SUFFIX,passport.wechat.com
+  - DOMAIN-SUFFIX,support.wechat.com
+  - DOMAIN-SUFFIX,filehelper.weixin.qq.com
+  - DOMAIN-SUFFIX,update.wechat.com
+  - DOMAIN-SUFFIX,dl.wechat.com
+  - DOMAIN-SUFFIX,wework.qpic.cn
+
+# > 微信 SDK 接口（WeChat SDKs & Tracking）
+
+  - DOMAIN-SUFFIX,isdspeed.qq.com
+  - DOMAIN-SUFFIX,support.weixin.qq.com
+
+# > 微信安全与链接防护（Security & Safe Browsing）
+
+  - DOMAIN-SUFFIX,safebrowsing.urlsec.qq.com
+
+# > 微信图片与消息资源 CDN
+
+  - IP-CIDR,222.186.181.0/24
+  - IP-CIDR,222.79.113.0/24
+  - IP-CIDR,115.231.229.0/24
+  - IP-CIDR,223.247.65.0/24
+
+# > 微信小程序运行时与静态资源 CDN
+
+  - IP-CIDR,61.170.59.0/24
+  - IP-CIDR,61.170.65.0/24
+  - IP-CIDR,117.68.71.0/24
+  - IP-CIDR,61.170.64.0/24
+  - IP-CIDR,183.131.58.0/24
+  - IP-CIDR,116.31.98.0/24
+  - IP-CIDR,60.165.67.0/24
+  - IP-CIDR,111.172.209.0/24
+  - IP-CIDR,116.31.64.0/24
+  - IP-CIDR,14.17.85.0/24
+  - IP-CIDR,61.170.73.30/24
+
+# > 微信客户端与资源下载 CDN（中国电信 / 联通 / 移动）
+
+  - IP-CIDR,180.153.82.0/24
+  - IP-CIDR,114.80.149.0/24
+  - IP-CIDR,117.68.18.0/24
+  - IP-CIDR,117.68.26.0/24
+
+# > 核心通信与长连接（MMTLS / QUIC）
+
+  - IP-CIDR,101.226.142.218/32
+  - IP-CIDR,101.226.153.110/32
+  - IP-CIDR,101.91.34.241/32
+  - IP-CIDR,101.91.33.235/32
+  - IP-CIDR,106.39.206.70/32
+  - IP-CIDR,106.39.206.21/32
+  - IP-CIDR,180.111.196.239/32
+  - IP-CIDR,101.226.137.107/32
+  - IP-CIDR,101.226.144.240/32
+  - IP-CIDR,101.227.132.63/32
+  - IP-CIDR,180.101.242.212/32
+  - IP-CIDR,180.101.242.186/32
+  - IP-CIDR,180.101.242.227/32
+  - IP-CIDR,61.151.230.185/32
+  - IP-CIDR,117.89.182.0/32
+  - IP-CIDR,101.227.131.0/24
+  - IP-CIDR,61.151.230.226/32 微信 MMTLS 加密通信节点（江苏电信）
+  - IP-CIDR,1.13.36.127/32
+  - IP-CIDR,1.13.36.122/32
+  - IP-CIDR,117.89.176.0/24
