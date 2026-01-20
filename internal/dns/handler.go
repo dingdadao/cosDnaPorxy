@@ -200,14 +200,307 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 
-		// 只处理A和AAAA记录
+		// 目前重点处理A和AAAA记录（IP地址记录）
+		// 其他记录类型（如NS、MX等）也会被处理，但不经过云服务检测优化
 		if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
-			continue
+			// 对于非A/AAAA记录，仍然进行查询，但跳过云服务检测和替换逻辑
+			h.processNonIPQuery(w, req, domain, q.Qtype)
+			return // 处理完后返回
 		}
 
 		h.processQuery(w, req, domain, q.Qtype)
 		return // 只处理第一个有效问题
 	}
+}
+
+// processNonIPQuery 处理非IP记录类型的DNS查询（如NS、MX、TXT等）
+func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
+	// 非IP记录类型直接查询上游DNS服务器，不经过云服务检测和替换逻辑
+	// 但仍经过缓存处理
+
+	// 1. 检查缓存
+	resp, hit, _, _ := h.cacheManager.Get(domain, qtype)
+	if hit {
+		respCopy := resp.Copy()
+		h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+		respCopy.Id = req.Id
+		w.WriteMsg(respCopy)
+
+		h.Logger.Info("✅ [DNS查询完成-非IP记录-缓存命中] ", map[string]interface{}{
+			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"client_addr":  w.RemoteAddr().String(),
+			"source":       "cache_non_ip",
+			"answer_count": len(respCopy.Answer),
+			"result":       "success",
+		})
+		return
+	}
+
+	// 2. 确定上游服务器
+	upstreams := h.determineUpstreamsForDomain(domain)
+
+	// 3. 执行查询（不经过云服务检测和替换逻辑）
+	resp, err := h.proxyQuery(req, upstreams)
+	if err != nil || resp == nil {
+		h.Logger.Error("❌ [非IP记录查询失败] ", map[string]interface{}{
+			"domain":      domain,
+			"qtype":       dns.TypeToString[qtype],
+			"client_addr": w.RemoteAddr().String(),
+			"error":       err,
+		})
+		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+		return
+	}
+
+	// 4. 处理响应 - 特别处理CNAME记录
+	respCopy := resp.Copy()
+	processedResp := h.processNonIPResponseWithCNAME(respCopy, domain, qtype, upstreams)
+
+	// 5. 验证响应是否有效
+	mockResult := &ConcurrentQueryResult{
+		FastestResult: &QueryResult{
+			Response: processedResp,
+			Error:    nil,
+		},
+	}
+
+	if h.IsValidNonIPDNSResult(mockResult) {
+		h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+		// 6. 缓存结果
+		h.cacheManager.Set(domain, qtype, processedResp, false)
+
+		// 7. 返回响应
+		processedResp.Id = req.Id
+		w.WriteMsg(processedResp)
+
+		h.Logger.Info("✅ [DNS查询完成-非IP记录] ", map[string]interface{}{
+			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"client_addr":  w.RemoteAddr().String(),
+			"source":       "non_ip",
+			"answer_count": len(processedResp.Answer),
+			"auth_count":   len(processedResp.Ns),
+			"extra_count":  len(processedResp.Extra),
+			"rcode":        dns.RcodeToString[processedResp.Rcode],
+			"result":       "success",
+		})
+	} else {
+		h.Logger.Error("❌ [非IP记录响应无效] ", map[string]interface{}{
+			"domain":      domain,
+			"qtype":       dns.TypeToString[qtype],
+			"client_addr": w.RemoteAddr().String(),
+			"rcode":       dns.RcodeToString[processedResp.Rcode],
+		})
+		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+		return
+	}
+}
+
+// processNonIPResponseWithCNAME 处理非IP记录类型的DNS响应中的CNAME记录
+func (h *RefactoredHandler) processNonIPResponseWithCNAME(resp *dns.Msg, domain string, qtype uint16, upstreams []string) *dns.Msg {
+	if resp == nil {
+		return resp
+	}
+
+	// 检查响应中是否包含CNAME记录
+	var cnames []*dns.CNAME
+	var otherRecords []dns.RR
+
+	for _, rr := range resp.Answer {
+		if cname, ok := rr.(*dns.CNAME); ok {
+			cnames = append(cnames, cname)
+		} else {
+			// 保存其他类型的记录
+			otherRecords = append(otherRecords, rr)
+		}
+	}
+
+	// 如果没有CNAME记录，直接返回原响应，但保留AUTHORITY和ADDITIONAL部分
+	if len(cnames) == 0 {
+		// 确保域名正确设置
+		result := resp.Copy()
+		// 修改问题节中的域名
+		for i := range result.Question {
+			result.Question[i].Name = dns.Fqdn(domain)
+		}
+		// 修改答案节中的域名
+		for i := range result.Answer {
+			result.Answer[i].Header().Name = dns.Fqdn(domain)
+		}
+		// 修改权威节中的域名
+		for i := range result.Ns {
+			result.Ns[i].Header().Name = dns.Fqdn(domain)
+		}
+		// 修改附加节中的域名
+		for i := range result.Extra {
+			result.Extra[i].Header().Name = dns.Fqdn(domain)
+		}
+		return result
+	}
+
+	h.Logger.Debug("🔍 检测到CNAME记录，处理非IP查询", map[string]interface{}{
+		"domain":      domain,
+		"qtype":       dns.TypeToString[qtype],
+		"cname_count": len(cnames),
+	})
+
+	// 对于非IP记录查询，如果原始查询类型不是A/AAAA，我们需要递归查询CNAME指向的目标
+	// 以获取所需的记录类型
+	for _, cname := range cnames {
+		h.Logger.Debug("🔄 递归查询CNAME目标", map[string]interface{}{
+			"domain": domain,
+			"target": cname.Target,
+			"qtype":  dns.TypeToString[qtype],
+		})
+
+		// 创建对CNAME目标的新查询
+		cnameTargetReq := &dns.Msg{}
+		cnameTargetReq.SetQuestion(cname.Target, qtype)
+		cnameTargetReq.Id = resp.Id // 保持请求ID一致
+
+		// 查询CNAME目标的相同记录类型
+		cnameTargetResp, err := h.proxyQuery(cnameTargetReq, upstreams)
+		if err == nil && cnameTargetResp != nil {
+			// 无论CNAME目标是否有答案记录，我们都应该处理其权威和附加部分
+			// 复制响应但使用原始域名
+			result := &dns.Msg{}
+			*result = *resp            // 复制原始响应结构
+			result.Answer = []dns.RR{} // 清空答案部分
+
+			// 添加原始的CNAME记录
+			for _, origRR := range resp.Answer {
+				if origCNAME, ok := origRR.(*dns.CNAME); ok {
+					newCnameRecord := &dns.CNAME{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: dns.TypeCNAME,
+							Class:  origCNAME.Header().Class,
+							Ttl:    origCNAME.Header().Ttl,
+						},
+						Target: origCNAME.Target,
+					}
+					result.Answer = append(result.Answer, newCnameRecord)
+				}
+			}
+
+			// 如果CNAME目标有答案记录，添加它们（修改为原始域名）
+			for _, targetRR := range cnameTargetResp.Answer {
+				switch record := targetRR.(type) {
+				case *dns.A:
+					newRecord := &dns.A{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: record.Header().Rrtype,
+							Class:  record.Header().Class,
+							Ttl:    record.Header().Ttl,
+						},
+						A: record.A,
+					}
+					result.Answer = append(result.Answer, newRecord)
+				case *dns.AAAA:
+					newRecord := &dns.AAAA{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: record.Header().Rrtype,
+							Class:  record.Header().Class,
+							Ttl:    record.Header().Ttl,
+						},
+						AAAA: record.AAAA,
+					}
+					result.Answer = append(result.Answer, newRecord)
+				case *dns.TXT:
+					newRecord := &dns.TXT{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: record.Header().Rrtype,
+							Class:  record.Header().Class,
+							Ttl:    record.Header().Ttl,
+						},
+						Txt: record.Txt,
+					}
+					result.Answer = append(result.Answer, newRecord)
+				case *dns.MX:
+					newRecord := &dns.MX{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: record.Header().Rrtype,
+							Class:  record.Header().Class,
+							Ttl:    record.Header().Ttl,
+						},
+						Preference: record.Preference,
+						Mx:         record.Mx,
+					}
+					result.Answer = append(result.Answer, newRecord)
+				case *dns.NS:
+					newRecord := &dns.NS{
+						Hdr: dns.RR_Header{
+							Name:   dns.Fqdn(domain),
+							Rrtype: record.Header().Rrtype,
+							Class:  record.Header().Class,
+							Ttl:    record.Header().Ttl,
+						},
+						Ns: record.Ns,
+					}
+					result.Answer = append(result.Answer, newRecord)
+				default:
+					// 对于其他类型，复制并修改域名
+					newRecord := dns.Copy(targetRR)
+					if newRecord != nil {
+						newRecord.Header().Name = dns.Fqdn(domain)
+						result.Answer = append(result.Answer, newRecord)
+					}
+				}
+			}
+
+			// 保留CNAME目标响应的权威部分和附加部分（这是关键的修复）
+			result.Ns = []dns.RR{} // 清空权威部分重新填充
+			for _, nsRR := range cnameTargetResp.Ns {
+				newNsRecord := dns.Copy(nsRR)
+				if newNsRecord != nil {
+					newNsRecord.Header().Name = dns.Fqdn(domain)
+					result.Ns = append(result.Ns, newNsRecord)
+				}
+			}
+			result.Extra = []dns.RR{} // 清空附加部分重新填充
+			for _, extraRR := range cnameTargetResp.Extra {
+				newExtraRecord := dns.Copy(extraRR)
+				if newExtraRecord != nil {
+					newExtraRecord.Header().Name = dns.Fqdn(domain)
+					result.Extra = append(result.Extra, newExtraRecord)
+				}
+			}
+
+			return result
+		} else {
+			h.Logger.Debug("❌ CNAME目标查询失败", map[string]interface{}{
+				"domain": domain,
+				"target": cname.Target,
+				"qtype":  dns.TypeToString[qtype],
+				"error":  err,
+			})
+		}
+	}
+
+	// 如果CNAME处理失败，返回原始响应，但保留AUTHORITY和ADDITIONAL部分
+	result := resp.Copy()
+	// 修改问题节中的域名
+	for i := range result.Question {
+		result.Question[i].Name = dns.Fqdn(domain)
+	}
+	// 修改答案节中的域名
+	for i := range result.Answer {
+		result.Answer[i].Header().Name = dns.Fqdn(domain)
+	}
+	// 修改权威节中的域名
+	for i := range result.Ns {
+		result.Ns[i].Header().Name = dns.Fqdn(domain)
+	}
+	// 修改附加节中的域名
+	for i := range result.Extra {
+		result.Extra[i].Header().Name = dns.Fqdn(domain)
+	}
+	return result
 }
 
 // processQuery 处理单个DNS查询
