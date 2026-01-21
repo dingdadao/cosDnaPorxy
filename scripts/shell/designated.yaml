@@ -99,6 +99,7 @@ payload:
   - "DOMAIN-SUFFIX,xunlei.com,udp://58.20.127.170"
   - "DOMAIN-SUFFIX,icloud-content.com.cn,default_dns"
   - "DOMAIN-SUFFIX,myqcloud.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,gitv.tv,udp://58.20.127.170"
   - "DOMAIN-SUFFIX,qiniudns.com,udp://58.20.127.170"
   - "DOMAIN-SUFFIX,bcelive.com,default_dns"
   - "DOMAIN-SUFFIX,ctdns.cn,udp://58.20.127.170"
@@ -109,3 +110,4 @@ payload:
   - "DOMAIN-SUFFIX,dnsv1.com,default_dns"
   - "DOMAIN-SUFFIX,bvfcdn.com,default_dns"
   - "DOMAIN-SUFFIX,doh.pub,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,xiaomi.com,udp://58.20.127.170"
