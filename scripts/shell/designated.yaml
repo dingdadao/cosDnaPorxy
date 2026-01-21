@@ -111,3 +111,4 @@ payload:
   - "DOMAIN-SUFFIX,bvfcdn.com,default_dns"
   - "DOMAIN-SUFFIX,doh.pub,udp://58.20.127.170"
   - "DOMAIN-SUFFIX,xiaomi.com,udp://58.20.127.170"
+  - "DOMAIN-KEYWORD,teiron-inc,udp://58.20.127.170"
