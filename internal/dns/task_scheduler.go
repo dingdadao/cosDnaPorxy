@@ -49,13 +49,35 @@ func (ts *TaskScheduler) StartBackgroundTasks() {
 		}
 
 		// 中国域名刷新任务
-		if ts.config.ChinaDomainFile != "" && ts.config.ChinaDomainRefreshInterval > 0 {
+		if ts.config.EnableChinaDomainCheck && ts.config.ChinaDomainFile != "" && ts.config.ChinaDomainRefreshInterval > 0 {
+			ts.logger.Info("🔄 [中国域名定时刷新启动] ", map[string]interface{}{
+				"rule":     "CHINA_DOMAIN_REFRESH_TASK",
+				"interval": ts.config.ChinaDomainRefreshInterval.String(),
+				"enabled":  ts.config.EnableChinaDomainCheck,
+			})
 			go ts.ChinaDomainRefreshTask()
+		} else {
+			ts.logger.Info("⏭️ [中国域名定时刷新已禁用] ", map[string]interface{}{
+				"rule":    "CHINA_DOMAIN_REFRESH_SKIPPED",
+				"enabled": ts.config.EnableChinaDomainCheck,
+			})
 		}
 
-		// 网络段刷新任务
-		if ts.config.NetworkRefreshInterval > 0 {
+		// 网络段刷新任务（仅在启用云服务检查时启动）
+		if (ts.config.EnableCloudflareCheck || ts.config.EnableAWSCheck) && ts.config.NetworkRefreshInterval > 0 {
+			ts.logger.Info("🔄 [网络段定时刷新启动] ", map[string]interface{}{
+				"rule":       "NETWORK_REFRESH_TASK",
+				"interval":   ts.config.NetworkRefreshInterval.String(),
+				"enable_cf":  ts.config.EnableCloudflareCheck,
+				"enable_aws": ts.config.EnableAWSCheck,
+			})
 			go ts.NetworkRefreshTask()
+		} else {
+			ts.logger.Info("⏭️ [网络段定时刷新已禁用] ", map[string]interface{}{
+				"rule":       "NETWORK_REFRESH_SKIPPED",
+				"enable_cf":  ts.config.EnableCloudflareCheck,
+				"enable_aws": ts.config.EnableAWSCheck,
+			})
 		}
 	}()
 }
@@ -77,7 +99,7 @@ func (ts *TaskScheduler) DesignatedRefreshTask() {
 				"file": ts.config.DesignatedDomain,
 				"url":  ts.config.DesignatedDomainURL,
 			})
-			if err := ts.fileLoader.LoadDesignatedDomains(); err != nil { // 使用fileLoader的LoadDesignatedDomains方法，确保下载失败时保留旧文件
+			if err := ts.fileLoader.ForceDownloadAndReloadDesignatedDomains(); err != nil {
 				ts.logger.Error("❌ [定向域名刷新失败] ", map[string]interface{}{
 					"rule":  "DESIGNATED_REFRESH_FAILED",
 					"error": err.Error(),
@@ -113,7 +135,7 @@ func (ts *TaskScheduler) ChinaDomainRefreshTask() {
 				"file": ts.config.ChinaDomainFile,
 				"url":  ts.config.ChinaDomainFileURL,
 			})
-			if err := ts.fileLoader.LoadChinaDomains(); err != nil {
+			if err := ts.fileLoader.ForceDownloadAndReloadChinaDomains(); err != nil {
 				ts.logger.Error("❌ [中国域名刷新失败] ", map[string]interface{}{
 					"rule":  "CHINA_DOMAIN_REFRESH_FAILED",
 					"error": err.Error(),
@@ -145,15 +167,26 @@ func (ts *TaskScheduler) NetworkRefreshTask() {
 	for {
 		select {
 		case <-ticker.C:
+			// 根据开关决定传递哪些文件路径
+			cfFile4 := ""
+			cfFile6 := ""
+			awsFile := ""
+			if ts.config.EnableCloudflareCheck {
+				cfFile4 = ts.config.CloudflareNetFile
+				cfFile6 = ts.config.CloudflareNetFile6
+			}
+			if ts.config.EnableAWSCheck {
+				awsFile = ts.config.AWSNetFile
+			}
 			ts.logger.Debug("开始定时网络段刷新", map[string]interface{}{
-				"cloudflare_v4": ts.config.CloudflareNetFile,
-				"cloudflare_v6": ts.config.CloudflareNetFile6,
-				"aws_file":      ts.config.AWSNetFile,
+				"cloudflare_v4": cfFile4,
+				"cloudflare_v6": cfFile6,
+				"aws_file":      awsFile,
 			})
 			if err := ts.cloudDetector.LoadNetworkRanges(
-				ts.config.CloudflareNetFile,
-				ts.config.CloudflareNetFile6,
-				ts.config.AWSNetFile,
+				cfFile4,
+				cfFile6,
+				awsFile,
 			); err != nil {
 				ts.logger.Error("❌ [网络段刷新失败] ", map[string]interface{}{
 					"rule":  "NETWORK_REFRESH_FAILED",

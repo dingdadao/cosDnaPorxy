@@ -11,115 +11,104 @@ payload:
   # ===========================================
   # 常用域名配置（原白名单合并）
   # ===========================================
-  # 微软 Bing 相关 (支持多种匹配模式)
-  - "DOMAIN-KEYWORD,bing,default_dns" # 关键字匹配：匹配任何包含 bing 的域名
-  - "DOMAIN-SUFFIX,bing.cn,default_dns"
-  # 个人域名
+  # 微软 Bing 相关（关键字匹配：覆盖所有含 bing 的域名）
+  - "DOMAIN-KEYWORD,bing,default_dns"
+
+  # 个人域名（DOMAIN-SUFFIX 覆盖子域名，无需单独配置 fn/qh 子域）
   - "DOMAIN-SUFFIX,niao.fun,default_dns"
-  - "DOMAIN,fn.niao.fun,default_dns"
-  - "DOMAIN,qh.niao.fun,default_dns"
   - "DOMAIN-SUFFIX,dension.dpdns.org,default_dns"
+
   # Cloudflare 中国相关
   - "DOMAIN-SUFFIX,cloudflare-cn.com,default_dns"
 
-  # 个人 CDN 域名
-  - "DOMAIN-SUFFIX,cloudfront.182682.xyz,default_dns"
-  - "DOMAIN-SUFFIX,cloudflare.182682.xyz,default_dns"
-  - "DOMAIN-SUFFIX,xingpingcn.top,default_dns"
-  - "DOMAIN,cf.877774.xyz,default_dns"
-
-  # Synology 相关
+  # Synology 群晖 + 微软 + 百度相关
   - "DOMAIN-SUFFIX,synology.com,default_dns"
   - "DOMAIN-SUFFIX,synology.cn,default_dns"
   - "DOMAIN-SUFFIX,synologydownload.com,default_dns"
+  - "DOMAIN-SUFFIX,microsoft.com,default_dns"
   - "DOMAIN-SUFFIX,microsoftonline.com,default_dns"
   - "DOMAIN-SUFFIX,imnks.com,default_dns"
-  - "DOMAIN-SUFFIX,microsoft.com,default_dns"
   - "DOMAIN-SUFFIX,baidubce.com,default_dns"
-  # 云服务替换域名（这些域名不应该被检测为云服务）
-  - "DOMAIN,cf-cname.xingpingcn.top,udp://10.0.0.1:1053"
-  - "DOMAIN,cc.cloudfront.182682.xyz,udp://10.0.0.1:1053"
-
-  # ===========================================
-  # 局域网域名 - 使用本地DNS服务器（最高优先级）
-  # ===========================================
-  - "DOMAIN-SUFFIX,lan,udp://10.0.0.1:53"
-  - "DOMAIN-SUFFIX,local,udp://10.0.0.1:53"
-  - "DOMAIN-SUFFIX,home,udp://10.0.0.1:53"
-  - "DOMAIN-SUFFIX,corp,udp://10.0.0.1:53"
-  - "DOMAIN-SUFFIX,intranet,udp://10.0.0.1:53"
-
-  # ===========================================
-  # 海外服务 - 使用海外DNS服务器
-  # ===========================================
-  # Twitter/X 相关域名
-  - "DOMAIN-SUFFIX,twitter.com,https://dns.google/dns-query"
-  - "DOMAIN-SUFFIX,twimg.com,https://dns.google/dns-query"
-  - "DOMAIN-SUFFIX,twtrdns.com,https://dns.google/dns-query"
-  - "DOMAIN-SUFFIX,t.com,https://dns.google/dns-query"
-  - "DOMAIN-SUFFIX,x.com,https://dns.google/dns-query"
-
-  # 苹果服务相关域名
-  - "DOMAIN-SUFFIX,apple.com,default_dns"
-  - "DOMAIN-SUFFIX,icloud.com,default_dns"
-  - "DOMAIN-SUFFIX,mzstatic.com,default_dns"
-  - "DOMAIN-SUFFIX,push.apple.com,default_dns"
-  - "DOMAIN,apple.com,default_dns"
-  - "DOMAIN,icloud.com,default_dns"
-  - "DOMAIN,itunes.com,default_dns"
-  - "DOMAIN,appstore.com,default_dns"
-  - "DOMAIN,me.com,default_dns"
-  - "DOMAIN,mac.com,default_dns"
-  - "DOMAIN,appleid.cdn-apple.com,default_dns"
-  - "DOMAIN,apple-mapkit.com,default_dns"
-  - "DOMAIN,apple-cloudkit.com,default_dns"
-  - "DOMAIN,apple-dns.net,default_dns"
-  - "DOMAIN,apple-pay.com,default_dns"
-  - "DOMAIN,gateway.icloud.com.cn,default_dns"
-  - "DOMAIN-SUFFIX,push.apple.com,default_dns"
-  - "DOMAIN-SUFFIX,push-apple.com,default_dns"
-
   # ===========================================
   # 示例：国内常用域名可以加入此处
   # ===========================================
   # 百度系服务
-  - "DOMAIN-KEYWORD,baidu,udp://180.76.76.76:53"
 
   # 特斯拉相关域名
-  - "DOMAIN,tesla.cn,default_dns"
+  # 特斯拉相关域名（优化去重）
   - "DOMAIN-SUFFIX,tesla.cn,default_dns"
-  - "DOMAIN,teslamotors.com,default_dns"
   - "DOMAIN-SUFFIX,teslamotors.com,default_dns"
-  - "DOMAIN,mytesla.com,default_dns"
+  - "DOMAIN-SUFFIX,mytesla.com,default_dns"
   - "DOMAIN-SUFFIX,akadns.net,default_dns"
   - "DOMAIN-SUFFIX,tl88.net,default_dns"
   - "DOMAIN-SUFFIX,akamaiedge.net,default_dns"
   - "DOMAIN-SUFFIX,cloudinary.com,default_dns"
   - "DOMAIN-SUFFIX,edgekey.net,default_dns"
-  - "DOMAIN,tesla.com,default_dns"
   - "DOMAIN-SUFFIX,tesla.com,default_dns"
 
-  - "DOMAIN,vpn.niao.fun,default_dns"
+  # 阿里DNS 223.5.5.5（仅阿里系DNS相关域名）
+  - "DOMAIN-SUFFIX,alidns.com,udp://223.5.5.5"
+  - "DOMAIN-SUFFIX,alibabadns.com,udp://223.5.5.5"
 
-  - "DOMAIN-SUFFIX,cdn77.org,default_dns"
-  - "DOMAIN-SUFFIX,btc760.com,default_dns"
-  # 微信服务相关域名
-  - "DOMAIN-SUFFIX,qq.com,default_dns"
-  - "DOMAIN-SUFFIX,weixin.qq.com,default_dns"
-  - "DOMAIN-SUFFIX,wechat.com,default_dns"
-  - "DOMAIN-SUFFIX,qpic.cn,default_dns"
-  - "DOMAIN-SUFFIX,servicewechat.com,default_dns"
-  - "DOMAIN-SUFFIX,weixinbridge.com,default_dns"
-  - "DOMAIN-SUFFIX,tencent-cloud.net,default_dns"
-  - "DOMAIN-SUFFIX,gdtimg.com,default_dns"
-  - "DOMAIN-SUFFIX,qqmusic.qq.com,default_dns"
-  - "DOMAIN-SUFFIX,urlsec.qq.com,default_dns"
-  - "DOMAIN,weixin.qq.com,default_dns"
-  - "DOMAIN,mp.weixin.qq.com,default_dns"
-  - "DOMAIN,connect.wechat.com,default_dns"
-  - "DOMAIN,dns.weixin.qq.com.cn,default_dns"
-  - "DOMAIN,paydns.wechatpay.cn,default_dns"
-  - "DOMAIN,cdn-wechat.com,default_dns"
-  - "DOMAIN,staticwechat.com,default_dns"
-  - "DOMAIN,cdnwechat.net,default_dns"
-  - "DOMAIN,wework.qpic.cn,default_dns"
+  # 腾讯DNS 119.29.29.29（对应 default_dns）
+  - "DOMAIN-SUFFIX,5gweilaixilie.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,baidu.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,niao.fun,default_dns"
+  - "DOMAIN-SUFFIX,baidupcs.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,apple.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,icloud.com.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,aaplimg.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,akadns.net,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,icloud.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,rj.link,default_dns"
+  - "DOMAIN-SUFFIX,baidubce.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,qtlcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,apple-dns.net,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,iqiyi.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,torrent.eu.org,default_dns"
+  - "DOMAIN-SUFFIX,apple-dns.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,ksyuncdn.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,sovcloud.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,shifen.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,qy.net,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,bytefcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,outlook.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,douyincdn.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,ks-cdn.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,wxqcloud.qq.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,tdnsv5.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,qq.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,jomodns.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,volcfcdndvs.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,sandai.net,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,cdnhwc2.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,qlivecdn.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,douyinliving.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,cdngslb.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,wsdvs.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,wps.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,tdnslive1.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,netease.com,default_dns"
+  - "DOMAIN-SUFFIX,cdnhwc3.com,default_dns"
+  - "DOMAIN-SUFFIX,dcloudlive.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,bdydns.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,wpsdns.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,tcdnlive.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,queniucf.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,tdnsv6.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,xunlei.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,icloud-content.com.cn,default_dns"
+  - "DOMAIN-SUFFIX,myqcloud.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,gitv.tv,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,qiniudns.com,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,bcelive.com,default_dns"
+  - "DOMAIN-SUFFIX,ctdns.cn,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,chinamobile.com,default_dns"
+  - "DOMAIN-SUFFIX,alikunlun.net,default_dns"
+  - "DOMAIN-SUFFIX,queniuiq.com,default_dns"
+  - "DOMAIN-SUFFIX,amemv.com,default_dns"
+  - "DOMAIN-SUFFIX,dnsv1.com,default_dns"
+  - "DOMAIN-SUFFIX,bvfcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,doh.pub,udp://58.20.127.170"
+  - "DOMAIN-SUFFIX,xiaomi.com,udp://58.20.127.170"
+  - "DOMAIN-KEYWORD,teiron-inc,udp://58.20.127.170"

@@ -1,11 +1,13 @@
 package dns
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 // CacheEntry 缓存条目
@@ -21,18 +23,20 @@ type CacheEntry struct {
 
 // OptimizedDNSCache 优化的DNS缓存系统
 type OptimizedDNSCache struct {
-	mu         sync.RWMutex
-	store      map[string]*CacheEntry
-	maxSize    int
-	defaultTTL time.Duration
+	mu          sync.RWMutex
+	store       map[string]*CacheEntry
+	maxSize     int
+	defaultTTL  time.Duration
+	flightGroup singleflight.Group
 }
 
 // NewOptimizedDNSCache 创建一个新的优化DNS缓存系统
 func NewOptimizedDNSCache(maxSize int, defaultTTL time.Duration) *OptimizedDNSCache {
 	cache := &OptimizedDNSCache{
-		store:      make(map[string]*CacheEntry),
-		maxSize:    maxSize,
-		defaultTTL: defaultTTL,
+		store:       make(map[string]*CacheEntry),
+		maxSize:     maxSize,
+		defaultTTL:  defaultTTL,
+		flightGroup: singleflight.Group{},
 	}
 
 	// 启动后台清理协程
@@ -129,23 +133,141 @@ func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bo
 	// 检查是否过期
 	isExpired := time.Now().After(entry.ExpireAt)
 	if isExpired {
-		// 对于已过期的条目，我们仍然返回它，但设置一个很小的TTL给客户端
-		// 不立即删除，而是返回过期的响应，让调用者处理
-		c.mu.Lock()
-		entry.LastAccess = time.Now()
-		c.mu.Unlock()
+		// 检查是否为失败响应（如NXDOMAIN）且已过期，如果是则立即删除并返回未命中
+		if !entry.IsCloud && entry.Response != nil && entry.Response.Rcode != dns.RcodeSuccess {
+			// 失败响应已过期，立即删除缓存项并返回未命中
+			c.mu.Lock()
+			delete(c.store, key)
+			c.mu.Unlock()
+			return nil, false, false, 0
+		}
 
+		// 对于成功的过期响应，先返回给客户端，但不立即删除缓存项
+		// 为了避免并发请求导致的缓存雪崩问题，我们采用懒惰删除策略
 		// 云服务域名特殊处理
 		if entry.IsCloud && entry.CloudResponse != nil {
 			// 创建响应副本并调整TTL
 			resp := entry.CloudResponse.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second)
+			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
+			// 不删除缓存项，而是更新访问时间
+			c.mu.Lock()
+			entry.LastAccess = time.Now()
+			c.mu.Unlock()
 			return resp, true, true, entry.CloudType
 		} else if !entry.IsCloud && entry.Response != nil {
 			// 普通域名响应
 			resp := entry.Response.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second)
+			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
+			// 不删除缓存项，而是更新访问时间
+			c.mu.Lock()
+			entry.LastAccess = time.Now()
+			c.mu.Unlock()
 			return resp, true, false, 0
+		}
+		return nil, true, entry.IsCloud, entry.CloudType
+	}
+
+	// 更新最后访问时间（用于LRU淘汰策略）
+	c.mu.Lock()
+	entry.LastAccess = time.Now()
+	c.mu.Unlock()
+
+	// 云服务域名特殊处理
+	if entry.IsCloud {
+		return entry.CloudResponse, true, true, entry.CloudType
+	}
+
+	return entry.Response, true, false, 0
+}
+
+// CacheStats 缓存统计信息
+type CacheStats struct {
+	Size           int                  `json:"size"`
+	MaxSize        int                  `json:"max_size"`
+	HitCount       int64                `json:"hit_count"`
+	MissCount      int64                `json:"miss_count"`
+	Entries        map[string]EntryInfo `json:"entries,omitempty"`
+	HotEntries     []HotEntry           `json:"hot_entries,omitempty"`
+	ExpiredEntries []string             `json:"expired_entries,omitempty"`
+	ValidEntries   int                  `json:"valid_entries"`
+	ExpiredCount   int                  `json:"expired_count"`
+	IPCounts       map[string]int       `json:"ip_counts,omitempty"`
+}
+
+// EntryInfo 单个缓存条目信息
+type EntryInfo struct {
+	Domain      string    `json:"domain"`
+	QType       string    `json:"qtype"`
+	IsExpired   bool      `json:"is_expired"`
+	IsCloud     bool      `json:"is_cloud"`
+	ExpireAt    time.Time `json:"expire_at"`
+	LastAccess  time.Time `json:"last_access"`
+	AnswerCount int       `json:"answer_count"`
+}
+
+// HotEntry 热点条目
+type HotEntry struct {
+	Domain      string    `json:"domain"`
+	QType       string    `json:"qtype"`
+	LastAccess  time.Time `json:"last_access"`
+	AccessCount int       `json:"access_count"`
+}
+
+// GetWithFlight 获取缓存响应，使用单飞行模式避免重复查询
+func (c *OptimizedDNSCache) GetWithFlight(domain string, qType uint16) (*dns.Msg, bool, bool, int) {
+	key := c.key(domain, qType)
+
+	c.mu.RLock()
+	entry, exists := c.store[key]
+	c.mu.RUnlock()
+
+	if !exists {
+		return nil, false, false, 0
+	}
+
+	// 检查是否过期
+	isExpired := time.Now().After(entry.ExpireAt)
+	if isExpired {
+		// 检查是否为失败响应（如NXDOMAIN）且已过期，如果是则立即删除并返回未命中
+		if !entry.IsCloud && entry.Response != nil && entry.Response.Rcode != dns.RcodeSuccess {
+			// 失败响应已过期，立即删除缓存项并返回未命中
+			c.mu.Lock()
+			delete(c.store, key)
+			c.mu.Unlock()
+			return nil, false, false, 0
+		}
+
+		// 对于成功的过期响应，我们使用单飞行模式来避免重复查询
+		// 返回当前的过期响应，并在后台刷新
+		var resp *dns.Msg
+		var isCloudResult bool
+		var cloudType int
+		var hit bool
+
+		// 云服务域名特殊处理
+		if entry.IsCloud && entry.CloudResponse != nil {
+			// 创建响应副本并调整TTL
+			resp = entry.CloudResponse.Copy()
+			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
+			isCloudResult = true
+			cloudType = entry.CloudType
+			hit = true
+		} else if !entry.IsCloud && entry.Response != nil {
+			// 普通域名响应
+			resp = entry.Response.Copy()
+			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
+			isCloudResult = false
+			hit = true
+		}
+
+		// 更新访问时间
+		c.mu.Lock()
+		entry.LastAccess = time.Now()
+		c.mu.Unlock()
+
+		// 返回过期的响应，但通过单飞行模式触发后台刷新
+		if hit {
+			return resp, true, isCloudResult, cloudType
 		}
 		return nil, true, entry.IsCloud, entry.CloudType
 	}
@@ -576,18 +698,6 @@ func (c *OptimizedDNSCache) GetExpiringSoonEntries(refreshThreshold time.Duratio
 	return expiringSoon
 }
 
-// GetStats 获取缓存统计
-type CacheStats struct {
-	Size int
-}
-
-func (c *OptimizedDNSCache) GetStats() CacheStats {
-	c.mu.RLock()
-	size := len(c.store)
-	c.mu.RUnlock()
-	return CacheStats{Size: size}
-}
-
 // ExtendTTL 延长缓存条目的过期时间
 func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time.Duration) {
 	// 添加空指针检查
@@ -629,4 +739,156 @@ func (c *OptimizedDNSCache) DebugCache() {
 	for _, _ = range c.store {
 		// 仅作为调试接口，实际应用中可能需要记录缓存内容
 	}
+}
+
+// GetStats 获取缓存统计信息
+func (c *OptimizedDNSCache) GetStats(includeEntries bool) *CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	stats := &CacheStats{
+		Size:    len(c.store),
+		MaxSize: c.maxSize,
+		Entries: make(map[string]EntryInfo),
+	}
+
+	currentTime := time.Now()
+	validEntries := 0
+	expiredEntries := []string{}
+
+	// 收集所有条目的详细信息
+	for key, entry := range c.store {
+		isExpired := currentTime.After(entry.ExpireAt)
+		if isExpired {
+			expiredEntries = append(expiredEntries, key)
+		} else {
+			validEntries++
+		}
+
+		// 解析域名和查询类型
+		parts := strings.Split(key, "|")
+		domain := "unknown"
+		qtype := "unknown"
+		if len(parts) >= 2 {
+			domain = parts[0]
+			qtype = parts[1]
+		}
+
+		answerCount := 0
+		if entry.Response != nil {
+			answerCount = len(entry.Response.Answer)
+		} else if entry.CloudResponse != nil {
+			answerCount = len(entry.CloudResponse.Answer)
+		}
+
+		stats.Entries[key] = EntryInfo{
+			Domain:      domain,
+			QType:       qtype,
+			IsExpired:   isExpired,
+			IsCloud:     entry.IsCloud,
+			ExpireAt:    entry.ExpireAt,
+			LastAccess:  entry.LastAccess,
+			AnswerCount: answerCount,
+		}
+	}
+
+	stats.ValidEntries = validEntries
+	stats.ExpiredCount = len(expiredEntries)
+	stats.ExpiredEntries = expiredEntries
+
+	// 如果不需要详细条目信息，则清空Entries字段
+	if !includeEntries {
+		stats.Entries = nil
+	}
+
+	return stats
+}
+
+// GetHotEntries 获取热点条目（最近访问的条目）
+func (c *OptimizedDNSCache) GetHotEntries(limit int) []HotEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// 创建临时切片存储所有条目及其访问信息
+	allEntries := make([]struct {
+		Key        string
+		Entry      *CacheEntry
+		LastAccess time.Time
+	}, 0, len(c.store))
+
+	for key, entry := range c.store {
+		allEntries = append(allEntries, struct {
+			Key        string
+			Entry      *CacheEntry
+			LastAccess time.Time
+		}{key, entry, entry.LastAccess})
+	}
+
+	// 按最后访问时间排序（最新的在前）
+	sort.Slice(allEntries, func(i, j int) bool {
+		return allEntries[i].LastAccess.After(allEntries[j].LastAccess)
+	})
+
+	// 获取前N个热点条目
+	hotEntries := make([]HotEntry, 0, limit)
+	count := 0
+	for _, item := range allEntries {
+		if count >= limit {
+			break
+		}
+
+		parts := strings.Split(item.Key, "|")
+		domain := "unknown"
+		qtype := "unknown"
+		if len(parts) >= 2 {
+			domain = parts[0]
+			qtype = parts[1]
+		}
+
+		hotEntries = append(hotEntries, HotEntry{
+			Domain:     domain,
+			QType:      qtype,
+			LastAccess: item.LastAccess,
+		})
+		count++
+	}
+
+	return hotEntries
+}
+
+// CountCachedIPs 统计缓存中的IP数量
+func (c *OptimizedDNSCache) CountCachedIPs() map[string]int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	ipCounts := make(map[string]int)
+	currentTime := time.Now()
+
+	for _, entry := range c.store {
+		// 检查条目是否已过期
+		if currentTime.After(entry.ExpireAt) {
+			continue // 跳过已过期的条目
+		}
+
+		// 检查响应中的IP记录
+		var response *dns.Msg
+		if entry.IsCloud && entry.CloudResponse != nil {
+			response = entry.CloudResponse
+		} else if !entry.IsCloud && entry.Response != nil {
+			response = entry.Response
+		}
+
+		if response != nil {
+			for _, rr := range response.Answer {
+				switch rr.(type) {
+				case *dns.A:
+					ipCounts["A"]++
+				case *dns.AAAA:
+					ipCounts["AAAA"]++
+				}
+			}
+		}
+	}
+
+	return ipCounts
 }

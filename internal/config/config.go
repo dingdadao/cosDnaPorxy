@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -66,13 +67,16 @@ type Config struct {
 	CloudflareNetFile          string           `yaml:"cloudflare_net_file"`
 	CloudflareNetFile6         string           `yaml:"cloudflare_net_file6"`
 	AWSNetFile                 string           `yaml:"aws_net_file"`
-	WhitelistRefreshInterval   time.Duration    `yaml:"whitelist_refresh"`     // 白名单刷新间隔（支持30m、1h格式）
-	DesignatedRefreshInterval  time.Duration    `yaml:"designated_refresh"`    // 定向域名刷新间隔（支持30m、1h格式）
-	NetworkRefreshInterval     time.Duration    `yaml:"network_refresh"`       // 网络段刷新间隔（支持24h、1d格式）
-	ChinaDomainFile            string           `yaml:"china_domain_file"`     // 中国域名列表文件
-	ChinaDomainFileURL         string           `yaml:"china_domain_file_url"` // 中国域名列表文件URL
-	ChinaDomainRefreshInterval time.Duration    `yaml:"china_domain_refresh"`  // 中国域名刷新间隔（支持24h、1d格式）
-	ChinaDNS                   string           `yaml:"china_dns"`             // 中国DNS服务器
+	WhitelistRefreshInterval   time.Duration    `yaml:"whitelist_refresh"`         // 白名单刷新间隔（支持30m、1h格式）
+	DesignatedRefreshInterval  time.Duration    `yaml:"designated_refresh"`        // 定向域名刷新间隔（支持30m、1h格式）
+	NetworkRefreshInterval     time.Duration    `yaml:"network_refresh"`           // 网络段刷新间隔（支持24h、1d格式）
+	ChinaDomainFile            string           `yaml:"china_domain_file"`         // 中国域名列表文件
+	ChinaDomainFileURL         string           `yaml:"china_domain_file_url"`     // 中国域名列表文件URL
+	ChinaDomainRefreshInterval time.Duration    `yaml:"china_domain_refresh"`      // 中国域名刷新间隔（支持24h、1d格式）
+	ChinaDNS                   string           `yaml:"china_dns"`                 // 中国DNS服务器
+	EnableChinaDomainCheck     bool             `yaml:"enable_china_domain_check"` // 启用中国域名检查
+	EnableCloudflareCheck      bool             `yaml:"enable_cloudflare_check"`   // 启用Cloudflare域名检查
+	EnableAWSCheck             bool             `yaml:"enable_aws_check"`          // 启用AWS域名检查
 }
 
 // LoadConfig 加载配置文件
@@ -129,7 +133,47 @@ func LoadConfig(path string) (*Config, error) {
 		config.NetworkRefreshInterval = 24 * time.Hour // 默认24小时
 	}
 
+	// 设置开关默认值（如果配置文件中未明确设置，则启用）
+	if !isFieldSetInConfig(cfgData, "enable_china_domain_check") {
+		config.EnableChinaDomainCheck = true // 默认启用中国域名检查
+	}
+	if !isFieldSetInConfig(cfgData, "enable_cloudflare_check") {
+		config.EnableCloudflareCheck = true // 默认启用Cloudflare检查
+	}
+	if !isFieldSetInConfig(cfgData, "enable_aws_check") {
+		config.EnableAWSCheck = true // 默认启用AWS检查
+	}
+
 	return &config, nil
+}
+
+// isFieldSetInConfig 检查配置文件中是否设置了某个字段
+func isFieldSetInConfig(configData []byte, fieldName string) bool {
+	configStr := string(configData)
+	lines := strings.Split(configStr, "\n")
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		// 跳过注释行
+		if strings.HasPrefix(trimmedLine, "#") {
+			continue
+		}
+		// 检查是否是该字段的定义
+		if strings.HasPrefix(trimmedLine, fieldName+":") {
+			// 提取字段值部分（去掉字段名和冒号）
+			valuePart := strings.TrimSpace(strings.SplitN(trimmedLine, ":", 2)[1])
+
+			// 检查是否有注释（# 符号）
+			if idx := strings.Index(valuePart, "#"); idx != -1 {
+				// 如果有注释，只取注释前的部分
+				valuePart = strings.TrimSpace(valuePart[:idx])
+			}
+
+			// 检查是否是布尔值
+			value := strings.ToLower(strings.TrimSpace(valuePart))
+			return value == "true" || value == "false"
+		}
+	}
+	return false
 }
 
 // ValidateConfig 验证配置

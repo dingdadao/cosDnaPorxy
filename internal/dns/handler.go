@@ -3,7 +3,6 @@ package dns
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -69,6 +68,10 @@ type RefactoredHandler struct {
 	fileLoader     *FileLoader
 	taskScheduler  *TaskScheduler
 
+	// 新增处理器
+	cnameProcessor *CNAMEProcessor
+	cloudProcessor *CloudProcessor
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -119,12 +122,6 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 	// 初始化匹配处理器 - 传递完整的handler实例
 	matcherHandler := NewMatcherHandler(cfg, logger, handler)
 	handler.matcherHandler = matcherHandler
-	// 初始化配置
-	if err := matcherHandler.InitializeConfig(); err != nil {
-		logger.Error("初始化匹配器配置失败", map[string]interface{}{
-			"error": err.Error(),
-		})
-	}
 	if cfg.DefaultDNS != "" {
 		matcherHandler.GetYAMLMatcher().SetDefaultDNS(cfg.DefaultDNS)
 	}
@@ -145,12 +142,23 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger) (*Re
 	refreshHandler := NewRefreshHandler(cfg, logger, cacheManager, cloudDetector, queryOptimizer, matcherHandler, handler.proxyQuery)
 	handler.refreshHandler = refreshHandler
 
-	// 设置缓存回调
-	cacheManager.SetRefreshCallback(handler.refreshDNSRecord)
+	// 初始化CNAME处理器
+	cnameProcessor := NewCNAMEProcessor(cfg, logger, handler.proxyQuery)
+	handler.cnameProcessor = cnameProcessor
 
-	// 加载所有数据
-	if err := handler.fileLoader.LoadAllData(); err != nil {
-		logger.Error("加载数据失败，但继续启动", map[string]interface{}{
+	// 初始化云服务处理器
+	cloudProcessor := NewCloudProcessor(cfg, logger, handler.proxyQuery)
+	handler.cloudProcessor = cloudProcessor
+
+	// 设置缓存回调
+	handler.cacheManager.SetRefreshCallback(handler.refreshDNSRecord)
+
+	// 根据开关决定是否加载数据
+	if err := handler.fileLoader.LoadSelectiveData(
+		cfg.EnableChinaDomainCheck,
+		cfg.EnableCloudflareCheck || cfg.EnableAWSCheck,
+	); err != nil {
+		logger.Error("选择性加载数据失败，但继续启动", map[string]interface{}{
 			"error": err.Error(),
 		})
 		// 即使加载失败也继续启动，确保服务可用
@@ -222,7 +230,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	resp, hit, _, _ := h.cacheManager.Get(domain, qtype)
 	if hit {
 		respCopy := resp.Copy()
-		h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+		h.cnameProcessor.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 		respCopy.Id = req.Id
 		w.WriteMsg(respCopy)
 
@@ -255,7 +263,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 
 	// 4. 处理响应 - 特别处理CNAME记录
 	respCopy := resp.Copy()
-	processedResp := h.processNonIPResponseWithCNAME(respCopy, domain, qtype, upstreams)
+	processedResp := h.cnameProcessor.ProcessNonIPResponseWithCNAME(respCopy, domain, qtype, upstreams)
 
 	// 5. 验证响应是否有效
 	mockResult := &ConcurrentQueryResult{
@@ -266,7 +274,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	}
 
 	if h.IsValidNonIPDNSResult(mockResult) {
-		h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+		h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
 		// 6. 缓存结果
 		h.cacheManager.Set(domain, qtype, processedResp, false)
 
@@ -297,217 +305,10 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	}
 }
 
-// processNonIPResponseWithCNAME 处理非IP记录类型的DNS响应中的CNAME记录
-func (h *RefactoredHandler) processNonIPResponseWithCNAME(resp *dns.Msg, domain string, qtype uint16, upstreams []string) *dns.Msg {
-	if resp == nil {
-		return resp
-	}
-
-	// 检查响应中是否包含CNAME记录
-	var cnames []*dns.CNAME
-	var otherRecords []dns.RR
-
-	for _, rr := range resp.Answer {
-		if cname, ok := rr.(*dns.CNAME); ok {
-			cnames = append(cnames, cname)
-		} else {
-			// 保存其他类型的记录
-			otherRecords = append(otherRecords, rr)
-		}
-	}
-
-	// 如果没有CNAME记录，直接返回原响应，但保留AUTHORITY和ADDITIONAL部分
-	if len(cnames) == 0 {
-		// 确保域名正确设置
-		result := resp.Copy()
-		// 修改问题节中的域名
-		for i := range result.Question {
-			result.Question[i].Name = dns.Fqdn(domain)
-		}
-		// 修改答案节中的域名
-		for i := range result.Answer {
-			result.Answer[i].Header().Name = dns.Fqdn(domain)
-		}
-		// 修改权威节中的域名
-		for i := range result.Ns {
-			result.Ns[i].Header().Name = dns.Fqdn(domain)
-		}
-		// 修改附加节中的域名
-		for i := range result.Extra {
-			result.Extra[i].Header().Name = dns.Fqdn(domain)
-		}
-		return result
-	}
-
-	h.Logger.Debug("🔍 检测到CNAME记录，处理非IP查询", map[string]interface{}{
-		"domain":      domain,
-		"qtype":       dns.TypeToString[qtype],
-		"cname_count": len(cnames),
-	})
-
-	// 对于非IP记录查询，如果原始查询类型不是A/AAAA，我们需要递归查询CNAME指向的目标
-	// 以获取所需的记录类型
-	for _, cname := range cnames {
-		h.Logger.Debug("🔄 递归查询CNAME目标", map[string]interface{}{
-			"domain": domain,
-			"target": cname.Target,
-			"qtype":  dns.TypeToString[qtype],
-		})
-
-		// 创建对CNAME目标的新查询
-		cnameTargetReq := &dns.Msg{}
-		cnameTargetReq.SetQuestion(cname.Target, qtype)
-		cnameTargetReq.Id = resp.Id // 保持请求ID一致
-
-		// 查询CNAME目标的相同记录类型
-		cnameTargetResp, err := h.proxyQuery(cnameTargetReq, upstreams)
-		if err == nil && cnameTargetResp != nil {
-			// 无论CNAME目标是否有答案记录，我们都应该处理其权威和附加部分
-			// 复制响应但使用原始域名
-			result := &dns.Msg{}
-			*result = *resp            // 复制原始响应结构
-			result.Answer = []dns.RR{} // 清空答案部分
-
-			// 添加原始的CNAME记录
-			for _, origRR := range resp.Answer {
-				if origCNAME, ok := origRR.(*dns.CNAME); ok {
-					newCnameRecord := &dns.CNAME{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: dns.TypeCNAME,
-							Class:  origCNAME.Header().Class,
-							Ttl:    origCNAME.Header().Ttl,
-						},
-						Target: origCNAME.Target,
-					}
-					result.Answer = append(result.Answer, newCnameRecord)
-				}
-			}
-
-			// 如果CNAME目标有答案记录，添加它们（修改为原始域名）
-			for _, targetRR := range cnameTargetResp.Answer {
-				switch record := targetRR.(type) {
-				case *dns.A:
-					newRecord := &dns.A{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: record.Header().Rrtype,
-							Class:  record.Header().Class,
-							Ttl:    record.Header().Ttl,
-						},
-						A: record.A,
-					}
-					result.Answer = append(result.Answer, newRecord)
-				case *dns.AAAA:
-					newRecord := &dns.AAAA{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: record.Header().Rrtype,
-							Class:  record.Header().Class,
-							Ttl:    record.Header().Ttl,
-						},
-						AAAA: record.AAAA,
-					}
-					result.Answer = append(result.Answer, newRecord)
-				case *dns.TXT:
-					newRecord := &dns.TXT{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: record.Header().Rrtype,
-							Class:  record.Header().Class,
-							Ttl:    record.Header().Ttl,
-						},
-						Txt: record.Txt,
-					}
-					result.Answer = append(result.Answer, newRecord)
-				case *dns.MX:
-					newRecord := &dns.MX{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: record.Header().Rrtype,
-							Class:  record.Header().Class,
-							Ttl:    record.Header().Ttl,
-						},
-						Preference: record.Preference,
-						Mx:         record.Mx,
-					}
-					result.Answer = append(result.Answer, newRecord)
-				case *dns.NS:
-					newRecord := &dns.NS{
-						Hdr: dns.RR_Header{
-							Name:   dns.Fqdn(domain),
-							Rrtype: record.Header().Rrtype,
-							Class:  record.Header().Class,
-							Ttl:    record.Header().Ttl,
-						},
-						Ns: record.Ns,
-					}
-					result.Answer = append(result.Answer, newRecord)
-				default:
-					// 对于其他类型，复制并修改域名
-					newRecord := dns.Copy(targetRR)
-					if newRecord != nil {
-						newRecord.Header().Name = dns.Fqdn(domain)
-						result.Answer = append(result.Answer, newRecord)
-					}
-				}
-			}
-
-			// 保留CNAME目标响应的权威部分和附加部分（这是关键的修复）
-			result.Ns = []dns.RR{} // 清空权威部分重新填充
-			for _, nsRR := range cnameTargetResp.Ns {
-				newNsRecord := dns.Copy(nsRR)
-				if newNsRecord != nil {
-					newNsRecord.Header().Name = dns.Fqdn(domain)
-					result.Ns = append(result.Ns, newNsRecord)
-				}
-			}
-			result.Extra = []dns.RR{} // 清空附加部分重新填充
-			for _, extraRR := range cnameTargetResp.Extra {
-				newExtraRecord := dns.Copy(extraRR)
-				if newExtraRecord != nil {
-					newExtraRecord.Header().Name = dns.Fqdn(domain)
-					result.Extra = append(result.Extra, newExtraRecord)
-				}
-			}
-
-			return result
-		} else {
-			h.Logger.Debug("❌ CNAME目标查询失败", map[string]interface{}{
-				"domain": domain,
-				"target": cname.Target,
-				"qtype":  dns.TypeToString[qtype],
-				"error":  err,
-			})
-		}
-	}
-
-	// 如果CNAME处理失败，返回原始响应，但保留AUTHORITY和ADDITIONAL部分
-	result := resp.Copy()
-	// 修改问题节中的域名
-	for i := range result.Question {
-		result.Question[i].Name = dns.Fqdn(domain)
-	}
-	// 修改答案节中的域名
-	for i := range result.Answer {
-		result.Answer[i].Header().Name = dns.Fqdn(domain)
-	}
-	// 修改权威节中的域名
-	for i := range result.Ns {
-		result.Ns[i].Header().Name = dns.Fqdn(domain)
-	}
-	// 修改附加节中的域名
-	for i := range result.Extra {
-		result.Extra[i].Header().Name = dns.Fqdn(domain)
-	}
-	return result
-}
-
 // processQuery 处理单个DNS查询
 func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
-	// 1. 缓存检查
-	// 1. 缓存检查
-	resp, hit, _, cloudType := h.cacheManager.Get(domain, qtype)
+	// 1. 缓存检查（使用单飞行模式避免重复查询）
+	resp, hit, _, cloudType := h.cacheManager.GetWithFlight(domain, qtype)
 	if hit {
 		// 检查域名级别的云服务状态，确保A/AAAA记录处理一致性
 		isDomainCloud := h.cacheManager.IsDomainCloud(domain)
@@ -531,7 +332,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 						})
 					}
 				}
-				h.ensureMinimumTTL(respCopy, replaceCacheTime)
+				h.cnameProcessor.ensureMinimumTTL(respCopy, replaceCacheTime)
 				respCopy.Id = req.Id
 				w.WriteMsg(respCopy)
 				h.Logger.Info("✅ [DNS查询完成-缓存命中-云域名] ", map[string]interface{}{
@@ -552,7 +353,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			// 缓存命中 - 检查域名类型以提供准确日志
 			respCopy := resp.Copy()
 			// 确保响应中的 TTL 不小于配置的最小 TTL
-			h.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
+			h.cnameProcessor.ensureMinimumTTL(respCopy, h.config.Cache.TTL)
 			respCopy.Id = req.Id
 			w.WriteMsg(respCopy)
 
@@ -602,10 +403,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"result":       "success",
 		})
 
-		// 处理CNAME记录
-		processedResp := h.processDNSResponseWithCNAME(resp, domain, []string{upstream})
-		h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
-		h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		// 定义变量用于后续处理
+		var processedResp *dns.Msg
+
+		// 检查响应是否成功，只有成功的响应才进行CNAME处理和缓存
+		if resp.Rcode == dns.RcodeSuccess {
+			// 处理CNAME记录
+			processedResp = h.cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, []string{upstream})
+			h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		} else {
+			// 如果响应不成功（如NXDOMAIN），不进行CNAME处理，直接返回原始响应
+			processedResp = resp.Copy()
+			h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		}
 
 		processedResp.Id = req.Id
 		w.WriteMsg(processedResp)
@@ -628,7 +440,53 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			return
 		}
 
-		respCopy := resp.Copy()
+		// 记录原始响应内容
+		h.Logger.Debug("🔍 [替换域名原始响应] ", map[string]interface{}{
+			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"rcode":        dns.RcodeToString[resp.Rcode],
+			"answer_count": len(resp.Answer),
+			"answers":      formatAnswerRecords(resp.Answer),
+		})
+
+		// 对于替换域名，使用积极解析模式以收集尽可能多的IP
+		resolvedResp := h.cnameProcessor.ProcessDNSResponseWithCNAMEAggressive(resp, domain, h.config.Upstream)
+
+		// 记录解析后的响应内容
+		h.Logger.Debug("🔍 [替换域名解析后响应] ", map[string]interface{}{
+			"domain":       domain,
+			"qtype":        dns.TypeToString[qtype],
+			"rcode":        dns.RcodeToString[resolvedResp.Rcode],
+			"answer_count": len(resolvedResp.Answer),
+			"answers":      formatAnswerRecords(resolvedResp.Answer),
+		})
+
+		// 使用积极解析后的响应，只保留IP记录，并进行去重
+		var ipRecords []dns.RR
+		seenIPs := make(map[string]bool) // 用于去重
+		for _, rr := range resolvedResp.Answer {
+			switch v := rr.(type) {
+			case *dns.A:
+				ipStr := v.A.String()
+				if !seenIPs[ipStr] {
+					seenIPs[ipStr] = true
+					ipRecords = append(ipRecords, rr)
+				}
+			case *dns.AAAA:
+				ipStr := v.AAAA.String()
+				if !seenIPs[ipStr] {
+					seenIPs[ipStr] = true
+					ipRecords = append(ipRecords, rr)
+				}
+			}
+		}
+
+		// 创建只包含IP记录的响应
+		filteredResp := &dns.Msg{}
+		*filteredResp = *resolvedResp // 复制基础信息
+		filteredResp.Answer = ipRecords
+
+		respCopy := filteredResp.Copy()
 		respCopy.Id = req.Id
 
 		// 使用替换域名的TTL配置
@@ -646,7 +504,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		}
 
 		// 确保响应中的 TTL 不小于替换域名的TTL配置
-		h.ensureMinimumTTL(respCopy, replaceCacheTime)
+		h.cnameProcessor.ensureMinimumTTL(respCopy, replaceCacheTime)
 
 		// 缓存替换域名的响应结果，使用替换域名的TTL
 		h.cacheManager.Set(domain, qtype, respCopy, false)
@@ -661,14 +519,14 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"qtype":        dns.TypeToString[qtype],
 			"client_addr":  w.RemoteAddr().String(),
 			"source":       "replace_domain",
-			"answer_count": len(resp.Answer),
+			"answer_count": len(respCopy.Answer),
 			"result":       "success",
 		})
 		return
 	}
 
 	// 4. 中国域名检查
-	if h.matcherHandler.GetChinaMatcher().IsChinaDomain(domain) {
+	if h.config.EnableChinaDomainCheck && h.matcherHandler.GetChinaMatcher().IsChinaDomain(domain) {
 		h.Logger.Info("🇨🇳 [中国域名处理开始] ", map[string]interface{}{
 			"domain": domain,
 			"dns":    h.config.ChinaDNS,
@@ -700,10 +558,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"result":       "success",
 		})
 
-		// 处理CNAME记录
-		processedResp := h.processDNSResponseWithCNAME(resp, domain, upstreams)
-		h.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
-		h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		// 定义变量用于后续处理
+		var processedResp *dns.Msg
+
+		// 检查响应是否成功，只有成功的响应才进行CNAME处理和缓存
+		if resp.Rcode == dns.RcodeSuccess {
+			// 处理CNAME记录
+			processedResp = h.cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, upstreams)
+			h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		} else {
+			// 如果响应不成功（如NXDOMAIN），不进行CNAME处理，直接返回原始响应
+			processedResp = resp.Copy()
+			h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+			h.cacheManager.Set(domain, qtype, processedResp, false, 0)
+		}
 
 		processedResp.Id = req.Id
 		w.WriteMsg(processedResp)
@@ -723,27 +592,88 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		return
 	}
 
-	// 检查响应是否包含云服务IP，如果是云域名则需要进行替换处理
-	detection := h.cloudDetector.DetectCloudService(resp, domain)
-	isCloud := detection.Type != CloudTypeNone
+	// 先对响应进行CNAME递归解析，获取最终的响应
+	resolvedResp := h.cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, h.config.Upstream)
 
-	if isCloud {
-		// 这是一个云域名，需要进行IP替换
-		h.Logger.Info("☁️ [云域名检测到，开始替换处理] ", map[string]interface{}{
-			"domain":         domain,
-			"cloud_type":     detection.Type,
-			"replace_domain": detection.ReplaceDomain,
-		})
-
-		// 使用云处理器进行替换处理
-		h.cloudHandler.HandleCloudReplacement(w, req, domain, qtype, int(detection.Type))
-		return
+	// 检查解析后的响应是否包含IP记录，如果有IP则进行云服务检测
+	var hasResolvedIP bool
+	for _, rr := range resolvedResp.Answer {
+		if _, ok := rr.(*dns.A); ok || isAAAARecord(rr) {
+			hasResolvedIP = true
+			break
+		}
 	}
 
-	resp.Id = req.Id
+	if hasResolvedIP {
+		// 解析后的响应包含IP，进行云服务检测
+		// 根据配置开关分别检测Cloudflare和AWS
+		var detection *CloudDetectionResult
+		isCloud := false
+
+		if h.config.EnableCloudflareCheck {
+			// 检查Cloudflare
+			cfDetection := h.cloudDetector.DetectCloudflareService(resolvedResp)
+			if cfDetection.Type != CloudTypeNone {
+				detection = cfDetection
+				isCloud = true
+			}
+		}
+
+		if !isCloud && h.config.EnableAWSCheck {
+			// 如果不是Cloudflare，检查AWS
+			awsDetection := h.cloudDetector.DetectAWSService(resolvedResp)
+			if awsDetection.Type != CloudTypeNone {
+				detection = awsDetection
+				isCloud = true
+			}
+		}
+
+		if isCloud && detection != nil {
+			// 这是一个云域名，需要进行IP替换
+			h.Logger.Info("☁️ [云域名检测到，开始替换处理] ", map[string]interface{}{
+				"domain":         domain,
+				"cloud_type":     detection.Type,
+				"replace_domain": detection.ReplaceDomain,
+			})
+
+			// 使用云处理器进行替换处理
+			h.cloudHandler.HandleCloudReplacement(w, req, domain, qtype, int(detection.Type))
+			return
+		}
+	}
+
+	// 如果不是云服务域名，返回CNAME解析后的最终结果
+	processedResp := resolvedResp
+	processedResp.Id = req.Id
 	// 确保响应中的 TTL 不小于配置的最小 TTL
-	h.ensureMinimumTTL(resp, h.config.Cache.TTL)
-	w.WriteMsg(resp)
+	h.cnameProcessor.ensureMinimumTTL(processedResp, h.config.Cache.TTL)
+
+	// 记录实际返回给客户端的响应详情
+	answerDetails := make([]map[string]interface{}, 0)
+	for _, ans := range processedResp.Answer {
+		answerDetail := map[string]interface{}{
+			"type": dns.TypeToString[ans.Header().Rrtype],
+			"name": ans.Header().Name,
+		}
+		switch rr := ans.(type) {
+		case *dns.A:
+			answerDetail["ip"] = rr.A.String()
+		case *dns.AAAA:
+			answerDetail["ip"] = rr.AAAA.String()
+		case *dns.CNAME:
+			answerDetail["target"] = rr.Target
+		}
+		answerDetails = append(answerDetails, answerDetail)
+	}
+
+	h.Logger.Debug("📤 实际返回给客户端的响应", map[string]interface{}{
+		"domain":       req.Question[0].String(),
+		"answer_count": len(processedResp.Answer),
+		"answers":      answerDetails,
+		"rcode":        dns.RcodeToString[processedResp.Rcode],
+	})
+
+	w.WriteMsg(processedResp)
 
 	// 检查域名级别的云服务状态来判断是否为云服务域名（确保A/AAAA记录处理一致性）
 	isDomainCloud := h.cacheManager.IsDomainCloud(domain)
@@ -766,7 +696,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"client_addr":  w.RemoteAddr().String(),
 			"source":       "cloud",
 			"cloud_type":   cloudTypeName,
-			"answer_count": len(resp.Answer),
+			"answer_count": len(processedResp.Answer),
 			"result":       "success",
 		})
 	} else {
@@ -775,452 +705,10 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"qtype":        dns.TypeToString[qtype],
 			"client_addr":  w.RemoteAddr().String(),
 			"source":       "normal",
-			"answer_count": len(resp.Answer),
+			"answer_count": len(processedResp.Answer),
 			"result":       "success",
 		})
 	}
-}
-
-// ensureMinimumTTL 确保响应中的 TTL 不小于指定的最小值
-func (h *RefactoredHandler) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration) {
-	if resp == nil {
-		return
-	}
-
-	minTTLSeconds := uint32(minTTL.Seconds())
-
-	// 更新 Answer 部分的 TTL
-	for _, rr := range resp.Answer {
-		if rr.Header().Ttl < minTTLSeconds {
-			rr.Header().Ttl = minTTLSeconds
-		}
-	}
-
-	// 更新 Authority 部分的 TTL
-	for _, rr := range resp.Ns {
-		if rr.Header().Ttl < minTTLSeconds {
-			rr.Header().Ttl = minTTLSeconds
-		}
-	}
-
-	// 更新 Additional 部分的 TTL
-	for _, rr := range resp.Extra {
-		if rr.Header().Ttl < minTTLSeconds {
-			rr.Header().Ttl = minTTLSeconds
-		}
-	}
-}
-
-// processCloudResponse 处理云域名响应，确保符合DNS协议标准
-func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *dns.Msg {
-	if resp == nil {
-		return resp
-	}
-
-	// 使用通用的CNAME处理方法，传入上游DNS服务器为默认上游
-	return h.processDNSResponseWithCNAME(resp, domain, h.config.Upstream)
-}
-
-// processDNSResponseWithCNAME 处理DNS响应并递归解析CNAME记录
-// 完整实现：收集所有CNAME记录并递归解析，获取IP后按需补充原始IP记录
-func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
-	if resp == nil {
-		return resp
-	}
-
-	// 分离CNAME记录和IP记录
-	var cnames []*dns.CNAME
-	var ipRecords []dns.RR
-
-	for _, rr := range resp.Answer {
-		if cname, ok := rr.(*dns.CNAME); ok {
-			cnames = append(cnames, cname)
-		} else if _, ok := rr.(*dns.A); ok || isAAAARecord(rr) {
-			ipRecords = append(ipRecords, rr)
-		}
-	}
-
-	// 获取最大IP记录数配置，默认为2
-	maxIPRecords := h.config.MaxIPRecords
-	if maxIPRecords <= 0 {
-		maxIPRecords = 2 // 默认值
-	}
-
-	// 创建结果存储
-	var finalIPRecords []dns.RR
-
-	// 如果有CNAME记录，优先递归解析
-	if len(cnames) > 0 {
-		h.Logger.Debug("🔍 检测到CNAME记录，开始递归解析", map[string]interface{}{
-			"domain":         domain,
-			"cname_count":    len(cnames),
-			"max_ip_records": maxIPRecords,
-		})
-
-		// 递归解析所有CNAME记录
-		for _, cname := range cnames {
-			if len(finalIPRecords) >= maxIPRecords {
-				break // 已达到最大数量
-			}
-
-			h.Logger.Debug("🔄 解析CNAME记录", map[string]interface{}{
-				"domain": domain,
-				"target": cname.Target,
-			})
-
-			// 递归解析CNAME目标，使用传入的上游DNS服务器
-			cnameTargetReq := &dns.Msg{}
-			cnameTargetReq.SetQuestion(cname.Target, resp.Question[0].Qtype)
-
-			cnameTargetResp, err := h.proxyQuery(cnameTargetReq, upstreams)
-			if err == nil && cnameTargetResp != nil {
-				// 递归处理CNAME目标的响应
-				// 注意：这里不应该再次应用IP数量限制，而是获取所有可能的IP，
-				// 然后由外层逻辑统一控制最终数量
-				processedCnameResp := h.processDNSResponseWithCNAME(cnameTargetResp, domain, upstreams)
-				if processedCnameResp != nil {
-					// 收集解析出的IP记录，不超过剩余配额
-					for _, targetRR := range processedCnameResp.Answer {
-						if len(finalIPRecords) >= maxIPRecords {
-							break
-						}
-						if _, ok := targetRR.(*dns.A); ok || isAAAARecord(targetRR) {
-							// 检查是否已存在相同的IP记录，避免重复
-							isDuplicate := false
-							for _, existing := range finalIPRecords {
-								if existing.String() == targetRR.String() {
-									isDuplicate = true
-									break
-								}
-							}
-							if !isDuplicate {
-								finalIPRecords = append(finalIPRecords, targetRR)
-							}
-						}
-					}
-				}
-			} else {
-				h.Logger.Debug("❌ CNAME解析失败", map[string]interface{}{
-					"domain": domain,
-					"target": cname.Target,
-					"error":  err,
-				})
-			}
-		}
-	}
-
-	// 按IPv4和IPv6分别计数
-	var ipv4Records []dns.RR
-	var ipv6Records []dns.RR
-
-	for _, record := range finalIPRecords {
-		if _, ok := record.(*dns.A); ok {
-			ipv4Records = append(ipv4Records, record)
-		} else if isAAAARecord(record) {
-			ipv6Records = append(ipv6Records, record)
-		}
-	}
-
-	// IPv4和IPv6各自独立限制为配置的最大值
-	maxIPv4 := maxIPRecords
-	maxIPv6 := maxIPRecords
-
-	// 截取IPv4和IPv6记录
-	var resultRecords []dns.RR
-
-	// 添加IPv4记录（最多maxIPv4个）
-	for i, record := range ipv4Records {
-		if i >= maxIPv4 {
-			break
-		}
-		resultRecords = append(resultRecords, record)
-	}
-
-	// 添加IPv6记录（最多maxIPv6个）
-	for i, record := range ipv6Records {
-		if i >= maxIPv6 {
-			break
-		}
-		resultRecords = append(resultRecords, record)
-	}
-
-	// 如果数量不足，尝试补充原始IP记录
-	remainingSlots := maxIPRecords - len(resultRecords)
-	if remainingSlots > 0 {
-		// 按IPv4和IPv6分别补充
-		var additionalIPv4 []dns.RR
-		var additionalIPv6 []dns.RR
-
-		for _, record := range ipRecords {
-			// 检查记录是否已经存在于resultRecords中
-			isAlreadyAdded := false
-			for _, existing := range resultRecords {
-				if existing.String() == record.String() {
-					isAlreadyAdded = true
-					break
-				}
-			}
-			if isAlreadyAdded {
-				continue // 跳过已添加的记录
-			}
-
-			if _, ok := record.(*dns.A); ok {
-				// 检查是否已达到IPv4最大数量
-				currentIPv4Count := 0
-				for _, res := range resultRecords {
-					if _, ok := res.(*dns.A); ok {
-						currentIPv4Count++
-					}
-				}
-				if currentIPv4Count < maxIPv4 {
-					additionalIPv4 = append(additionalIPv4, record)
-				}
-			} else if isAAAARecord(record) {
-				// 检查是否已达到IPv6最大数量
-				currentIPv6Count := 0
-				for _, res := range resultRecords {
-					if isAAAARecord(res) {
-						currentIPv6Count++
-					}
-				}
-				if currentIPv6Count < maxIPv6 {
-					additionalIPv6 = append(additionalIPv6, record)
-				}
-			}
-		}
-
-		// 补充IPv4记录
-		for _, record := range additionalIPv4 {
-			if len(resultRecords) >= maxIPRecords {
-				break
-			}
-			// 确保没有重复
-			isDuplicate := false
-			for _, existing := range resultRecords {
-				if existing.String() == record.String() {
-					isDuplicate = true
-					break
-				}
-			}
-			if !isDuplicate {
-				resultRecords = append(resultRecords, record)
-			}
-		}
-
-		// 补充IPv6记录
-		for _, record := range additionalIPv6 {
-			if len(resultRecords) >= maxIPRecords {
-				break
-			}
-			// 确保没有重复
-			isDuplicate := false
-			for _, existing := range resultRecords {
-				if existing.String() == record.String() {
-					isDuplicate = true
-					break
-				}
-			}
-			if !isDuplicate {
-				resultRecords = append(resultRecords, record)
-			}
-		}
-	}
-
-	// 创建并填充最终响应
-	processedResp := &dns.Msg{
-		MsgHdr: resp.MsgHdr,
-		Question: []dns.Question{
-			{
-				Name:   dns.Fqdn(domain),
-				Qtype:  resp.Question[0].Qtype,
-				Qclass: resp.Question[0].Qclass,
-			},
-		},
-		Answer: []dns.RR{},
-		Ns:     append([]dns.RR{}, resp.Ns...),
-		Extra:  append([]dns.RR{}, resp.Extra...),
-	}
-	processedResp.Id = resp.Id
-
-	// 添加IP记录到响应，同时确保去重
-	for _, record := range resultRecords {
-		newRecord := dns.Copy(record)
-		newRecord.Header().Name = dns.Fqdn(domain)
-
-		// 检查是否已经添加了相同的IP记录，只比较IP地址部分
-		alreadyAdded := false
-		for _, existing := range processedResp.Answer {
-			// 比较IP地址部分
-			existingIP := ""
-			newIP := ""
-
-			if a, ok := existing.(*dns.A); ok {
-				existingIP = a.A.String()
-			} else if aaaa, ok := existing.(*dns.AAAA); ok {
-				existingIP = aaaa.AAAA.String()
-			}
-
-			if a, ok := newRecord.(*dns.A); ok {
-				newIP = a.A.String()
-			} else if aaaa, ok := newRecord.(*dns.AAAA); ok {
-				newIP = aaaa.AAAA.String()
-			}
-
-			if existingIP != "" && existingIP == newIP {
-				alreadyAdded = true
-				break
-			}
-		}
-		if !alreadyAdded {
-			processedResp.Answer = append(processedResp.Answer, newRecord)
-		}
-	}
-
-	h.Logger.Debug("✅ CNAME处理完成", map[string]interface{}{
-		"domain":      domain,
-		"final_count": len(processedResp.Answer),
-		"max_allowed": maxIPRecords,
-		"ipv4_count":  countType(processedResp.Answer, "A"),
-		"ipv6_count":  countType(processedResp.Answer, "AAAA"),
-	})
-
-	return processedResp
-}
-
-// isAAAARecord 检查记录是否为AAAA记录
-func isAAAARecord(rr dns.RR) bool {
-	_, ok := rr.(*dns.AAAA)
-	return ok
-}
-
-// countType 计算指定类型的记录数量
-func countType(records []dns.RR, recordType string) int {
-	count := 0
-	for _, record := range records {
-		switch recordType {
-		case "A":
-			if _, ok := record.(*dns.A); ok {
-				count++
-			}
-		case "AAAA":
-			if _, ok := record.(*dns.AAAA); ok {
-				count++
-			}
-		}
-	}
-	return count
-}
-
-// replaceCloudIPs 用替换域名的IP替换原始响应中的云服务IP
-func (h *RefactoredHandler) replaceCloudIPs(originalResp *dns.Msg, originalDetection *CloudDetectionResult) *dns.Msg {
-	if originalResp == nil || originalDetection == nil {
-		return originalResp
-	}
-
-	// 查询替换域名获取IP地址
-	replaceDomain := originalDetection.ReplaceDomain
-	if replaceDomain == "" {
-		return originalResp
-	}
-
-	// 查询替换域名的A和AAAA记录
-	replaceReqA := &dns.Msg{}
-	replaceReqA.SetQuestion(dns.Fqdn(replaceDomain), dns.TypeA)
-
-	replaceReqAAAA := &dns.Msg{}
-	replaceReqAAAA.SetQuestion(dns.Fqdn(replaceDomain), dns.TypeAAAA)
-
-	var replaceIPs []netip.Addr
-
-	// 获取替换域名的A记录
-	if replaceRespA, err := h.proxyQuery(replaceReqA, h.config.Upstream); err == nil && replaceRespA != nil && replaceRespA.Rcode == dns.RcodeSuccess {
-		for _, rr := range replaceRespA.Answer {
-			if a, ok := rr.(*dns.A); ok {
-				if ip, err := netip.ParseAddr(a.A.String()); err == nil {
-					replaceIPs = append(replaceIPs, ip)
-				}
-			}
-		}
-	}
-
-	// 获取替换域名的AAAA记录
-	if replaceRespAAAA, err := h.proxyQuery(replaceReqAAAA, h.config.Upstream); err == nil && replaceRespAAAA != nil && replaceRespAAAA.Rcode == dns.RcodeSuccess {
-		for _, rr := range replaceRespAAAA.Answer {
-			if aaaa, ok := rr.(*dns.AAAA); ok {
-				if ip, err := netip.ParseAddr(aaaa.AAAA.String()); err == nil {
-					replaceIPs = append(replaceIPs, ip)
-				}
-			}
-		}
-	}
-
-	if len(replaceIPs) == 0 {
-		h.Logger.Warn("⚠️ 替换域名无有效IP记录", map[string]interface{}{
-			"replace_domain": replaceDomain,
-		})
-		return originalResp
-	}
-
-	// 创建新的响应并替换IP
-	newResp := &dns.Msg{}
-	*newResp = *originalResp // 复制原始响应结构
-	newResp.Answer = nil     // 清空答案部分
-
-	// 复制非IP的记录
-	for _, rr := range originalResp.Answer {
-		switch rr.(type) {
-		case *dns.A, *dns.AAAA:
-			// 跳过云服务IP记录，稍后用替换IP替换
-		default:
-			// 保留非IP记录
-			newResp.Answer = append(newResp.Answer, dns.Copy(rr))
-		}
-	}
-
-	// 添加替换IP，保持原始查询类型
-	for _, ip := range replaceIPs {
-		// 根据IP类型创建相应的记录
-		if ip.Is4() && originalResp.Question[0].Qtype == dns.TypeA {
-			for _, originalRR := range originalResp.Answer {
-				if _, ok := originalRR.(*dns.A); ok {
-					newA := &dns.A{
-						Hdr: dns.RR_Header{
-							Name:   originalRR.Header().Name,
-							Rrtype: dns.TypeA,
-							Class:  originalRR.Header().Class,
-							Ttl:    originalRR.Header().Ttl,
-						},
-						A: ip.AsSlice(),
-					}
-					newResp.Answer = append(newResp.Answer, newA)
-					break
-				}
-			}
-		} else if ip.Is6() && originalResp.Question[0].Qtype == dns.TypeAAAA {
-			for _, originalRR := range originalResp.Answer {
-				if _, ok := originalRR.(*dns.AAAA); ok {
-					newAAAA := &dns.AAAA{
-						Hdr: dns.RR_Header{
-							Name:   originalRR.Header().Name,
-							Rrtype: dns.TypeAAAA,
-							Class:  originalRR.Header().Class,
-							Ttl:    originalRR.Header().Ttl,
-						},
-						AAAA: ip.AsSlice(),
-					}
-					newResp.Answer = append(newResp.Answer, newAAAA)
-					break
-				}
-			}
-		}
-	}
-
-	h.Logger.Debug("🔄 云IP替换完成", map[string]interface{}{
-		"original_ips_count": len(originalDetection.DetectedIPs),
-		"replace_ips_count":  len(replaceIPs),
-	})
-
-	return newResp
 }
 
 // sendErrorResponse 发送错误响应
@@ -1232,11 +720,16 @@ func (h *RefactoredHandler) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg
 
 // GetStats 获取统计信息
 func (h *RefactoredHandler) GetStats() map[string]interface{} {
-	cacheStats := h.cacheManager.GetStats()
+	cacheStats := h.cacheManager.GetStats(false)
 
 	return map[string]interface{}{
 		"cache": cacheStats,
 	}
+}
+
+// GetCacheManager 获取缓存管理器
+func (h *RefactoredHandler) GetCacheManager() *CacheManager {
+	return h.cacheManager
 }
 
 // Close 关闭处理器
@@ -1281,4 +774,56 @@ func (h *RefactoredHandler) determineUpstreamsForDomain(domain string) []string 
 		"upstreams": h.config.Upstream,
 	})
 	return h.config.Upstream
+}
+
+// isAAAARecord 检查记录是否为AAAA记录
+func isAAAARecord(rr dns.RR) bool {
+	_, ok := rr.(*dns.AAAA)
+	return ok
+}
+
+// formatAnswerRecords 格式化回答记录用于日志
+func formatAnswerRecords(records []dns.RR) []map[string]interface{} {
+	formatted := make([]map[string]interface{}, 0, len(records))
+	for _, record := range records {
+		recordInfo := map[string]interface{}{
+			"type": dns.TypeToString[record.Header().Rrtype],
+			"name": record.Header().Name,
+		}
+		switch rr := record.(type) {
+		case *dns.A:
+			recordInfo["ip"] = rr.A.String()
+		case *dns.AAAA:
+			recordInfo["ip"] = rr.AAAA.String()
+		case *dns.CNAME:
+			recordInfo["target"] = rr.Target
+		}
+		formatted = append(formatted, recordInfo)
+	}
+	return formatted
+}
+
+// processDNSResponseWithCNAME 处理DNS响应并递归解析CNAME记录
+func (h *RefactoredHandler) processDNSResponseWithCNAME(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
+	return h.cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, upstreams)
+}
+
+// processCloudResponse 处理云域名响应，确保符合DNS协议标准
+func (h *RefactoredHandler) processCloudResponse(resp *dns.Msg, domain string) *dns.Msg {
+	return h.cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, h.config.Upstream)
+}
+
+// processDNSResponseWithCNAMEAggressive 更积极地解析CNAME记录以收集更多IP
+func (h *RefactoredHandler) processDNSResponseWithCNAMEAggressive(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
+	return h.cnameProcessor.ProcessDNSResponseWithCNAMEAggressive(resp, domain, upstreams)
+}
+
+// ensureMinimumTTL 确保响应中的 TTL 不小于指定的最小值
+func (h *RefactoredHandler) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration) {
+	h.cnameProcessor.ensureMinimumTTL(resp, minTTL)
+}
+
+// replaceCloudIPs 用替换域名的IP替换原始响应中的云服务IP
+func (h *RefactoredHandler) replaceCloudIPs(originalResp *dns.Msg, originalDetection *CloudDetectionResult) *dns.Msg {
+	return h.cloudProcessor.ReplaceCloudIPs(originalResp, originalDetection)
 }

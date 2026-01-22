@@ -11,6 +11,7 @@ import (
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 // CacheManager 缓存管理器
@@ -34,6 +35,9 @@ type CacheManager struct {
 
 	// 云服务检测器
 	cloudDetector *CloudDetector
+
+	// 单飞行组，用于避免对同一域名的重复查询
+	flightGroup singleflight.Group
 }
 
 // AsyncRefreshTask 异步刷新任务
@@ -66,6 +70,7 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger, cloudDete
 			workers: cfg.Cache.MaxAsyncWorkers,
 			stopCh:  make(chan struct{}),
 		},
+		flightGroup: singleflight.Group{},
 	}
 
 	// 启动异步工作池
@@ -150,6 +155,61 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 	}
 
 	return resp, hit, cloudType
+}
+
+// GetWithFlight 获取缓存，使用单飞行模式避免重复查询
+func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
+	timer := cm.logger.StartTimer("cache_get_flight", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+	})
+	defer timer.End()
+
+	// 使用单飞行模式来避免对同一域名的重复查询
+	v, err, _ := cm.flightGroup.Do(domain+"|"+dns.TypeToString[qtype], func() (interface{}, error) {
+		resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype)
+		return struct {
+			Resp      *dns.Msg
+			Hit       bool
+			IsCloud   bool
+			CloudType int
+		}{resp, hit, isCloud, cloudType}, nil
+	})
+
+	if err != nil {
+		cm.logger.Error("单飞行查询错误", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"error":  err,
+		})
+		return nil, false, false, 0
+	}
+
+	result := v.(struct {
+		Resp      *dns.Msg
+		Hit       bool
+		IsCloud   bool
+		CloudType int
+	})
+
+	if result.Hit {
+		cm.logger.Debug("💾 单飞行缓存命中", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+
+		// 检查是否需要按需刷新（缓存已过期但仍有条目）
+		if cm.shouldRefreshOnDemand(domain, qtype) { // 异步刷新默认启用
+			cm.submitOnDemandRefresh(domain, qtype)
+		}
+	} else {
+		cm.logger.Debug("🔍 单飞行缓存未命中", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+		})
+	}
+
+	return result.Resp, result.Hit, result.IsCloud, result.CloudType
 }
 
 // SetCloudResponse 设置云域名的替换响应缓存
@@ -282,13 +342,25 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 		}
 	}
 
-	// 缓存普通响应
-	cm.cache.Set(domain, qtype, response, isCloud, cloudType...)
-	cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
-		"domain": domain,
-		"qtype":  dns.TypeToString[qtype],
-		"rcode":  dns.RcodeToString[response.Rcode],
-	})
+	// 检查是否为失败的DNS响应（如NXDOMAIN），如果是则使用较短的TTL
+	if response.Rcode != dns.RcodeSuccess {
+		shortTTL := 5 * time.Second
+		cm.cache.SetWithTTL(domain, qtype, response, isCloud, shortTTL, cloudType...)
+		cm.logger.Debug("💾 失败响应已缓存（短TTL）", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"rcode":  dns.RcodeToString[response.Rcode],
+			"ttl":    shortTTL.String(),
+		})
+	} else {
+		// 缓存普通成功响应
+		cm.cache.Set(domain, qtype, response, isCloud, cloudType...)
+		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"rcode":  dns.RcodeToString[response.Rcode],
+		})
+	}
 }
 
 // SetWithTTL 设置缓存（使用自定义TTL）
@@ -338,13 +410,25 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 		}
 	}
 
-	// 使用自定义TTL缓存响应
-	cm.cache.SetWithTTL(domain, qtype, response, isCloud, customTTL, cloudType...)
-	cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
-		"domain": domain,
-		"qtype":  dns.TypeToString[qtype],
-		"rcode":  dns.RcodeToString[response.Rcode],
-	})
+	// 检查是否为失败的DNS响应（如NXDOMAIN），如果是则使用较短的TTL
+	if response.Rcode != dns.RcodeSuccess {
+		shortTTL := 5 * time.Second
+		cm.cache.SetWithTTL(domain, qtype, response, isCloud, shortTTL, cloudType...)
+		cm.logger.Debug("💾 失败响应已缓存（短TTL）", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"rcode":  dns.RcodeToString[response.Rcode],
+			"ttl":    shortTTL.String(),
+		})
+	} else {
+		// 使用自定义TTL缓存响应
+		cm.cache.SetWithTTL(domain, qtype, response, isCloud, customTTL, cloudType...)
+		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"rcode":  dns.RcodeToString[response.Rcode],
+		})
+	}
 }
 
 // calculateTTL 计算响应的实际TTL（使用配置的TTL作为最小值）
@@ -853,22 +937,6 @@ func (cm *CacheManager) SetRefreshCallback(callback RefreshCallback) {
 	cm.refreshCallback = callback
 }
 
-// GetStats 获取缓存统计
-func (cm *CacheManager) GetStats() map[string]interface{} {
-	stats := cm.cache.GetStats()
-
-	cm.asyncMu.RLock()
-	pendingTasks := len(cm.asyncSet)
-	cm.asyncMu.RUnlock()
-
-	return map[string]interface{}{
-		"cache_size":     stats.Size,
-		"pending_tasks":  pendingTasks,
-		"queue_capacity": cap(cm.asyncChan),
-		"queue_length":   len(cm.asyncChan),
-	}
-}
-
 // Clear 清空缓存
 func (cm *CacheManager) Clear() {
 	cm.cache.Clear()
@@ -884,6 +952,22 @@ func (cm *CacheManager) Clear() {
 	}
 
 	cm.logger.Info("🗑️ 缓存已清空")
+}
+
+// GetStats 获取缓存统计信息
+func (cm *CacheManager) GetStats(includeEntries bool) *CacheStats {
+	stats := cm.cache.GetStats(includeEntries)
+	// 添加IP统计信息
+	ipCounts := cm.cache.CountCachedIPs()
+	if stats != nil {
+		stats.IPCounts = ipCounts
+	}
+	return stats
+}
+
+// GetHotEntries 获取热点条目
+func (cm *CacheManager) GetHotEntries(limit int) []HotEntry {
+	return cm.cache.GetHotEntries(limit)
 }
 
 // ExtendTTL 延长缓存条目的过期时间

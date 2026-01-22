@@ -64,7 +64,7 @@ func (mh *MatcherHandler) InitializeConfig() error {
 	}
 
 	// 检查中国域名配置文件是否存在，如果不存在则跳过加载
-	if mh.config.ChinaDomainFile != "" {
+	if mh.config.EnableChinaDomainCheck && mh.config.ChinaDomainFile != "" {
 		if _, err := os.Stat(mh.config.ChinaDomainFile); err == nil {
 			// 文件存在，加载配置
 			if err := mh.chinaMatcher.LoadChinaDomains(mh.config.ChinaDomainFile); err != nil {
@@ -82,6 +82,10 @@ func (mh *MatcherHandler) InitializeConfig() error {
 				"file": mh.config.ChinaDomainFile,
 			})
 		}
+	} else if !mh.config.EnableChinaDomainCheck {
+		mh.logger.Info("⏭️ 中国域名检查已禁用，跳过加载", map[string]interface{}{
+			"enabled": mh.config.EnableChinaDomainCheck,
+		})
 	}
 
 	return nil

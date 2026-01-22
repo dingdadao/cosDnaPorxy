@@ -394,13 +394,35 @@ func (rm *RecoveryManager) healthCheck() {
 		runtime.GC()
 	}
 
-	rm.logger.Debug("✅ 健康检查通过", map[string]interface{}{
+	// 获取统计信息以显示IP统计
+	stats := rm.GetStats()
+	cacheInfo, ok := stats["cache"].(map[string]interface{})
+
+	logFields := map[string]interface{}{
 		"uptime":        time.Since(rm.startTime).String(),
 		"restart_count": rm.restartCount,
 		"panic_count":   rm.panicCount,
 		"memory_mb":     allocMB,
 		"goroutines":    runtime.NumGoroutine(),
-	})
+	}
+
+	// 添加缓存IP统计信息到日志
+	if ok && cacheInfo != nil {
+		if ipCounts, exists := cacheInfo["ip_counts"].(map[string]interface{}); exists {
+			logFields["cached_a_records"] = ipCounts["A"]
+			logFields["cached_aaaa_records"] = ipCounts["AAAA"]
+			logFields["total_cached_ips"] = ipCounts["A"]
+			if aaaaCount, ok := ipCounts["AAAA"].(int); ok {
+				if aCount, ok := ipCounts["A"].(int); ok {
+					logFields["total_cached_ips"] = aCount + aaaaCount
+				}
+			}
+		}
+		logFields["cache_size"] = cacheInfo["size"]
+		logFields["cache_valid_entries"] = cacheInfo["valid_entries"]
+	}
+
+	rm.logger.Debug("✅ 健康检查通过", logFields)
 }
 
 // setupSignalHandler 设置信号处理
@@ -511,6 +533,52 @@ func (rm *RecoveryManager) GetStats() map[string]interface{} {
 		"memory_alloc_mb": m.Alloc / 1024 / 1024,
 		"goroutines":      runtime.NumGoroutine(),
 		"max_restarts":    rm.maxRestarts,
+	}
+
+	// 如果DNS处理器存在，添加缓存统计信息
+	if rm.dnsHandler != nil && rm.dnsHandler.GetCacheManager() != nil {
+		// 获取缓存统计信息（不包含详细条目信息以节省资源）
+		cacheStats := rm.dnsHandler.GetCacheManager().GetStats(false)
+		if cacheStats != nil {
+			cacheInfo := map[string]interface{}{
+				"size":          cacheStats.Size,
+				"max_size":      cacheStats.MaxSize,
+				"valid_entries": cacheStats.ValidEntries,
+				"expired_count": cacheStats.ExpiredCount,
+			}
+			// 添加IP统计信息
+			if cacheStats.IPCounts != nil {
+				cacheInfo["ip_counts"] = cacheStats.IPCounts
+			}
+			stats["cache"] = cacheInfo
+
+			// 获取热点条目（前10个）
+			hotEntries := rm.dnsHandler.GetCacheManager().GetHotEntries(10)
+			if len(hotEntries) > 0 {
+				hotEntryList := make([]map[string]interface{}, 0, len(hotEntries))
+				for _, entry := range hotEntries {
+					hotEntryList = append(hotEntryList, map[string]interface{}{
+						"domain":      entry.Domain,
+						"qtype":       entry.QType,
+						"last_access": entry.LastAccess.Format(time.RFC3339),
+					})
+				}
+				stats["hot_entries"] = hotEntryList
+			}
+
+			// 获取过期条目（前10个）
+			if len(cacheStats.ExpiredEntries) > 0 {
+				limit := 10
+				if len(cacheStats.ExpiredEntries) < limit {
+					limit = len(cacheStats.ExpiredEntries)
+				}
+				expiredList := make([]string, 0, limit)
+				for i := 0; i < limit; i++ {
+					expiredList = append(expiredList, cacheStats.ExpiredEntries[i])
+				}
+				stats["expired_entries"] = expiredList
+			}
+		}
 	}
 
 	if !rm.lastRestart.IsZero() {

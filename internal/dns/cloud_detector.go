@@ -99,6 +99,8 @@ func NewCloudDetector(logger *utils.EnhancedLogger, metrics interface{}) *CloudD
 
 // LoadNetworkRanges 加载云服务网段
 func (cd *CloudDetector) LoadNetworkRanges(cfFile4, cfFile6, awsFile string) error {
+	// 注意：这里不检查配置开关，因为开关检查应该在调用方完成
+
 	timer := cd.logger.StartTimer("load_network_ranges")
 	defer timer.End()
 
@@ -341,6 +343,86 @@ func (cd *CloudDetector) isAWSIP(ip netip.Addr) bool {
 		return cd.awsV4.Contains(ip)
 	}
 	return cd.awsV6.Contains(ip)
+}
+
+// DetectCloudflareService 检测DNS响应中的Cloudflare服务IP
+func (cd *CloudDetector) DetectCloudflareService(msg *dns.Msg) *CloudDetectionResult {
+	if msg == nil || len(msg.Answer) == 0 {
+		return &CloudDetectionResult{Type: CloudTypeNone}
+	}
+
+	var detectedIPs []netip.Addr
+
+	for _, rr := range msg.Answer {
+		var ip netip.Addr
+		switch v := rr.(type) {
+		case *dns.A:
+			ip, _ = netip.ParseAddr(v.A.String())
+		case *dns.AAAA:
+			ip, _ = netip.ParseAddr(v.AAAA.String())
+		default:
+			continue
+		}
+
+		if !ip.IsValid() {
+			continue
+		}
+
+		// 检测Cloudflare
+		if cd.isCloudflareIP(ip) {
+			cd.logger.Debug("🔍 检测到Cloudflare IP", map[string]interface{}{
+				"ip":             ip.String(),
+				"replace_domain": cd.cfReplaceDomain,
+			})
+			return &CloudDetectionResult{
+				Type:          CloudTypeCloudflare,
+				DetectedIPs:   append(detectedIPs, ip),
+				ReplaceDomain: cd.cfReplaceDomain,
+			}
+		}
+	}
+
+	return &CloudDetectionResult{Type: CloudTypeNone}
+}
+
+// DetectAWSService 检测DNS响应中的AWS服务IP
+func (cd *CloudDetector) DetectAWSService(msg *dns.Msg) *CloudDetectionResult {
+	if msg == nil || len(msg.Answer) == 0 {
+		return &CloudDetectionResult{Type: CloudTypeNone}
+	}
+
+	var detectedIPs []netip.Addr
+
+	for _, rr := range msg.Answer {
+		var ip netip.Addr
+		switch v := rr.(type) {
+		case *dns.A:
+			ip, _ = netip.ParseAddr(v.A.String())
+		case *dns.AAAA:
+			ip, _ = netip.ParseAddr(v.AAAA.String())
+		default:
+			continue
+		}
+
+		if !ip.IsValid() {
+			continue
+		}
+
+		// 检测AWS
+		if cd.isAWSIP(ip) {
+			cd.logger.Debug("🔍 检测到AWS IP", map[string]interface{}{
+				"ip":             ip.String(),
+				"replace_domain": cd.awsReplaceDomain,
+			})
+			return &CloudDetectionResult{
+				Type:          CloudTypeAWS,
+				DetectedIPs:   append(detectedIPs, ip),
+				ReplaceDomain: cd.awsReplaceDomain,
+			}
+		}
+	}
+
+	return &CloudDetectionResult{Type: CloudTypeNone}
 }
 
 // downloadOrReadFile 下载或读取文件
