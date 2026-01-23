@@ -160,7 +160,8 @@ func (cp *CloudProcessor) ProcessCloudResponse(resp *dns.Msg, domain string) *dn
 	}
 
 	// 使用通用的CNAME处理方法，传入上游DNS服务器为默认上游
-	cnameProcessor := NewCNAMEProcessor(cp.config, cp.Logger, cp.proxyQuery)
+	// 使用不带缓存功能的CNAME处理器，因为CloudProcessor不需要缓存中间结果
+	cnameProcessor := NewCNAMEProcessorWithoutCache(cp.config, cp.Logger, cp.proxyQuery)
 	return cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, cp.config.Upstream)
 }
 

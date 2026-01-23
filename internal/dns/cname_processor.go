@@ -12,17 +12,29 @@ import (
 
 // CNAMEProcessor 处理CNAME相关逻辑
 type CNAMEProcessor struct {
-	config     *config.Config
-	Logger     *utils.EnhancedLogger
-	proxyQuery func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
+	config       *config.Config
+	Logger       *utils.EnhancedLogger
+	proxyQuery   func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
+	cacheManager *CacheManager                              // 添加缓存管理器
 }
 
 // NewCNAMEProcessor 创建新的CNAME处理器
-func NewCNAMEProcessor(config *config.Config, logger *utils.EnhancedLogger, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error)) *CNAMEProcessor {
+func NewCNAMEProcessor(config *config.Config, logger *utils.EnhancedLogger, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error), cacheManager *CacheManager) *CNAMEProcessor {
 	return &CNAMEProcessor{
-		config:     config,
-		Logger:     logger,
-		proxyQuery: proxyQuery,
+		config:       config,
+		Logger:       logger,
+		proxyQuery:   proxyQuery,
+		cacheManager: cacheManager,
+	}
+}
+
+// NewCNAMEProcessorWithoutCache 创建不带缓存功能的CNAME处理器（用于某些特殊场景）
+func NewCNAMEProcessorWithoutCache(config *config.Config, logger *utils.EnhancedLogger, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error)) *CNAMEProcessor {
+	return &CNAMEProcessor{
+		config:       config,
+		Logger:       logger,
+		proxyQuery:   proxyQuery,
+		cacheManager: nil, // 不设置缓存管理器
 	}
 }
 
@@ -32,194 +44,25 @@ func (cp *CNAMEProcessor) ProcessDNSResponseWithCNAME(resp *dns.Msg, domain stri
 		return resp
 	}
 
-	// 使用积极解析模式来避免重复查询和收集所有可能的IP
-	return cp.ProcessDNSResponseWithCNAMEAggressive(resp, domain, upstreams)
+	// 使用RFC兼容的CNAME解析
+	return cp.ProcessDNSResponseWithCNAMERFC(resp, domain, upstreams)
 }
 
-func (cp *CNAMEProcessor) processDNSResponseWithCNAMERecursive(resp *dns.Msg, domain string, upstreams []string, visited map[string]bool) *dns.Msg {
+// ProcessDNSResponseWithCNAMERFC 符合RFC 1034/1035标准的CNAME解析
+// 只解析指定深度的CNAME链，并返回完整的CNAME链和最终IP记录
+func (cp *CNAMEProcessor) ProcessDNSResponseWithCNAMERFC(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
 	if resp == nil {
 		return resp
 	}
 
-	// 分离CNAME记录和IP记录
-	var cnames []*dns.CNAME
-	var ipRecords []dns.RR
-	var otherRecords []dns.RR // 其他类型的记录
+	cp.Logger.Debug("🔍 开始RFC兼容CNAME解析", map[string]interface{}{
+		"domain":          domain,
+		"initial_answers": len(resp.Answer),
+		"recursion_depth": cp.config.CNAMERecursionDepth,
+	})
 
-	for _, rr := range resp.Answer {
-		if cname, ok := rr.(*dns.CNAME); ok {
-			cnames = append(cnames, cname)
-		} else if _, ok := rr.(*dns.A); ok || cp.isAAAARecord(rr) {
-			ipRecords = append(ipRecords, rr)
-		} else {
-			otherRecords = append(otherRecords, rr)
-		}
-	}
-
-	// 获取最大IP记录数配置，默认为2
-	maxIPRecords := cp.config.MaxIPRecords
-	if maxIPRecords <= 0 {
-		maxIPRecords = 2 // 默认值
-	}
-
-	// 创建结果存储
-	var finalIPRecords []dns.RR
-
-	// 如果有CNAME记录，优先递归解析CNAME，即使同时存在IP记录
-	// 这样可以确保获取CNAME指向的最新IP，而不是可能过时的直接IP记录
-	if len(cnames) > 0 {
-		// 有CNAME记录，优先处理CNAME
-	} else if len(ipRecords) > 0 {
-		// 没有CNAME记录，只有IP记录，直接返回
-		processedResp := &dns.Msg{
-			MsgHdr: resp.MsgHdr,
-			Question: []dns.Question{
-				{
-					Name:   dns.Fqdn(domain),
-					Qtype:  resp.Question[0].Qtype,
-					Qclass: resp.Question[0].Qclass,
-				},
-			},
-			Answer: []dns.RR{},
-			Ns:     append([]dns.RR{}, resp.Ns...),
-			Extra:  append([]dns.RR{}, resp.Extra...),
-		}
-		processedResp.Id = resp.Id
-
-		// 添加IP记录
-		for _, record := range ipRecords {
-			newRecord := dns.Copy(record)
-			newRecord.Header().Name = dns.Fqdn(domain)
-			processedResp.Answer = append(processedResp.Answer, newRecord)
-		}
-
-		// 添加其他非CNAME记录
-		for _, record := range otherRecords {
-			newRecord := dns.Copy(record)
-			newRecord.Header().Name = dns.Fqdn(domain)
-			processedResp.Answer = append(processedResp.Answer, newRecord)
-		}
-
-		return processedResp
-	}
-
-	// 如果没有IP记录，处理CNAME记录
-	if len(cnames) > 0 {
-		cp.Logger.Debug("🔍 检测到CNAME记录，开始递归解析", map[string]interface{}{
-			"domain":         domain,
-			"cname_count":    len(cnames),
-			"max_ip_records": maxIPRecords,
-		})
-
-		// 递归解析所有非循环CNAME记录
-		for _, cname := range cnames {
-			// 检查是否形成自循环引用
-			canonicalTarget := strings.ToLower(strings.TrimSuffix(cname.Target, "."))
-			canonicalDomain := strings.ToLower(strings.TrimSuffix(domain, "."))
-			if canonicalTarget == canonicalDomain {
-				cp.Logger.Debug("⚠️ 检测到CNAME自循环引用，跳过", map[string]interface{}{
-					"domain": domain,
-					"target": cname.Target,
-				})
-				continue // 跳过这个自循环CNAME记录
-			}
-
-			// 检查是否已访问过此目标（防止间接循环）
-			if visited[canonicalTarget] {
-				cp.Logger.Debug("⚠️ 检测到CNAME间接循环，跳过", map[string]interface{}{
-					"domain": domain,
-					"target": cname.Target,
-				})
-				continue // 跳过这个CNAME记录，避免无限循环
-			}
-
-			cp.Logger.Debug("🔄 解析CNAME记录", map[string]interface{}{
-				"domain": domain,
-				"target": cname.Target,
-			})
-
-			// 标记目标为已访问
-			visited[canonicalTarget] = true
-
-			// 递归解析CNAME目标，使用传入的上游DNS服务器
-			cnameTargetReq := &dns.Msg{}
-			cnameTargetReq.SetQuestion(cname.Target, resp.Question[0].Qtype)
-
-			cnameTargetResp, err := cp.proxyQuery(cnameTargetReq, upstreams)
-			if err == nil && cnameTargetResp != nil {
-				// 递归处理CNAME目标的响应
-				processedCnameResp := cp.processDNSResponseWithCNAMERecursive(cnameTargetResp, canonicalTarget, upstreams, visited)
-				if processedCnameResp != nil {
-					// 收集解析出的IP记录，不超过剩余配额
-					for _, targetRR := range processedCnameResp.Answer {
-						if len(finalIPRecords) >= maxIPRecords {
-							break
-						}
-						if _, ok := targetRR.(*dns.A); ok || cp.isAAAARecord(targetRR) {
-							// 检查是否已存在相同的IP记录，避免重复
-							isDuplicate := false
-							for _, existing := range finalIPRecords {
-								if existing.String() == targetRR.String() {
-									isDuplicate = true
-									break
-								}
-							}
-							if !isDuplicate {
-								finalIPRecords = append(finalIPRecords, targetRR)
-							}
-						}
-					}
-				}
-			} else {
-				cp.Logger.Debug("❌ CNAME解析失败", map[string]interface{}{
-					"domain": domain,
-					"target": cname.Target,
-					"error":  err,
-				})
-			}
-
-			// 移除访问标记，以便其他分支可以访问相同的域名
-			delete(visited, canonicalTarget)
-		}
-	}
-
-	// 按IPv4和IPv6分别计数
-	var ipv4Records []dns.RR
-	var ipv6Records []dns.RR
-
-	for _, record := range finalIPRecords {
-		if _, ok := record.(*dns.A); ok {
-			ipv4Records = append(ipv4Records, record)
-		} else if cp.isAAAARecord(record) {
-			ipv6Records = append(ipv6Records, record)
-		}
-	}
-
-	// IPv4和IPv6各自独立限制为配置的最大值
-	maxIPv4 := maxIPRecords
-	maxIPv6 := maxIPRecords
-
-	// 截取IPv4和IPv6记录
-	var resultRecords []dns.RR
-
-	// 添加IPv4记录（最多maxIPv4个）
-	for i, record := range ipv4Records {
-		if i >= maxIPv4 {
-			break
-		}
-		resultRecords = append(resultRecords, record)
-	}
-
-	// 添加IPv6记录（最多maxIPv6个）
-	for i, record := range ipv6Records {
-		if i >= maxIPv6 {
-			break
-		}
-		resultRecords = append(resultRecords, record)
-	}
-
-	// 创建并填充最终响应
-	processedResp := &dns.Msg{
+	// 创建结果响应
+	resultResp := &dns.Msg{
 		MsgHdr: resp.MsgHdr,
 		Question: []dns.Question{
 			{
@@ -232,65 +75,240 @@ func (cp *CNAMEProcessor) processDNSResponseWithCNAMERecursive(resp *dns.Msg, do
 		Ns:     append([]dns.RR{}, resp.Ns...),
 		Extra:  append([]dns.RR{}, resp.Extra...),
 	}
-	processedResp.Id = resp.Id
+	resultResp.Id = resp.Id
 
-	// 添加IP记录
-	for _, record := range resultRecords {
-		newRecord := dns.Copy(record)
-		newRecord.Header().Name = dns.Fqdn(domain)
-		processedResp.Answer = append(processedResp.Answer, newRecord)
+	// 使用辅助函数进行递归解析，保留完整的CNAME链
+	visited := make(map[string]bool) // 防止循环引用
+	resultResp = cp.processCNAMEChainWithFullPath(resp, domain, upstreams, visited, 0, cp.config.CNAMERecursionDepth)
+
+	// 限制IP记录数量，但保持CNAME记录在前的正确顺序
+	maxIPRecords := cp.config.MaxIPRecords
+	if maxIPRecords <= 0 {
+		maxIPRecords = 2 // 默认值
 	}
 
-	// 如果没有IP记录，但原始响应中有非循环CNAME记录，则添加它们
-	if len(resultRecords) == 0 {
-		for _, cname := range cnames {
-			canonicalTarget := strings.ToLower(strings.TrimSuffix(cname.Target, "."))
-			canonicalDomain := strings.ToLower(strings.TrimSuffix(domain, "."))
+	// 按照DNS协议推荐顺序重新组织记录：CNAME在前，IP在后
+	var orderedRecords []dns.RR
 
-			// 过滤自引用CNAME
-			if canonicalTarget == canonicalDomain {
-				cp.Logger.Debug("⚠️ 过滤自引用CNAME记录", map[string]interface{}{
-					"domain": domain,
-					"target": cname.Target,
+	// 首先添加所有CNAME记录
+	for _, record := range resultResp.Answer {
+		if _, ok := record.(*dns.CNAME); ok {
+			orderedRecords = append(orderedRecords, record)
+		}
+	}
+
+	// 然后添加IP记录（A和AAAA），但限制数量
+	var ipRecords []dns.RR
+	for _, record := range resultResp.Answer {
+		switch record.(type) {
+		case *dns.A, *dns.AAAA:
+			ipRecords = append(ipRecords, record)
+		}
+	}
+
+	// 限制IP记录数量并去重
+	var finalIPRecords []dns.RR
+	uniqueIPs := make(map[string]bool)
+	var ipv4Count, ipv6Count int
+
+	for _, record := range ipRecords {
+		var ipStr string
+		switch r := record.(type) {
+		case *dns.A:
+			ipStr = r.A.String()
+		case *dns.AAAA:
+			ipStr = r.AAAA.String()
+		}
+		if ipStr != "" && !uniqueIPs[ipStr] {
+			uniqueIPs[ipStr] = true
+			switch record.(type) {
+			case *dns.A:
+				if ipv4Count < maxIPRecords {
+					finalIPRecords = append(finalIPRecords, record)
+					ipv4Count++
+				}
+			case *dns.AAAA:
+				if ipv6Count < maxIPRecords {
+					finalIPRecords = append(finalIPRecords, record)
+					ipv6Count++
+				}
+			}
+			// 总数也不能超过maxIPRecords
+			if len(finalIPRecords) >= maxIPRecords {
+				break
+			}
+		}
+	}
+
+	// 合并记录：CNAME在前，IP在后
+	orderedRecords = append(orderedRecords, finalIPRecords...)
+
+	// 更新结果响应
+	resultResp.Answer = orderedRecords
+
+	cp.Logger.Debug("✅ RFC兼容CNAME解析完成", map[string]interface{}{
+		"domain":      domain,
+		"final_count": len(resultResp.Answer),
+		"max_allowed": maxIPRecords,
+		"ipv4_count":  cp.countType(resultResp.Answer, "A"),
+		"ipv6_count":  cp.countType(resultResp.Answer, "AAAA"),
+		"cname_count": cp.countType(resultResp.Answer, "CNAME"),
+	})
+
+	return resultResp
+}
+
+// processCNAMEChainWithFullPath 递归处理CNAME链，保留完整的解析路径
+func (cp *CNAMEProcessor) processCNAMEChainWithFullPath(resp *dns.Msg, originalDomain string, upstreams []string, visited map[string]bool, currentDepth, maxDepth int) *dns.Msg {
+	if resp == nil || currentDepth > maxDepth {
+		return resp
+	}
+
+	// 创建结果响应
+	resultResp := &dns.Msg{
+		MsgHdr: resp.MsgHdr,
+		Question: []dns.Question{
+			{
+				Name:   dns.Fqdn(originalDomain),
+				Qtype:  resp.Question[0].Qtype,
+				Qclass: resp.Question[0].Qclass,
+			},
+		},
+		Answer: []dns.RR{},
+		Ns:     append([]dns.RR{}, resp.Ns...),
+		Extra:  append([]dns.RR{}, resp.Extra...),
+	}
+	resultResp.Id = resp.Id
+
+	// 首先处理当前响应中的所有记录
+	// 根据RFC标准，我们只处理第一条CNAME记录
+	var firstCNAME *dns.CNAME
+	var otherRecords []dns.RR
+
+	for _, rr := range resp.Answer {
+		switch record := rr.(type) {
+		case *dns.CNAME:
+			// 防止自引用
+			target := strings.ToLower(strings.TrimSuffix(record.Target, "."))
+			source := strings.ToLower(strings.TrimSuffix(record.Hdr.Name, "."))
+
+			if target == source {
+				cp.Logger.Debug("⚠️ 跳过自引用CNAME", map[string]interface{}{
+					"domain": target,
 				})
 				continue
 			}
 
-			// 检查是否已经在结果中（避免重复添加）
-			alreadyAdded := false
-			for _, existing := range processedResp.Answer {
-				if existingCNAME, ok := existing.(*dns.CNAME); ok {
-					if strings.ToLower(strings.TrimSuffix(existingCNAME.Target, ".")) == canonicalTarget {
-						alreadyAdded = true
-						break
-					}
+			// 检查是否已访问过此目标（防止循环）
+			if visited[target] {
+				cp.Logger.Debug("⚠️ 检测到CNAME循环引用，但仍保留CNAME记录", map[string]interface{}{
+					"target": target,
+					"source": source,
+				})
+				// 即使是循环，也添加CNAME记录到结果中，但不继续解析
+				newCNAME := &dns.CNAME{
+					Hdr: dns.RR_Header{
+						Name:   dns.Fqdn(originalDomain), // 使用原始查询域名
+						Rrtype: dns.TypeCNAME,
+						Class:  dns.ClassINET,
+						Ttl:    record.Hdr.Ttl,
+					},
+					Target: record.Target,
 				}
+				resultResp.Answer = append(resultResp.Answer, newCNAME)
+				continue
 			}
-			if !alreadyAdded {
-				// 添加非自循环的CNAME记录
-				newRecord := dns.Copy(cname)
-				newRecord.Header().Name = dns.Fqdn(domain)
-				processedResp.Answer = append(processedResp.Answer, newRecord)
-			}
-		}
 
-		// 添加其他非IP记录
-		for _, record := range otherRecords {
+			// 只保留第一条CNAME记录，根据RFC标准
+			if firstCNAME == nil {
+				firstCNAME = record
+				// 添加CNAME记录到结果（使用原始查询域名作为名称）
+				newCNAME := &dns.CNAME{
+					Hdr: dns.RR_Header{
+						Name:   dns.Fqdn(originalDomain), // 使用原始查询域名
+						Rrtype: dns.TypeCNAME,
+						Class:  dns.ClassINET,
+						Ttl:    record.Hdr.Ttl,
+					},
+					Target: record.Target,
+				}
+				resultResp.Answer = append(resultResp.Answer, newCNAME)
+
+				// 如果还有深度可以解析，继续处理CNAME目标
+				if currentDepth+1 <= maxDepth {
+					// 标记为已访问，防止循环
+					visited[target] = true
+					visited[source] = true
+
+					queryReq := &dns.Msg{}
+					queryReq.SetQuestion(dns.Fqdn(target), resp.Question[0].Qtype)
+
+					// 尝试从缓存获取中间域名的响应
+					cachedResp, hit, _, _ := cp.cacheManager.Get(target, resp.Question[0].Qtype)
+					var queryResp *dns.Msg
+					var err error
+
+					if hit && cachedResp != nil {
+						cp.Logger.Debug("🎯 使用缓存的CNAME目标响应", map[string]interface{}{
+							"target": target,
+							"qtype":  dns.TypeToString[resp.Question[0].Qtype],
+						})
+						queryResp = cachedResp
+					} else {
+						// 如果缓存中没有，执行查询
+						queryResp, err = cp.proxyQuery(queryReq, upstreams)
+						if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
+							// 将查询结果缓存
+							cp.cacheManager.Set(target, resp.Question[0].Qtype, queryResp, false)
+							cp.Logger.Debug("💾 缓存CNAME目标查询结果", map[string]interface{}{
+								"target":       target,
+								"qtype":        dns.TypeToString[resp.Question[0].Qtype],
+								"answer_count": len(queryResp.Answer),
+							})
+						}
+					}
+
+					if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
+						// 递归处理CNAME目标的响应
+						subResult := cp.processCNAMEChainWithFullPath(queryResp, originalDomain, upstreams, visited, currentDepth+1, maxDepth)
+
+						// 将子结果中的所有记录（除了已添加的当前CNAME）添加到当前结果
+						// 但我们只需要添加IP记录，避免重复添加CNAME
+						for _, subRR := range subResult.Answer {
+							switch subRR.(type) {
+							case *dns.A, *dns.AAAA:
+								// 只添加IP记录
+								resultResp.Answer = append(resultResp.Answer, subRR)
+							}
+						}
+					} else {
+						cp.Logger.Debug("❌ CNAME目标查询失败", map[string]interface{}{
+							"target": target,
+							"error":  err,
+						})
+					}
+
+					// 移除标记，允许其他分支访问相同的域名
+					delete(visited, target)
+				}
+			} else {
+				// 如果不是第一条CNAME，将其作为其他记录处理
+				otherRecords = append(otherRecords, record)
+			}
+		default:
+			// 添加其他类型的记录，使用原始域名
 			newRecord := dns.Copy(record)
-			newRecord.Header().Name = dns.Fqdn(domain)
-			processedResp.Answer = append(processedResp.Answer, newRecord)
+			newRecord.Header().Name = dns.Fqdn(originalDomain) // 使用原始域名
+			otherRecords = append(otherRecords, newRecord)
 		}
 	}
 
-	cp.Logger.Debug("✅ CNAME处理完成", map[string]interface{}{
-		"domain":      domain,
-		"final_count": len(processedResp.Answer),
-		"max_allowed": maxIPRecords,
-		"ipv4_count":  cp.countType(processedResp.Answer, "A"),
-		"ipv6_count":  cp.countType(processedResp.Answer, "AAAA"),
-	})
+	// 添加非CNAME记录
+	for _, record := range otherRecords {
+		resultResp.Answer = append(resultResp.Answer, record)
+	}
 
-	return processedResp
+	return resultResp
 }
 
 // ProcessDNSResponseWithCNAMEAggressive 更积极地解析CNAME记录以收集更多IP
@@ -842,4 +860,104 @@ func (cp *CNAMEProcessor) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration) 
 			rr.Header().Ttl = minTTLSeconds
 		}
 	}
+}
+
+// extractFinalIPs 递归提取CNAME链的最终IP记录
+func (cp *CNAMEProcessor) extractFinalIPs(resp *dns.Msg, originalDomain string, upstreams []string, visited map[string]bool, currentDepth, maxDepth int) []dns.RR {
+	if resp == nil || currentDepth > maxDepth {
+		return []dns.RR{}
+	}
+
+	var finalIPs []dns.RR
+
+	// 查找当前响应中的CNAME记录
+	var cnameRecord *dns.CNAME
+	for _, rr := range resp.Answer {
+		if c, ok := rr.(*dns.CNAME); ok {
+			// 防止自引用
+			target := strings.ToLower(strings.TrimSuffix(c.Target, "."))
+			source := strings.ToLower(strings.TrimSuffix(c.Hdr.Name, "."))
+
+			if target == source {
+				cp.Logger.Debug("⚠️ 跳过自引用CNAME", map[string]interface{}{
+					"domain": target,
+				})
+				continue
+			}
+
+			// 检查是否已访问过此目标（防止循环）
+			if visited[target] {
+				cp.Logger.Debug("⚠️ 检测到CNAME循环引用", map[string]interface{}{
+					"target": target,
+					"source": source,
+				})
+				continue
+			}
+
+			cnameRecord = c
+			break // 只处理第一条CNAME记录，符合RFC标准
+		}
+	}
+
+	if cnameRecord != nil && currentDepth < maxDepth {
+		// 有CNAME记录且还有递归深度，继续递归查询
+		target := strings.ToLower(strings.TrimSuffix(cnameRecord.Target, "."))
+
+		// 标记为已访问，防止循环
+		visited[target] = true
+		source := strings.ToLower(strings.TrimSuffix(cnameRecord.Hdr.Name, "."))
+		visited[source] = true
+
+		queryReq := &dns.Msg{}
+		queryReq.SetQuestion(dns.Fqdn(target), resp.Question[0].Qtype)
+
+		// 尝试从缓存获取中间域名的响应
+		cachedResp, hit, _, _ := cp.cacheManager.Get(target, resp.Question[0].Qtype)
+		var queryResp *dns.Msg
+		var err error
+
+		if hit && cachedResp != nil {
+			cp.Logger.Debug("🎯 使用缓存的CNAME目标响应", map[string]interface{}{
+				"target": target,
+				"qtype":  dns.TypeToString[resp.Question[0].Qtype],
+			})
+			queryResp = cachedResp
+		} else {
+			// 如果缓存中没有，执行查询
+			queryResp, err = cp.proxyQuery(queryReq, upstreams)
+			if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
+				// 将查询结果缓存
+				cp.cacheManager.Set(target, resp.Question[0].Qtype, queryResp, false)
+				cp.Logger.Debug("💾 缓存CNAME目标查询结果", map[string]interface{}{
+					"target":       target,
+					"qtype":        dns.TypeToString[resp.Question[0].Qtype],
+					"answer_count": len(queryResp.Answer),
+				})
+			}
+		}
+
+		if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
+			// 递归处理CNAME目标的响应
+			subIPs := cp.extractFinalIPs(queryResp, originalDomain, upstreams, visited, currentDepth+1, maxDepth)
+			finalIPs = append(finalIPs, subIPs...)
+		} else {
+			cp.Logger.Debug("❌ CNAME目标查询失败", map[string]interface{}{
+				"target": target,
+				"error":  err,
+			})
+		}
+
+		// 移除标记，允许其他分支访问相同的域名
+		delete(visited, target)
+	} else {
+		// 没有CNAME记录或达到最大递归深度，提取IP记录
+		for _, rr := range resp.Answer {
+			switch rr.(type) {
+			case *dns.A, *dns.AAAA:
+				finalIPs = append(finalIPs, rr)
+			}
+		}
+	}
+
+	return finalIPs
 }

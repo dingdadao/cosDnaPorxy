@@ -44,12 +44,12 @@ china_domain_file_url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_
 log_level: "debug"
 
 # 域名检查开关配置
-enable_china_domain_check: false # 启用中国域名检查
+enable_china_domain_check: true # 启用中国域名检查
 enable_cloudflare_check: true # 启用Cloudflare域名检查
 enable_aws_check: false # 启用AWS域名检查
 
 # 缓存配置
 cache:
   max_items: 5000 # 最大缓存条目数
-  ttl: "50m" # 最小缓存TTL：当DNS响应的TTL小于该值时，使用此配置值
+  ttl: "5m" # 最小缓存TTL：当DNS响应的TTL小于该值时，使用此配置值
   max_async_workers: 2 # 最大异步工作线程数：并发处理异步刷新任务

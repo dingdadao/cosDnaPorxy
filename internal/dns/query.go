@@ -66,7 +66,11 @@ func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.M
 
 // proxyQueryWithCaching 带智能缓存的查询（只缓存成功的结果）
 func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, skipCloudDetection ...bool) (*dns.Msg, error) {
+	// 计时上游查询
+	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
+
 	if len(upstreams) == 0 {
+		upstreamTimer.End() // 确保计时器关闭
 		return nil, errors.New("no upstream servers available")
 	}
 
@@ -83,12 +87,16 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 		// 使用传统查询优化器
 		result = traditionalOptimizer.Query(req, upstreams)
 	} else {
+		upstreamTimer.End() // 确保计时器关闭
 		return nil, errors.New("unknown query optimizer type")
 	}
 
 	// 初始化返回给客户端的响应
 	var responseToReturn *dns.Msg
 	var errorToReturn error
+
+	// 获取上游查询时间
+	upstreamTime := upstreamTimer.End()
 
 	// 如果有成功的结果，先进行处理
 	if result.HasSuccess && result.SuccessResult != nil {
@@ -103,6 +111,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			"qtype":          dns.TypeToString[qtype],
 			"success_server": result.SuccessResult.Server,
 			"fastest_server": fastestServer,
+			"upstream_time":  upstreamTime,
 		})
 
 		// 设置初始响应
@@ -129,8 +138,9 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 				// 更新返回给客户端的响应
 				responseToReturn = cloudProcessedResp
 				h.Logger.Debug("☁️ 云服务检测并处理完成", map[string]interface{}{
-					"domain": domain,
-					"type":   detection.Type,
+					"domain":        domain,
+					"type":          detection.Type,
+					"upstream_time": upstreamTime,
 				})
 			} else {
 				// 对于普通域名，处理CNAME记录
@@ -151,6 +161,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			"success_time":   result.SuccessResult.ResponseTime.String(),
 			"rcode":          dns.RcodeToString[responseToReturn.Rcode],
 			"answers":        len(responseToReturn.Answer),
+			"upstream_time":  upstreamTime,
 		})
 	} else {
 		// 没有有效结果，返回最快结果（可能是错误）
@@ -161,6 +172,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 					"domain":         domain,
 					"fastest_server": result.FastestResult.Server,
 					"error":          result.FastestResult.Error.Error(),
+					"upstream_time":  upstreamTime,
 				})
 			} else {
 				responseToReturn = result.FastestResult.Response
@@ -168,6 +180,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 					"domain":         domain,
 					"fastest_server": result.FastestResult.Server,
 					"fastest_time":   result.FastestResult.ResponseTime.String(),
+					"upstream_time":  upstreamTime,
 				})
 			}
 		} else {

@@ -48,8 +48,9 @@ type Config struct {
 	CFCacheTime                string           `yaml:"cf_cache_time"`
 	CFMrsFile6URL              string           `yaml:"cf_mrs_file6_url"`
 	ReplaceCacheTime           string           `yaml:"replace_cache_time"`
-	NoAnswerCacheTime          string           `yaml:"no_answer_cache_time"` // 无答案响应的缓存时间
-	MaxIPRecords               int              `yaml:"max_ip_records"`       // 云域名替换时的最大IP记录数
+	NoAnswerCacheTime          string           `yaml:"no_answer_cache_time"`  // 无答案响应的缓存时间
+	MaxIPRecords               int              `yaml:"max_ip_records"`        // 云域名替换时的最大IP记录数
+	CNAMERecursionDepth        int              `yaml:"cname_recursion_depth"` // CNAME递归解析深度
 	AWSMrsFile46               string           `yaml:"aws_mrs_file64"`
 	AWSMrsFile46URL            string           `yaml:"aws_mrs_file64_url"`
 	ReplaceCFDomain            string           `yaml:"replace_cf_domain"`
@@ -120,6 +121,11 @@ func LoadConfig(path string) (*Config, error) {
 	// 设置最大IP记录数默认值
 	if config.MaxIPRecords == 0 {
 		config.MaxIPRecords = 2 // 默认2条记录
+	}
+
+	// 设置CNAME递归深度默认值
+	if config.CNAMERecursionDepth == 0 {
+		config.CNAMERecursionDepth = 1 // 默认只解析第一个CNAME，符合RFC标准
 	}
 
 	// 设置刷新间隔默认值

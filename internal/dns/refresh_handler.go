@@ -368,22 +368,94 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 					"upstreams":    upstreams,
 				})
 			} else {
-				rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
-					"domain": domain,
-				})
+				// 检查是否为中国域名（如果启用了中国域名检查）- 在云服务检测之后
+				if rh.config.EnableChinaDomainCheck {
+					rh.logger.Debug("🔍 [异步刷新-中国域名检测开始] ", map[string]interface{}{
+						"domain":  domain,
+						"enabled": rh.config.EnableChinaDomainCheck,
+					})
+					isChinaDomain := rh.matcherHandler.GetChinaMatcher().IsChinaDomain(domain)
+					if isChinaDomain {
+						rh.logger.Info("🇨🇳 [异步刷新-中国域名检测结果] ", map[string]interface{}{
+							"domain": domain,
+						})
 
-				// 对于普通域名，处理CNAME记录
-				processedResp := processDNSResponseWithCNAME(rh.logger, result.SuccessResult.Response, domain, upstreams, rh.proxyQuery)
-				ensureMinimumTTL(processedResp, rh.config.Cache.TTL)
-				rh.cacheManager.Set(domain, qtype, processedResp, isCloud, cloudType)
+						// 对于中国域名，使用中国DNS服务器进行查询
+						if rh.config.ChinaDNS != "" {
+							processedResp := processDNSResponseWithCNAME(rh.logger, result.SuccessResult.Response, domain, []string{rh.config.ChinaDNS}, rh.proxyQuery)
+							ensureMinimumTTL(processedResp, rh.config.Cache.TTL)
+							rh.cacheManager.Set(domain, qtype, processedResp, false, 0) // 中国域名不标记为云服务
 
-				rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
-					"domain":       domain,
-					"qtype":        dns.TypeToString[qtype],
-					"source":       "normal",
-					"answer_count": len(processedResp.Answer),
-					"upstreams":    upstreams,
-				})
+							rh.logger.Debug("🔄 [异步刷新完成-中国域名] ", map[string]interface{}{
+								"domain":       domain,
+								"qtype":        dns.TypeToString[qtype],
+								"source":       "china",
+								"answer_count": len(processedResp.Answer),
+								"upstreams":    []string{rh.config.ChinaDNS},
+							})
+						} else {
+							rh.logger.Warn("⚠️ [异步刷新-中国域名但未配置ChinaDNS] ", map[string]interface{}{
+								"domain": domain,
+							})
+							// 如果未配置ChinaDNS，按普通域名处理
+							processedResp := processDNSResponseWithCNAME(rh.logger, result.SuccessResult.Response, domain, upstreams, rh.proxyQuery)
+							ensureMinimumTTL(processedResp, rh.config.Cache.TTL)
+							rh.cacheManager.Set(domain, qtype, processedResp, false, 0)
+
+							rh.logger.Debug("🔄 [异步刷新完成-中国域名-普通处理] ", map[string]interface{}{
+								"domain":       domain,
+								"qtype":        dns.TypeToString[qtype],
+								"source":       "china_fallback_normal",
+								"answer_count": len(processedResp.Answer),
+								"upstreams":    upstreams,
+							})
+						}
+					} else {
+						rh.logger.Debug("❌ [异步刷新-非中国域名] ", map[string]interface{}{
+							"domain": domain,
+						})
+
+						rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
+							"domain": domain,
+						})
+
+						// 对于普通域名，处理CNAME记录
+						processedResp := processDNSResponseWithCNAME(rh.logger, result.SuccessResult.Response, domain, upstreams, rh.proxyQuery)
+						ensureMinimumTTL(processedResp, rh.config.Cache.TTL)
+						rh.cacheManager.Set(domain, qtype, processedResp, false, 0)
+
+						rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
+							"domain":       domain,
+							"qtype":        dns.TypeToString[qtype],
+							"source":       "normal",
+							"answer_count": len(processedResp.Answer),
+							"upstreams":    upstreams,
+						})
+					}
+				} else {
+					// 如果中国域名检查被禁用，执行原来的逻辑
+					rh.logger.Debug("⏭️ [异步刷新-中国域名检查已禁用] ", map[string]interface{}{
+						"domain":  domain,
+						"enabled": rh.config.EnableChinaDomainCheck,
+					})
+
+					rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
+						"domain": domain,
+					})
+
+					// 对于普通域名，处理CNAME记录
+					processedResp := processDNSResponseWithCNAME(rh.logger, result.SuccessResult.Response, domain, upstreams, rh.proxyQuery)
+					ensureMinimumTTL(processedResp, rh.config.Cache.TTL)
+					rh.cacheManager.Set(domain, qtype, processedResp, false, 0)
+
+					rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
+						"domain":       domain,
+						"qtype":        dns.TypeToString[qtype],
+						"source":       "normal",
+						"answer_count": len(processedResp.Answer),
+						"upstreams":    upstreams,
+					})
+				}
 			}
 		}
 	} else {
@@ -441,6 +513,10 @@ func (rh *RefreshHandler) determineUpstreamsForDomain(domain string) []string {
 
 // processDNSResponseWithCNAME 处理DNS响应并递归解析CNAME记录的辅助函数
 func processDNSResponseWithCNAME(logger *utils.EnhancedLogger, resp *dns.Msg, domain string, upstreams []string, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error)) *dns.Msg {
+	// 开始计时CNAME处理
+	cnameTimer := logger.StartTimer("cname_processing_async")
+	defer cnameTimer.End()
+
 	if resp == nil {
 		return resp
 	}
@@ -632,10 +708,12 @@ func processDNSResponseWithCNAME(logger *utils.EnhancedLogger, resp *dns.Msg, do
 		processedResp.Answer = append(processedResp.Answer, newRR)
 	}
 
+	cnameProcessingTime := cnameTimer.End()
 	logger.Debug("✅ CNAME处理完成", map[string]interface{}{
-		"domain":      domain,
-		"final_count": len(processedResp.Answer),
-		"max_allowed": maxIPRecords,
+		"domain":          domain,
+		"final_count":     len(processedResp.Answer),
+		"max_allowed":     maxIPRecords,
+		"processing_time": cnameProcessingTime,
 	})
 
 	return processedResp
