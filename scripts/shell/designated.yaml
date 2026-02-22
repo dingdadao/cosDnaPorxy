@@ -13,6 +13,7 @@ payload:
   # ===========================================
   # 微软 Bing 相关（关键字匹配：覆盖所有含 bing 的域名）
   - "DOMAIN-KEYWORD,bing,default_dns"
+  - "DOMAIN-KEYWORD,tbsgcs,default_dns"
 
   # 个人域名（DOMAIN-SUFFIX 覆盖子域名，无需单独配置 fn/qh 子域）
   - "DOMAIN-SUFFIX,niao.fun,default_dns"
