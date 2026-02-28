@@ -16,6 +16,17 @@ payload:
   - DOMAIN-SUFFIX,img.diwodiwo.xyz
   - DOMAIN-SUFFIX,btc760.com
   - DOMAIN-SUFFIX,rsc.cdn77.org
+  - DOMAIN-SUFFIX,dns.twnic.tw
+  - DOMAIN-SUFFIX,dns.google
+  - DOMAIN-SUFFIX,dns64.dns.google
+  - DOMAIN-SUFFIX,cloudflare-dns.com
+  - DOMAIN-SUFFIX,dns.cloudflare.com
+  - DOMAIN-SUFFIX,common.dot.dns.yandex.net
+  - DOMAIN-SUFFIX,dns9.quad9.net
+  - DOMAIN-SUFFIX,dns.quad9.net
+  - DOMAIN-SUFFIX,doh.dns.sb
+  - DOMAIN-SUFFIX,doh.sb
+  - DOMAIN-SUFFIX,doh.opendns.com
   - DOMAIN,efd0e8b4-0d77-4f5d-b267-b4ec9307f1fc.dingdadao.dpdns.org
   - IP-CIDR,1.1.1.1/32,no-resolve
   - IP-CIDR,8.8.8.8/32,no-resolve
