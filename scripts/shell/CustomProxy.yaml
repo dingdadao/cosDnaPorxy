@@ -26,7 +26,6 @@ payload:
   - DOMAIN-SUFFIX,dns.quad9.net
   - DOMAIN-SUFFIX,doh.dns.sb
   - DOMAIN-SUFFIX,doh.sb
-  - DOMAIN-SUFFIX,getchu.com
   - DOMAIN-SUFFIX,doh.opendns.com
   - DOMAIN,efd0e8b4-0d77-4f5d-b267-b4ec9307f1fc.dingdadao.dpdns.org
   - IP-CIDR,1.1.1.1/32,no-resolve
