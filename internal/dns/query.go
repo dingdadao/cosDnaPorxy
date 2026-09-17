@@ -1,8 +1,13 @@
 package dns
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -64,8 +69,9 @@ func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.M
 	return result.FastestResult.Response, nil
 }
 
-// proxyQueryWithCaching 带智能缓存的查询（只缓存成功的结果）
-func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, skipCloudDetection ...bool) (*dns.Msg, error) {
+// proxyQueryWithCaching 代理查询并缓存原始上游响应
+// 云检测统一在processQuery中执行（仅一次），此处只做查询+缓存，不再处理CNAME或检测云
+func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16) (*dns.Msg, error) {
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
 
@@ -73,9 +79,6 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 		upstreamTimer.End() // 确保计时器关闭
 		return nil, errors.New("no upstream servers available")
 	}
-
-	// 检查是否应该跳过云服务检测
-	shouldSkipCloudDetection := len(skipCloudDetection) > 0 && skipCloudDetection[0]
 
 	// 根据优化器类型选择查询方法
 	var result *ConcurrentQueryResult
@@ -91,104 +94,35 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 		return nil, errors.New("unknown query optimizer type")
 	}
 
-	// 初始化返回给客户端的响应
-	var responseToReturn *dns.Msg
-	var errorToReturn error
-
 	// 获取上游查询时间
 	upstreamTime := upstreamTimer.End()
 
-	// 如果有成功的结果，先进行处理
-	if result.HasSuccess && result.SuccessResult != nil {
-		// 检查 fastest_server 是否为空
-		fastestServer := "unknown"
-		if result.FastestResult != nil {
-			fastestServer = result.FastestResult.Server
-		}
-
-		h.Logger.Debug("💾 处理成功结果", map[string]interface{}{
+	// 有成功结果：缓存原始响应（负缓存TTL由cacheManager.Set按RFC 2308处理）并返回
+	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response != nil {
+		resp := result.SuccessResult.Response
+		h.cacheManager.Set(domain, qtype, resp, false)
+		h.Logger.Debug("✅ 上游查询成功并缓存原始响应", map[string]interface{}{
 			"domain":         domain,
 			"qtype":          dns.TypeToString[qtype],
 			"success_server": result.SuccessResult.Server,
-			"fastest_server": fastestServer,
+			"rcode":          dns.RcodeToString[resp.Rcode],
+			"answers":        len(resp.Answer),
 			"upstream_time":  upstreamTime,
 		})
+		return resp, nil
+	}
 
-		// 设置初始响应
-		responseToReturn = result.SuccessResult.Response
-
-		// 只有在不跳过云服务检测时才进行云服务检测
-		if shouldSkipCloudDetection {
-			// 对于定向域名，跳过云服务检测，直接缓存结果
-			// 处理CNAME记录
-			processedResp := h.processDNSResponseWithCNAME(responseToReturn, domain, upstreams)
-			h.cacheManager.Set(domain, qtype, processedResp, false)
-			// 更新返回给客户端的响应
-			responseToReturn = processedResp
-		} else {
-			// 检查是否为云服务
-			detection := h.cloudDetector.DetectCloudService(result.SuccessResult.Response, domain)
-			isCloud := detection.Type != CloudTypeNone
-
-			if isCloud {
-				// 对于云域名，使用专门的云域名处理方法
-				cloudProcessedResp := h.processCloudResponse(result.SuccessResult.Response, domain)
-				// 将整个域名标记为云服务域名（确保A/AAAA记录一致性）
-				h.cacheManager.MarkDomainAsCloud(domain, qtype, int(detection.Type))
-				// 更新返回给客户端的响应
-				responseToReturn = cloudProcessedResp
-				h.Logger.Debug("☁️ 云服务检测并处理完成", map[string]interface{}{
-					"domain":        domain,
-					"type":          detection.Type,
-					"upstream_time": upstreamTime,
-				})
-			} else {
-				// 对于普通域名，处理CNAME记录
-				processedResp := h.processDNSResponseWithCNAME(responseToReturn, domain, upstreams)
-				h.cacheManager.Set(domain, qtype, processedResp, isCloud)
-				// 更新返回给客户端的响应
-				responseToReturn = processedResp
-			}
+	// 没有有效结果，返回最快结果（可能是错误）
+	if result.FastestResult != nil {
+		if result.FastestResult.Error != nil {
+			return nil, result.FastestResult.Error
+		}
+		if result.FastestResult.Response != nil {
+			return result.FastestResult.Response, nil
 		}
 	}
 
-	// 确定最终返回给客户端的响应
-	if h.IsValidDNSResult(result) {
-		// 有有效结果，返回处理后的结果
-		h.Logger.Debug("✅ 返回处理后的结果给客户端", map[string]interface{}{
-			"domain":         domain,
-			"success_server": result.SuccessResult.Server,
-			"success_time":   result.SuccessResult.ResponseTime.String(),
-			"rcode":          dns.RcodeToString[responseToReturn.Rcode],
-			"answers":        len(responseToReturn.Answer),
-			"upstream_time":  upstreamTime,
-		})
-	} else {
-		// 没有有效结果，返回最快结果（可能是错误）
-		if result.FastestResult != nil {
-			if result.FastestResult.Error != nil {
-				errorToReturn = result.FastestResult.Error
-				h.Logger.Debug("❌ 返回最快错误结果", map[string]interface{}{
-					"domain":         domain,
-					"fastest_server": result.FastestResult.Server,
-					"error":          result.FastestResult.Error.Error(),
-					"upstream_time":  upstreamTime,
-				})
-			} else {
-				responseToReturn = result.FastestResult.Response
-				h.Logger.Debug("⚠️ 返回最快结果（无成功结果）", map[string]interface{}{
-					"domain":         domain,
-					"fastest_server": result.FastestResult.Server,
-					"fastest_time":   result.FastestResult.ResponseTime.String(),
-					"upstream_time":  upstreamTime,
-				})
-			}
-		} else {
-			errorToReturn = errors.New("all upstream queries failed")
-		}
-	}
-
-	return responseToReturn, errorToReturn
+	return nil, errors.New("all upstream queries failed")
 }
 
 // ValidateDNSResult 验证查询结果是否包含有效的 DNS 记录
@@ -339,10 +273,13 @@ func (h *RefactoredHandler) queryUDP(req *dns.Msg, server string) (*dns.Msg, err
 	// 移除udp://前缀
 	addr := strings.TrimPrefix(server, "udp://")
 
-	client := &dns.Client{
-		Net:     "udp",
-		Timeout: h.config.Timeout,
-	}
+	// 使用连接池获取客户端
+	client := h.udpConnPool.GetClient(addr, h.config.Timeout)
+
+	// 确保在函数结束时归还客户端到池中
+	defer func() {
+		h.udpConnPool.PutClient(addr)
+	}()
 
 	resp, _, err := client.Exchange(req, addr)
 	return resp, err
@@ -353,10 +290,13 @@ func (h *RefactoredHandler) queryTCP(req *dns.Msg, server string) (*dns.Msg, err
 	// 移除tcp://前缀
 	addr := strings.TrimPrefix(server, "tcp://")
 
-	client := &dns.Client{
-		Net:     "tcp",
-		Timeout: h.config.Timeout,
-	}
+	// 使用连接池获取客户端
+	client := h.tcpConnPool.GetClient(addr, h.config.Timeout)
+
+	// 确保在函数结束时归还客户端到池中
+	defer func() {
+		h.tcpConnPool.PutClient(addr)
+	}()
 
 	resp, _, err := client.Exchange(req, addr)
 	return resp, err
@@ -364,22 +304,106 @@ func (h *RefactoredHandler) queryTCP(req *dns.Msg, server string) (*dns.Msg, err
 
 // queryDoH 执行DoH DNS查询
 func (h *RefactoredHandler) queryDoH(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 使用SimpleModernOptimizer的方法
-	optimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer)
-	if !ok {
-		return nil, fmt.Errorf("not a SimpleModernOptimizer")
+	// 使用连接池获取HTTP客户端
+	client := h.dohConnPool.GetClient(server)
+
+	// 解析URL
+	u, err := url.Parse(server)
+	if err != nil {
+		return nil, fmt.Errorf("invalid DoH URL: %w", err)
 	}
-	return optimizer.queryDoH(req, server)
+
+	// 如果没有路径，使用默认的/dns-query
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/dns-query"
+	}
+
+	// 将DNS消息编码为wireformat
+	wireData, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack DNS message: %w", err)
+	}
+
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(context.Background(), h.config.ModernTimeout)
+	defer cancel()
+
+	// 创建HTTP请求
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(wireData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// 设置DoH头部
+	httpReq.Header.Set("Content-Type", "application/dns-message")
+	httpReq.Header.Set("Accept", "application/dns-message")
+
+	// 发送请求
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("DoH request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	// 检查HTTP状态码
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH request failed with status: %d", httpResp.StatusCode)
+	}
+
+	// 读取响应数据
+	respData, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DoH response: %w", err)
+	}
+
+	// 解析DNS响应
+	resp := new(dns.Msg)
+	if err := resp.Unpack(respData); err != nil {
+		return nil, fmt.Errorf("failed to unpack DNS response: %w", err)
+	}
+
+	return resp, nil
 }
 
 // queryDoT 执行DoT DNS查询
 func (h *RefactoredHandler) queryDoT(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 使用SimpleModernOptimizer的方法
-	optimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer)
-	if !ok {
-		return nil, fmt.Errorf("not a SimpleModernOptimizer")
+	// 使用连接池获取DoT连接
+	ctx := context.Background()
+	conn, err := h.dotConnPool.GetConn(ctx, server)
+	if err != nil {
+		h.Logger.Error("获取DoT连接失败", map[string]interface{}{
+			"server": server,
+			"error":  err,
+		})
+		return nil, err
 	}
-	return optimizer.queryDoT(req, server)
+
+	// 确保在函数结束时归还连接到池中
+	defer func() {
+		h.dotConnPool.PutConn(conn)
+	}()
+
+	// 使用TLS连接创建dns.Conn并执行查询
+	dnsConn := &dns.Conn{Conn: conn.tlsConn}
+	err = dnsConn.WriteMsg(req)
+	if err != nil {
+		h.Logger.Error("DoT写入请求失败", map[string]interface{}{
+			"server": server,
+			"error":  err,
+		})
+		return nil, err
+	}
+
+	resp, err := dnsConn.ReadMsg()
+	if err != nil {
+		h.Logger.Error("DoT读取响应失败", map[string]interface{}{
+			"server": server,
+			"error":  err,
+		})
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // queryDoH3 执行DoH3 DNS查询

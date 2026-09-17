@@ -12,72 +12,47 @@ import (
 
 // 常量定义
 const (
-	DefaultConfigPath = "configs/config.yaml"
+	DefaultConfigPath = "config.yaml"
 	DefaultLogLevel   = "info"
 )
 
 // CacheConfig 缓存配置
 type CacheConfig struct {
 	MaxItems        int           `yaml:"max_items"`         // 最大缓存条目数
-	TTL             time.Duration `yaml:"ttl"`               // 最小缓存TTL
+	TTL             time.Duration `yaml:"ttl"`               // 兜底缓存TTL：上游未提供TTL时使用，不再抬高上游TTL
 	MaxAsyncWorkers int           `yaml:"max_async_workers"` // 最大异步工作线程数
-}
-
-// UpstreamServer 上游服务器配置
-type UpstreamServer struct {
-	Name          string        `yaml:"name"`            // 服务器名称
-	Address       string        `yaml:"address"`         // 服务器地址
-	Protocol      string        `yaml:"protocol"`        // 协议类型：udp/tcp/doh/dot/doh3
-	Endpoint      string        `yaml:"endpoint"`        // DoH/DoH3 端点路径
-	CacheTime     time.Duration `yaml:"cache_time"`      // 连接缓存时间
-	TLSServerName string        `yaml:"tls_server_name"` // TLS服务器名称
-	Weight        int           `yaml:"weight"`          // 权重（用于负载均衡）
-	Priority      int           `yaml:"priority"`        // 优先级（数字越小优先级越高）
 }
 
 // Config 配置结构体
 type Config struct {
-	ListenPort                 int              `yaml:"listen_port"`
-	Upstream                   []string         `yaml:"upstream"`         // 保留兼容性
-	UpstreamServers            []UpstreamServer `yaml:"upstream_servers"` // 新的上游服务器配置
-	Timeout                    time.Duration    `yaml:"timeout"`          // DNS查询超时（支持2s、2m、2h格式）
-	ModernTimeout              time.Duration    `yaml:"modern_timeout"`   // 现代协议超时（支持2s、2m、2h格式）
-	CFMrsFile4                 string           `yaml:"cf_mrs_file4"`
-	CFMrsFile4URL              string           `yaml:"cf_mrs_file4_url"`
-	CFMrsFile6                 string           `yaml:"cf_mrs_file6"`
-	CFCacheTime                string           `yaml:"cf_cache_time"`
-	CFMrsFile6URL              string           `yaml:"cf_mrs_file6_url"`
-	ReplaceCacheTime           string           `yaml:"replace_cache_time"`
-	NoAnswerCacheTime          string           `yaml:"no_answer_cache_time"`  // 无答案响应的缓存时间
-	MaxIPRecords               int              `yaml:"max_ip_records"`        // 云域名替换时的最大IP记录数
-	CNAMERecursionDepth        int              `yaml:"cname_recursion_depth"` // CNAME递归解析深度
-	AWSMrsFile46               string           `yaml:"aws_mrs_file64"`
-	AWSMrsFile46URL            string           `yaml:"aws_mrs_file64_url"`
-	ReplaceCFDomain            string           `yaml:"replace_cf_domain"`
-	ReplaceAWSDomain           string           `yaml:"replace_aws_domain"`
-	DefaultDNS                 string           `yaml:"default_dns"` // 默认DNS服务器（支持URL scheme格式）
-	BackupDNS                  string           `yaml:"backup_dns"`  // 备用DNS服务器
-	WhitelistFile              string           `yaml:"whitelist_file"`
-	DesignatedDomain           string           `yaml:"designated_domain"`
-	DesignatedDomainURL        string           `yaml:"designated_domain_url"` // 定向域名文件URL
-	LogLevel                   string           `yaml:"log_level"`
-	LogFormat                  string           `yaml:"log_format"` // 添加日志格式配置
-	TLSCertFile                string           `yaml:"tls_cert_file"`
-	TLSKeyFile                 string           `yaml:"tls_key_file"`
-	Cache                      CacheConfig      `yaml:"cache"`
-	CloudflareNetFile          string           `yaml:"cloudflare_net_file"`
-	CloudflareNetFile6         string           `yaml:"cloudflare_net_file6"`
-	AWSNetFile                 string           `yaml:"aws_net_file"`
-	WhitelistRefreshInterval   time.Duration    `yaml:"whitelist_refresh"`         // 白名单刷新间隔（支持30m、1h格式）
-	DesignatedRefreshInterval  time.Duration    `yaml:"designated_refresh"`        // 定向域名刷新间隔（支持30m、1h格式）
-	NetworkRefreshInterval     time.Duration    `yaml:"network_refresh"`           // 网络段刷新间隔（支持24h、1d格式）
-	ChinaDomainFile            string           `yaml:"china_domain_file"`         // 中国域名列表文件
-	ChinaDomainFileURL         string           `yaml:"china_domain_file_url"`     // 中国域名列表文件URL
-	ChinaDomainRefreshInterval time.Duration    `yaml:"china_domain_refresh"`      // 中国域名刷新间隔（支持24h、1d格式）
-	ChinaDNS                   string           `yaml:"china_dns"`                 // 中国DNS服务器
-	EnableChinaDomainCheck     bool             `yaml:"enable_china_domain_check"` // 启用中国域名检查
-	EnableCloudflareCheck      bool             `yaml:"enable_cloudflare_check"`   // 启用Cloudflare域名检查
-	EnableAWSCheck             bool             `yaml:"enable_aws_check"`          // 启用AWS域名检查
+	ListenPort                 int           `yaml:"listen_port"`
+	Upstream                   []string      `yaml:"upstream"`           // 上游DNS服务器（统一URL scheme）
+	Timeout                    time.Duration `yaml:"timeout"`            // 传统协议(UDP/TCP)查询超时
+	ModernTimeout              time.Duration `yaml:"modern_timeout"`     // 现代协议(DoH/DoT/DoH3)查询超时
+	ReplaceCacheTime           time.Duration `yaml:"replace_cache_time"` // 云替换响应缓存时间
+	MaxIPRecords               int           `yaml:"max_ip_records"`     // 替换域名使用的最大IP数
+	CNAMERecursionDepth        int           `yaml:"cname_recursion_depth"` // CNAME链收集深度（仅用于云检测）
+	ReplaceCFDomain            string        `yaml:"replace_cf_domain"`
+	ReplaceAWSDomain           string        `yaml:"replace_aws_domain"`
+	DefaultDNS                 string        `yaml:"default_dns"` // 定向域名未指定DNS时的默认DNS
+	BackupDNS                  string        `yaml:"backup_dns"`  // 所有上游失败后的备用DNS
+	ChinaDNS                   string        `yaml:"china_dns"`   // 中国域名解析DNS
+	DesignatedDomain           string        `yaml:"designated_domain"`
+	DesignatedDomainURL        string        `yaml:"designated_domain_url"` // 定向域名文件URL（优先于本地文件）
+	DesignatedRefreshInterval  time.Duration `yaml:"designated_refresh"`
+	ChinaDomainFile            string        `yaml:"china_domain_file"`
+	ChinaDomainFileURL         string        `yaml:"china_domain_file_url"` // 中国域名列表URL（优先于本地文件）
+	ChinaDomainRefreshInterval time.Duration `yaml:"china_domain_refresh"`
+	CloudflareNetFile          string        `yaml:"cloudflare_net_file"`
+	CloudflareNetFile6         string        `yaml:"cloudflare_net_file6"`
+	AWSNetFile                 string        `yaml:"aws_net_file"`
+	NetworkRefreshInterval     time.Duration `yaml:"network_refresh"`
+	LogLevel                   string        `yaml:"log_level"`
+	LogFormat                  string        `yaml:"log_format"`
+	Cache                      CacheConfig   `yaml:"cache"`
+	EnableChinaDomainCheck     bool          `yaml:"enable_china_domain_check"`
+	EnableCloudflareCheck      bool          `yaml:"enable_cloudflare_check"`
+	EnableAWSCheck             bool          `yaml:"enable_aws_check"`
 }
 
 // LoadConfig 加载配置文件
@@ -96,64 +71,67 @@ func LoadConfig(path string) (*Config, error) {
 	if config.LogLevel == "" {
 		config.LogLevel = DefaultLogLevel
 	}
-
-	// 设置日志格式默认值
 	if config.LogFormat == "" {
-		config.LogFormat = "text" // 默认文本格式
+		config.LogFormat = "text"
 	}
 
 	// 设置超时默认值
 	if config.Timeout == 0 {
-		config.Timeout = 5 * time.Second // 默认5秒超时
+		config.Timeout = 5 * time.Second
 	}
 	if config.ModernTimeout == 0 {
-		config.ModernTimeout = 3 * time.Second // 现代协议默认3秒超时
+		config.ModernTimeout = 3 * time.Second
 	}
 
 	// 设置缓存默认值
 	if config.Cache.MaxItems == 0 {
-		config.Cache.MaxItems = 5000 // 默认5000个条目
+		config.Cache.MaxItems = 5000
 	}
 	if config.Cache.TTL == 0 {
-		config.Cache.TTL = 300 * time.Second // 5分钟默认TTL
+		config.Cache.TTL = 300 * time.Second
 	}
 
 	// 设置最大IP记录数默认值
 	if config.MaxIPRecords == 0 {
-		config.MaxIPRecords = 2 // 默认2条记录
+		config.MaxIPRecords = 2
 	}
 
-	// 设置CNAME递归深度默认值
+	// 设置CNAME链收集深度默认值（仅用于云检测，不对客户端响应做递归重写）
 	if config.CNAMERecursionDepth == 0 {
-		config.CNAMERecursionDepth = 1 // 默认只解析第一个CNAME，符合RFC标准
+		config.CNAMERecursionDepth = 1
+	}
+
+	// 云替换响应缓存时间默认值
+	if config.ReplaceCacheTime == 0 {
+		config.ReplaceCacheTime = 30 * time.Minute
 	}
 
 	// 设置刷新间隔默认值
-	if config.WhitelistRefreshInterval == 0 {
-		config.WhitelistRefreshInterval = 30 * time.Minute // 默认30分钟
-	}
 	if config.DesignatedRefreshInterval == 0 {
-		config.DesignatedRefreshInterval = 30 * time.Minute // 默认30分钟
+		config.DesignatedRefreshInterval = 30 * time.Minute
+	}
+	if config.ChinaDomainRefreshInterval == 0 {
+		config.ChinaDomainRefreshInterval = 24 * time.Hour
 	}
 	if config.NetworkRefreshInterval == 0 {
-		config.NetworkRefreshInterval = 24 * time.Hour // 默认24小时
+		config.NetworkRefreshInterval = 24 * time.Hour
 	}
 
 	// 设置开关默认值（如果配置文件中未明确设置，则启用）
 	if !isFieldSetInConfig(cfgData, "enable_china_domain_check") {
-		config.EnableChinaDomainCheck = true // 默认启用中国域名检查
+		config.EnableChinaDomainCheck = true
 	}
 	if !isFieldSetInConfig(cfgData, "enable_cloudflare_check") {
-		config.EnableCloudflareCheck = true // 默认启用Cloudflare检查
+		config.EnableCloudflareCheck = true
 	}
 	if !isFieldSetInConfig(cfgData, "enable_aws_check") {
-		config.EnableAWSCheck = true // 默认启用AWS检查
+		config.EnableAWSCheck = true
 	}
 
 	return &config, nil
 }
 
-// isFieldSetInConfig 检查配置文件中是否设置了某个字段
+// isFieldSetInConfig 检查配置文件中是否设置了某个布尔字段
 func isFieldSetInConfig(configData []byte, fieldName string) bool {
 	configStr := string(configData)
 	lines := strings.Split(configStr, "\n")

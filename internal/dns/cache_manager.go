@@ -33,9 +33,6 @@ type CacheManager struct {
 	// 刷新回调
 	refreshCallback RefreshCallback
 
-	// 云服务检测器
-	cloudDetector *CloudDetector
-
 	// 单飞行组，用于避免对同一域名的重复查询
 	flightGroup singleflight.Group
 }
@@ -57,15 +54,16 @@ type AsyncWorkerPool struct {
 }
 
 // NewCacheManager 创建缓存管理器
-func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger, cloudDetector *CloudDetector, metrics interface{}) *CacheManager {
+// 注意：云检测统一在查询流程中执行（见 handler.processQuery），
+// 缓存层不再做云检测，避免同一响应被重复扫描。
+func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger) *CacheManager {
 	cm := &CacheManager{
-		cache:         NewOptimizedDNSCache(cfg.Cache.MaxItems, cfg.Cache.TTL),
-		config:        cfg,
-		logger:        logger,
-		cloudDetector: cloudDetector,
-		asyncChan:     make(chan *AsyncRefreshTask, 1000),
-		asyncSet:      make(map[string]struct{}),
-		domainLocks:   make(map[string]*sync.Mutex),
+		cache:       NewOptimizedDNSCache(cfg.Cache.MaxItems, cfg.Cache.TTL),
+		config:      cfg,
+		logger:      logger,
+		asyncChan:   make(chan *AsyncRefreshTask, 1000),
+		asyncSet:    make(map[string]struct{}),
+		domainLocks: make(map[string]*sync.Mutex),
 		workerPool: &AsyncWorkerPool{
 			workers: cfg.Cache.MaxAsyncWorkers,
 			stopCh:  make(chan struct{}),
@@ -157,17 +155,11 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 	return resp, hit, cloudType
 }
 
-// GetWithFlight 获取缓存，使用单飞行模式避免重复查询
+// GetWithFlight 获取缓存响应（使用单飞行模式避免重复查询）
 func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
-	timer := cm.logger.StartTimer("cache_get_flight", map[string]interface{}{
-		"domain": domain,
-		"qtype":  dns.TypeToString[qtype],
-	})
-	defer timer.End()
-
 	// 使用单飞行模式来避免对同一域名的重复查询
 	v, err, _ := cm.flightGroup.Do(domain+"|"+dns.TypeToString[qtype], func() (interface{}, error) {
-		resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype)
+		resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype) // 恢复原始逻辑
 		return struct {
 			Resp      *dns.Msg
 			Hit       bool
@@ -230,11 +222,9 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 	}
 
 	// 使用自定义TTL或默认TTL
-	var ttl time.Duration
+	ttl := cm.config.Cache.TTL
 	if len(customTTL) > 0 {
 		ttl = customTTL[0]
-	} else {
-		ttl = cm.calculateTTL(response)
 	}
 
 	cm.cache.SetCloudResponse(domain, qtype, response, cloudType, ttl)
@@ -326,31 +316,15 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 		return
 	}
 
-	// 检查响应是否包含云服务IP，如果是，则标记为云服务域名
-	if cm.cloudDetector != nil {
-		detection := cm.cloudDetector.DetectCloudService(response, domain)
-		if detection.Type != CloudTypeNone {
-			isCloud = true
-			cloudType = []int{int(detection.Type)}
-			cm.cache.Set(domain, qtype, nil, true, cloudType...)
-			cm.logger.Debug("☁️ 检测到云服务IP，已标记域名", map[string]interface{}{
-				"domain":     domain,
-				"qtype":      dns.TypeToString[qtype],
-				"cloud_type": detection.Type,
-			})
-			return
-		}
-	}
-
-	// 检查是否为失败的DNS响应（如NXDOMAIN），如果是则使用较短的TTL
+	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
 	if response.Rcode != dns.RcodeSuccess {
-		shortTTL := 5 * time.Second
-		cm.cache.SetWithTTL(domain, qtype, response, isCloud, shortTTL, cloudType...)
-		cm.logger.Debug("💾 失败响应已缓存（短TTL）", map[string]interface{}{
+		negTTL := soaNegativeTTL(response, 5*time.Second)
+		cm.cache.SetWithTTL(domain, qtype, response, isCloud, negTTL, cloudType...)
+		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"rcode":  dns.RcodeToString[response.Rcode],
-			"ttl":    shortTTL.String(),
+			"ttl":    negTTL.String(),
 		})
 	} else {
 		// 缓存普通成功响应
@@ -394,31 +368,15 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 		return
 	}
 
-	// 检查响应是否包含云服务IP，如果是，则标记为云服务域名
-	if cm.cloudDetector != nil {
-		detection := cm.cloudDetector.DetectCloudService(response, domain)
-		if detection.Type != CloudTypeNone {
-			isCloud = true
-			cloudType = []int{int(detection.Type)}
-			cm.cache.Set(domain, qtype, nil, true, cloudType...)
-			cm.logger.Debug("☁️ 检测到云服务IP，已标记域名", map[string]interface{}{
-				"domain":     domain,
-				"qtype":      dns.TypeToString[qtype],
-				"cloud_type": detection.Type,
-			})
-			return
-		}
-	}
-
-	// 检查是否为失败的DNS响应（如NXDOMAIN），如果是则使用较短的TTL
+	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
 	if response.Rcode != dns.RcodeSuccess {
-		shortTTL := 5 * time.Second
-		cm.cache.SetWithTTL(domain, qtype, response, isCloud, shortTTL, cloudType...)
-		cm.logger.Debug("💾 失败响应已缓存（短TTL）", map[string]interface{}{
+		negTTL := soaNegativeTTL(response, 5*time.Second)
+		cm.cache.SetWithTTL(domain, qtype, response, isCloud, negTTL, cloudType...)
+		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"rcode":  dns.RcodeToString[response.Rcode],
-			"ttl":    shortTTL.String(),
+			"ttl":    negTTL.String(),
 		})
 	} else {
 		// 使用自定义TTL缓存响应
@@ -431,35 +389,22 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 	}
 }
 
-// calculateTTL 计算响应的实际TTL（使用配置的TTL作为最小值）
-func (cm *CacheManager) calculateTTL(response *dns.Msg) time.Duration {
-	if response == nil || len(response.Answer) == 0 {
-		return cm.config.Cache.TTL
-	}
-
-	// 从响应中获取最小的TTL
-	var minTTL uint32 = 0
-	for _, rr := range response.Answer {
-		if rr.Header().Ttl > 0 {
-			if minTTL == 0 || rr.Header().Ttl < minTTL {
-				minTTL = rr.Header().Ttl
+// soaNegativeTTL 从响应的Authority段提取SOA的负缓存TTL（RFC 2308：取SOA.MINIMUM与SOA TTL的较小值）
+func soaNegativeTTL(response *dns.Msg, fallback time.Duration) time.Duration {
+	if response != nil {
+		for _, rr := range response.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				ttl := soa.Hdr.Ttl
+				if soa.Minttl < ttl {
+					ttl = soa.Minttl
+				}
+				if ttl > 0 {
+					return time.Duration(ttl) * time.Second
+				}
 			}
 		}
 	}
-
-	// 如果没有有效的TTL，使用配置的TTL
-	if minTTL == 0 {
-		return cm.config.Cache.TTL
-	}
-
-	upstreamTTL := time.Duration(minTTL) * time.Second
-	configTTL := cm.config.Cache.TTL
-
-	// 返回两者中的较大值（使用配置的TTL作为最小值）
-	if upstreamTTL > configTTL {
-		return upstreamTTL
-	}
-	return configTTL
+	return fallback
 }
 
 // isValidDNSResponse 验证DNS响应是否值得缓存

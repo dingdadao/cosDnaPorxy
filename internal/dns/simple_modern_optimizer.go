@@ -1,7 +1,6 @@
 package dns
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -36,6 +35,12 @@ type SimpleModernOptimizer struct {
 	// 连接缓存
 	connCache map[string]interface{}
 	cacheMu   sync.RWMutex
+
+	// Handler提供的方法（用于各种协议的连接池查询）
+	udpQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
+	tcpQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
+	doHQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
+	doTQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
 }
 
 // NewSimpleModernOptimizer 创建简化的现代DNS查询优化器
@@ -110,6 +115,15 @@ func (qo *SimpleModernOptimizer) Query(req *dns.Msg, upstreams []string) *Concur
 	}
 
 	return qo.concurrentQuery(req, upstreams)
+}
+
+// ServerStats 服务器统计信息
+type ServerStats struct {
+	Server       string
+	AvgResponseTime time.Duration
+	SuccessRate  float64
+	QueryCount   int
+	LastSuccess  time.Time
 }
 
 // concurrentQuery 并发查询多个上游服务器
@@ -206,7 +220,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	resultChan := make(chan *QueryResult, len(validUpstreams))
 	var wg sync.WaitGroup
 
-	qo.logger.Debug("🚀 开始简化并发DNS查询", map[string]interface{}{
+	qo.logger.Debug("🚀 开始智能并发DNS查询", map[string]interface{}{
 		"total_upstreams": len(upstreams),
 		"valid_upstreams": len(validUpstreams),
 		"domain":          req.Question[0].Name,
@@ -219,8 +233,8 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			// panic恢复机制
 			defer func() {
 				if r := recover(); r != nil {
-					qo.logger.Error("💥 [简化DNS查询panic] ", map[string]interface{}{
-						"rule":        "SIMPLE_DNS_QUERY_PANIC",
+					qo.logger.Error("💥 [DNS查询panic] ", map[string]interface{}{
+						"rule":        "DNS_QUERY_PANIC",
 						"server":      server,
 						"panic_msg":   fmt.Sprintf("%v", r),
 						"stack_trace": string(debug.Stack()),
@@ -259,11 +273,12 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	var fastestResult *QueryResult
 	var successResult *QueryResult
 	var fastestValidResult *QueryResult // 最快的有效结果
+	var fastestValidTime time.Duration
 	var fastestTime time.Duration
 	hasSuccess := false
 	hasValidResponse := false
 
-	// 优化：一旦发现有效结果就立即返回，而不是等待所有查询完成
+	// 优化：实现智能快速返回策略
 	// 创建一个用于快速返回的通道
 	quickReturnChan := make(chan *QueryResult, 1)
 
@@ -298,28 +313,45 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 
 					// 检查是否有答案（更优先的结果）
 					if len(result.Response.Answer) > 0 {
-						if !hasValidResponse {
+						// 记录最快的有效结果
+						if !hasValidResponse || result.ResponseTime < fastestValidTime {
 							fastestValidResult = result
+							fastestValidTime = result.ResponseTime
 							hasValidResponse = true
-							qo.logger.Debug("🏆 发现第一个有效结果", map[string]interface{}{
+							qo.logger.Debug("🏆 发现有效结果", map[string]interface{}{
 								"server":  result.Server,
 								"time":    result.ResponseTime.String(),
 								"answers": len(result.Response.Answer),
 								"rcode":   dns.RcodeToString[result.Response.Rcode],
 							})
-							// 一旦发现有效结果，立即发送到快速返回通道并停止等待
-							select {
-							case quickReturnChan <- result:
-								// 发现有效结果后，取消上下文以停止其他查询
-								cancel()
-							default:
-								// 如果通道已满，忽略
+
+							// 智能快速返回策略：
+							// 1. 如果响应时间非常快（小于100ms），立即返回
+							// 2. 如果已经有多个有效结果，选择最快的返回
+							if result.ResponseTime < 100*time.Millisecond {
+								// 响应时间非常快，立即返回
+								select {
+								case quickReturnChan <- result:
+									// 发现快速有效结果后，取消上下文以停止其他查询
+									cancel()
+								default:
+									// 如果通道已满，忽略
+								}
+								// 发现快速有效结果后立即返回
+								return
 							}
-							// 发现有效结果后立即返回
-							return
 						}
 					}
 				}
+			}
+		}
+
+		// 所有查询完成后，如果有有效结果，选择最快的返回
+		if hasValidResponse && fastestValidResult != nil {
+			select {
+			case quickReturnChan <- fastestValidResult:
+			default:
+				// 如果通道已满，忽略
 			}
 		}
 	}()
@@ -328,8 +360,8 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	var bestResult *QueryResult
 	select {
 	case bestResult = <-quickReturnChan:
-		// 收到第一个有效结果，立即使用
-		qo.logger.Debug("⚡ 快速返回第一个有效结果", map[string]interface{}{
+		// 收到有效结果，立即使用
+		qo.logger.Debug("⚡ 快速返回最优结果", map[string]interface{}{
 			"server":  bestResult.Server,
 			"answers": len(bestResult.Response.Answer),
 			"time":    bestResult.ResponseTime.String(),
@@ -378,7 +410,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	// 记录统计信息
 	totalQueryTime := time.Since(start)
 	if hasValidResponse && fastestValidResult != nil {
-		qo.logger.Debug("✅ 简化并发查询成功（有效结果）", map[string]interface{}{
+		qo.logger.Debug("✅ 智能并发查询成功（有效结果）", map[string]interface{}{
 			"fastest_server":      fastestResult.Server,
 			"fastest_time":        fastestTime.String(),
 			"valid_result_server": fastestValidResult.Server,
@@ -388,7 +420,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"total_time":          totalQueryTime.String(),
 		})
 	} else if hasSuccess && successResult != nil {
-		qo.logger.Debug("🥈 简化并发查询成功（无答案）", map[string]interface{}{
+		qo.logger.Debug("🥈 智能并发查询成功（无答案）", map[string]interface{}{
 			"fastest_server": fastestResult.Server,
 			"fastest_time":   fastestTime.String(),
 			"success_server": successResult.Server,
@@ -397,7 +429,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"total_time":     totalQueryTime.String(),
 		})
 	} else {
-		qo.logger.Warn("⚠️ 简化并发查询全部失败", map[string]interface{}{
+		qo.logger.Warn("⚠️ 智能并发查询全部失败", map[string]interface{}{
 			"fastest_server": fastestResult.Server,
 			"fastest_time":   fastestTime.String(),
 			"total_results":  len(allResults),
@@ -483,19 +515,39 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 	if strings.HasPrefix(server, "udp://") {
 		protocol = "UDP"
 		timeout = qo.timeout // 传统协议使用普通超时
-		resp, err = qo.queryUDP(req, server)
+		// 使用外部提供的UDP查询函数（如果已设置，即使用连接池）
+		if qo.udpQueryFunc != nil {
+			resp, err = qo.udpQueryFunc(req, server)
+		} else {
+			resp, err = qo.queryUDP(req, server)
+		}
 	} else if strings.HasPrefix(server, "tcp://") {
 		protocol = "TCP"
 		timeout = qo.timeout // 传统协议使用普通超时
-		resp, err = qo.queryTCP(req, server)
+		// 使用外部提供的TCP查询函数（如果已设置，即使用连接池）
+		if qo.tcpQueryFunc != nil {
+			resp, err = qo.tcpQueryFunc(req, server)
+		} else {
+			resp, err = qo.queryTCP(req, server)
+		}
 	} else if strings.HasPrefix(server, "https://") {
 		protocol = "DoH"
 		timeout = qo.modernTimeout // 现代协议使用更短超时
-		resp, err = qo.queryDoH(req, server)
+		// 使用外部提供的DoH查询函数（如果已设置）
+		if qo.doHQueryFunc != nil {
+			resp, err = qo.doHQueryFunc(req, server)
+		} else {
+			resp, err = qo.queryDoH(req, server)
+		}
 	} else if strings.HasPrefix(server, "tls://") {
 		protocol = "DoT"
 		timeout = qo.modernTimeout // 现代协议使用更短超时
-		resp, err = qo.queryDoT(req, server)
+		// 使用外部提供的DoT查询函数（如果已设置）
+		if qo.doTQueryFunc != nil {
+			resp, err = qo.doTQueryFunc(req, server)
+		} else {
+			resp, err = qo.queryDoT(req, server)
+		}
 	} else if strings.HasPrefix(server, "h3://") {
 		protocol = "DoH3"
 		timeout = qo.modernTimeout // 现代协议使用更短超时
@@ -609,98 +661,14 @@ func (qo *SimpleModernOptimizer) queryTraditional(req *dns.Msg, server string) (
 	return resp, err
 }
 
-// queryDoH DNS over HTTPS查询
+// queryDoH DNS over HTTPS查询 - 这个方法现在被Handler替代，此处保留是为了兼容性
 func (qo *SimpleModernOptimizer) queryDoH(req *dns.Msg, serverURL string) (*dns.Msg, error) {
-	// 解析URL
-	u, err := url.Parse(serverURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid DoH URL: %w", err)
-	}
-
-	// 如果没有路径，使用默认的/dns-query
-	if u.Path == "" || u.Path == "/" {
-		u.Path = "/dns-query"
-	}
-
-	// 将DNS消息编码为wireformat
-	wireData, err := req.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("failed to pack DNS message: %w", err)
-	}
-
-	// 创建带超时的上下文
-	ctx, cancel := context.WithTimeout(context.Background(), qo.modernTimeout)
-	defer cancel()
-
-	// 创建HTTP请求
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(wireData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	// 设置DoH头部
-	httpReq.Header.Set("Content-Type", "application/dns-message")
-	httpReq.Header.Set("Accept", "application/dns-message")
-
-	// 发送请求
-	httpResp, err := qo.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("DoH request failed: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	// 检查HTTP状态码
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("DoH request failed with status: %d", httpResp.StatusCode)
-	}
-
-	// 读取响应数据
-	respData, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read DoH response: %w", err)
-	}
-
-	// 解析DNS响应
-	resp := new(dns.Msg)
-	if err := resp.Unpack(respData); err != nil {
-		return nil, fmt.Errorf("failed to unpack DNS response: %w", err)
-	}
-
-	return resp, nil
+	return nil, fmt.Errorf("queryDoH should be handled by RefactoredHandler, not SimpleModernOptimizer directly")
 }
 
-// queryDoT DNS over TLS查询
+// queryDoT DNS over TLS查询 - 这个方法现在被Handler替代，此处保留是为了兼容性
 func (qo *SimpleModernOptimizer) queryDoT(req *dns.Msg, serverURL string) (*dns.Msg, error) {
-	// 解析URL (tls://example.com:853)
-	u, err := url.Parse(serverURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid DoT URL: %w", err)
-	}
-
-	// 构建地址
-	address := u.Host
-	if !strings.Contains(address, ":") {
-		address += ":853" // 默认DoT端口
-	}
-
-	// 使用现代协议超时
-	ctx, cancel := context.WithTimeout(context.Background(), qo.modernTimeout)
-	defer cancel()
-
-	// 配置TLS
-	tlsConfig := &tls.Config{
-		ServerName:         u.Hostname(),
-		InsecureSkipVerify: false,
-	}
-
-	client := &dns.Client{
-		Net:       "tcp-tls",
-		TLSConfig: tlsConfig,
-		Timeout:   qo.modernTimeout, // 使用现代协议超时
-	}
-
-	resp, _, err := client.ExchangeContext(ctx, req, address)
-	return resp, err
+	return nil, fmt.Errorf("queryDoT should be handled by RefactoredHandler, not SimpleModernOptimizer directly")
 }
 
 // queryDoH3 DNS over HTTP/3查询（简化版本，如果不支持HTTP/3则降级到HTTPS）

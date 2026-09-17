@@ -32,4 +32,4 @@ func (l *Logger) Warn(format string, v ...interface{}) {
 // Error 错误日志
 func (l *Logger) Error(format string, v ...interface{}) {
 	log.Printf("[ERROR] "+format, v...)
-} 
+}

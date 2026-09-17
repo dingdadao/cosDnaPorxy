@@ -14,7 +14,7 @@ import (
 func MatchDomain(pattern, domain string) bool {
 	domain = strings.ToLower(strings.TrimSuffix(domain, ".")) // 统一格式化域名
 	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	
+
 	if pattern == "" || domain == "" {
 		return false
 	}
@@ -51,14 +51,14 @@ func MatchDomain(pattern, domain string) bool {
 		// 转为正则表达式，处理特殊字符
 		regexPattern := "^" + regexp.QuoteMeta(pattern) + "$"
 		regexPattern = strings.ReplaceAll(regexPattern, `\*`, ".*")
-		
+
 		// 编译正则表达式以提高性能
 		re, err := regexp.Compile(regexPattern)
 		if err != nil {
 			// 正则编译失败，回退到简单字符串匹配
 			return strings.Contains(domain, strings.ReplaceAll(pattern, "*", ""))
 		}
-		
+
 		return re.MatchString(domain)
 	}
 
@@ -71,4 +71,4 @@ func SanitizeDomainName(name string) string {
 		return name[:idx]
 	}
 	return name
-} 
+}

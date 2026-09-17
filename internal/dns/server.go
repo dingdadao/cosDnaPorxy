@@ -25,6 +25,7 @@ type Server struct {
 	cancel      context.CancelFunc
 	mu          sync.RWMutex
 	running     bool
+	stopping    bool   // 主动停止标记，用于区分正常关闭与运行错误
 	netType     string // "udp" 或 "tcp"
 }
 
@@ -57,11 +58,12 @@ func NewTCPServer(cfg *config.Config, handler *RefactoredHandler) (*Server, erro
 }
 
 // Start 启动DNS服务器
+// 注意：不能在持有 s.mu 的情况下调用 ActivateAndServe（它会阻塞到服务器停止），
+// 否则 Stop() 将永远无法获取锁，导致优雅停机死锁。
 func (s *Server) Start() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.running {
+		s.mu.Unlock()
 		return fmt.Errorf("DNS服务器已在运行")
 	}
 
@@ -71,6 +73,7 @@ func (s *Server) Start() error {
 		// 创建UDP连接
 		conn, err := net.ListenPacket("udp", addr)
 		if err != nil {
+			s.mu.Unlock()
 			return fmt.Errorf("监听UDP端口失败: %w", err)
 		}
 		s.conn = conn
@@ -86,16 +89,11 @@ func (s *Server) Start() error {
 			"rule": "UDP_SERVER_START",
 			"addr": addr,
 		})
-
-		// 启动服务器（阻塞）
-		if err := s.server.ActivateAndServe(); err != nil {
-			s.running = false
-			return fmt.Errorf("DNS服务器启动失败: %w", err)
-		}
 	} else if s.netType == "tcp" {
 		// 创建TCP监听器
 		listener, err := net.Listen("tcp", addr)
 		if err != nil {
+			s.mu.Unlock()
 			return fmt.Errorf("监听TCP端口失败: %w", err)
 		}
 		s.tcpListener = listener
@@ -111,15 +109,28 @@ func (s *Server) Start() error {
 			"rule": "TCP_SERVER_START",
 			"addr": addr,
 		})
-
-		// 启动服务器（阻塞）
-		if err := s.server.ActivateAndServe(); err != nil {
-			s.running = false
-			return fmt.Errorf("DNS服务器启动失败: %w", err)
-		}
 	}
 
+	// 先标记为运行中，再释放锁并进入阻塞服务循环
 	s.running = true
+	s.stopping = false
+	server := s.server
+	s.mu.Unlock()
+
+	// 启动服务器（阻塞，直到 Shutdown 被调用）
+	err := server.ActivateAndServe()
+
+	// 服务循环已退出
+	s.mu.Lock()
+	wasStopping := s.stopping
+	s.running = false
+	s.stopping = false
+	s.mu.Unlock()
+
+	// 主动停止（Shutdown）导致的返回不算错误
+	if err != nil && !wasStopping {
+		return fmt.Errorf("DNS服务器运行失败: %w", err)
+	}
 	return nil
 }
 
@@ -131,6 +142,9 @@ func (s *Server) Stop() {
 	if !s.running {
 		return
 	}
+
+	// 标记为主动停止，Start() 中 ActivateAndServe 返回后据此判断不是运行错误
+	s.stopping = true
 
 	if s.netType == "udp" {
 		s.logger.Info("🔄 [停止UDP DNS服务器] ", map[string]interface{}{

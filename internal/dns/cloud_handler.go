@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 	"time"
@@ -17,30 +18,31 @@ type CloudHandler struct {
 	logger        *utils.EnhancedLogger
 	cacheManager  *CacheManager
 	cloudDetector *CloudDetector
-	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
+	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error)   // 代理查询函数
+	respond       func(dns.ResponseWriter, *dns.Msg, *dns.Msg) // 统一响应出口（保证EDNS/TC处理一致）
 }
 
 // NewCloudHandler 创建新的云服务处理器
-func NewCloudHandler(config *config.Config, logger *utils.EnhancedLogger, cacheManager *CacheManager, cloudDetector *CloudDetector, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error)) *CloudHandler {
+func NewCloudHandler(config *config.Config, logger *utils.EnhancedLogger, cacheManager *CacheManager, cloudDetector *CloudDetector, proxyQuery func(*dns.Msg, []string) (*dns.Msg, error), respond func(dns.ResponseWriter, *dns.Msg, *dns.Msg)) *CloudHandler {
 	return &CloudHandler{
 		config:        config,
 		logger:        logger,
 		cacheManager:  cacheManager,
 		cloudDetector: cloudDetector,
 		proxyQuery:    proxyQuery,
+		respond:       respond,
 	}
 }
 
 // HandleCloudReplacement 处理云IP替换
-func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int) error {
-	var replaceDomain string
+// 保持上游原始响应结构（CNAME链、owner、TTL均不变），仅将A/AAAA记录的IP值替换为替换域名的IP；
+// 云检测已在processQuery完成，此处不再重复检测
+func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int, originalResp *dns.Msg) error {
 	var cloudTypeName string
 	switch CloudType(cloudType) {
 	case CloudTypeCloudflare:
-		replaceDomain = ch.config.ReplaceCFDomain
 		cloudTypeName = "Cloudflare"
 	case CloudTypeAWS:
-		replaceDomain = ch.config.ReplaceAWSDomain
 		cloudTypeName = "AWS"
 	default:
 		ch.logger.Warn("⚠️ 未知云服务类型", map[string]interface{}{
@@ -50,83 +52,128 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
 	}
 
-	if replaceDomain == "" {
-		ch.logger.Warn("⚠️ 未配置云服务替换域名", map[string]interface{}{
-			"cloud_type": cloudTypeName,
-			"domain":     domain,
+	ch.logger.Debug("开始云IP替换查询", map[string]interface{}{
+		"original_domain": domain,
+		"cloud_type":      cloudTypeName,
+	})
+
+	// 查询替换域名IP（含缓存与CNAME链解析）
+	v4, v6, err := ch.ResolveReplaceIPs(req.Id, domain, qtype, cloudType)
+	if err != nil {
+		ch.logger.Warn("⚠️ 替换域名查询失败", map[string]interface{}{
+			"original_domain": domain,
+			"qtype":           dns.TypeToString[qtype],
+			"error":           err.Error(),
 		})
 		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
 	}
 
-	ch.logger.Debug("开始云IP替换查询", map[string]interface{}{
-		"original_domain": domain,
-		"replace_domain":  replaceDomain,
-		"cloud_type":      cloudTypeName,
-	})
-
-	// 解析替换缓存时间配置
-	replaceCacheTime := ch.config.Cache.TTL // 默认使用缓存TTL
-	if ch.config.ReplaceCacheTime != "" {
-		if parsedTime, err := time.ParseDuration(ch.config.ReplaceCacheTime); err == nil {
-			replaceCacheTime = parsedTime
-		} else {
-			ch.logger.Warn("⚠️ 解析替换缓存时间失败，使用默认值", map[string]interface{}{
-				"replace_cache_time": ch.config.ReplaceCacheTime,
-				"error":              err.Error(),
-				"default_value":      ch.config.Cache.TTL.String(),
-			})
-		}
+	// AAAA查询无IPv6替换：返回空answer让客户端降级到A查询
+	if qtype == dns.TypeAAAA && len(v6) == 0 {
+		ch.logger.Debug("🔄 AAAA查询无结果，返回空响应让客户端降级到A查询", map[string]interface{}{
+			"domain": domain,
+		})
+		resp := &dns.Msg{}
+		resp.SetReply(req)
+		resp.RecursionAvailable = true
+		resp.Authoritative = false
+		ch.respond(w, req, resp)
+		ch.logger.Info("✅ [DNS查询完成-AAAA无结果降级] ", map[string]interface{}{
+			"domain":      domain,
+			"qtype":       dns.TypeToString[qtype],
+			"client_addr": w.RemoteAddr().String(),
+			"source":      "aaaa_fallback",
+			"result":      "success",
+		})
+		return nil
 	}
 
-	// 首先检查替换域名是否有缓存
-	replaceResp, hit, _, _ := ch.cacheManager.Get(replaceDomain, qtype)
-	if hit {
-		ch.logger.Debug("🎯 使用替换域名缓存", map[string]interface{}{
-			"replace_domain": replaceDomain,
-			"qtype":          dns.TypeToString[qtype],
+	// A查询无IPv4替换：SERVFAIL
+	if qtype == dns.TypeA && len(v4) == 0 {
+		ch.logger.Warn("⚠️ 云IP替换失败：替换域名无有效IPv4记录", map[string]interface{}{
+			"original_domain": domain,
+			"qtype":           dns.TypeToString[qtype],
 		})
+		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
+	}
+
+	// 基于上游原始响应构建替换响应
+	finalResp := buildCloudResponse(originalResp, qtype, v4, v6)
+	if finalResp == nil {
+		ch.logger.Error("❌ 构建云替换响应失败", map[string]interface{}{
+			"original_domain": domain,
+		})
+		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
+	}
+
+	// 缓存云替换响应（使用替换缓存时间）
+	if ch.config.ReplaceCacheTime > 0 {
+		ch.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType, ch.config.ReplaceCacheTime)
 	} else {
-		// 如果没有缓存，查询替换域名的IP地址
+		ch.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType)
+	}
+
+	ch.logger.Info("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
+		"domain":       domain,
+		"qtype":        dns.TypeToString[qtype],
+		"client_addr":  w.RemoteAddr().String(),
+		"source":       "cloud_replacement",
+		"cloud_type":   cloudTypeName,
+		"answer_count": len(finalResp.Answer),
+		"result":       "success",
+	})
+
+	ch.respond(w, req, finalResp)
+	return nil
+}
+
+// ResolveReplaceIPs 查询替换域名的IP（先查缓存，未命中回源并缓存），返回去重后的A/AAAA记录
+func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uint16, cloudType int) ([]*dns.A, []*dns.AAAA, error) {
+	var replaceDomain string
+	switch CloudType(cloudType) {
+	case CloudTypeCloudflare:
+		replaceDomain = ch.config.ReplaceCFDomain
+	case CloudTypeAWS:
+		replaceDomain = ch.config.ReplaceAWSDomain
+	default:
+		return nil, nil, fmt.Errorf("unknown cloud type %d", cloudType)
+	}
+	if replaceDomain == "" {
+		return nil, nil, fmt.Errorf("replace domain not configured for cloud type %d", cloudType)
+	}
+
+	// 先查缓存（缓存的是原始响应，CNAME链在下方统一解析）
+	replaceResp, hit, _, _ := ch.cacheManager.Get(replaceDomain, qtype)
+	if !hit {
 		replaceReq := &dns.Msg{}
 		replaceReq.SetQuestion(dns.Fqdn(replaceDomain), qtype)
 		// 保持请求ID一致，避免响应匹配问题
-		replaceReq.Id = req.Id
+		replaceReq.Id = reqID
 
 		var err error
 		replaceResp, err = ch.proxyQuery(replaceReq, ch.config.Upstream)
 		if err != nil || replaceResp == nil || replaceResp.Rcode != dns.RcodeSuccess {
-			ch.logger.Warn("⚠️ 替换域名查询失败", map[string]interface{}{
-				"replace_domain": replaceDomain,
-				"qtype":          dns.TypeToString[qtype],
-				"error":          err,
-			})
-
-			// 如果替换域名查询失败，返回错误
-			return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
+			return nil, nil, fmt.Errorf("replace domain query failed: %w", err)
 		}
 		ch.logger.Debug("🔍 替换域名查询成功", map[string]interface{}{
 			"replace_domain": replaceDomain,
 			"qtype":          dns.TypeToString[qtype],
 		})
+	} else {
+		ch.logger.Debug("🎯 使用替换域名缓存", map[string]interface{}{
+			"replace_domain": replaceDomain,
+			"qtype":          dns.TypeToString[qtype],
+		})
 	}
 
-	// 对替换域名的响应进行CNAME解析，获取最终的IP地址
-	// 重要：对于替换域名的查询，我们使用专门的方法，不进行云服务检测
+	// 对替换域名的响应进行CNAME链解析，获取最终IP（替换域名不再做云检测）
 	processedReplaceResp := ch.processReplaceDomainResponse(replaceResp, replaceDomain, ch.config.Upstream)
 	if processedReplaceResp == nil {
-		ch.logger.Error("❌ 替换域名处理失败：处理后响应为空", map[string]interface{}{
-			"replace_domain": replaceDomain,
-		})
-		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
+		return nil, nil, fmt.Errorf("replace domain processing failed")
 	}
 
-	// 如果是首次查询且缓存未命中，将查询结果缓存
+	// 首次查询且缓存未命中时，缓存处理后的结果（遵循上游TTL，由缓存层递减）
 	if !hit {
-		// 确保替换域名的响应也使用配置的TTL
-		if processedReplaceResp != nil {
-			ch.ensureMinimumTTL(processedReplaceResp, replaceCacheTime)
-		}
-		// 缓存原始响应
 		ch.cacheManager.Set(replaceDomain, qtype, processedReplaceResp, false)
 		ch.logger.Debug("💾 缓存替换域名查询结果", map[string]interface{}{
 			"replace_domain": replaceDomain,
@@ -135,128 +182,96 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 		})
 	}
 
-	// 从处理后的替换域名响应中提取IP记录
-	var ipRecords []dns.RR
-	seenIPs := make(map[string]bool) // 用于IP去重
-
+	var v4 []*dns.A
+	var v6 []*dns.AAAA
+	seenIPs := make(map[string]bool)
 	for _, rr := range processedReplaceResp.Answer {
 		switch record := rr.(type) {
 		case *dns.A:
-			ipStr := record.A.String()
-			if !seenIPs[ipStr] {
+			if ipStr := record.A.String(); !seenIPs[ipStr] {
 				seenIPs[ipStr] = true
-				// 复制A记录，但使用原始域名
-				newA := &dns.A{
-					Hdr: dns.RR_Header{
-						Name:   dns.Fqdn(domain), // 使用原始域名
-						Rrtype: dns.TypeA,
-						Class:  record.Header().Class,
-						Ttl:    record.Header().Ttl,
-					},
-					A: record.A,
-				}
-				ipRecords = append(ipRecords, newA)
+				v4 = append(v4, record)
 			}
 		case *dns.AAAA:
-			ipStr := record.AAAA.String()
-			if !seenIPs[ipStr] {
+			if ipStr := record.AAAA.String(); !seenIPs[ipStr] {
 				seenIPs[ipStr] = true
-				// 复制AAAA记录，但使用原始域名
-				newAAAA := &dns.AAAA{
-					Hdr: dns.RR_Header{
-						Name:   dns.Fqdn(domain), // 使用原始域名
-						Rrtype: dns.TypeAAAA,
-						Class:  record.Header().Class,
-						Ttl:    record.Header().Ttl,
-					},
-					AAAA: record.AAAA,
-				}
-				ipRecords = append(ipRecords, newAAAA)
+				v6 = append(v6, record)
 			}
 		}
-		// 限制IP记录数量
-		if len(ipRecords) >= ch.config.MaxIPRecords {
-			break
+	}
+	return v4, v6, nil
+}
+
+// buildCloudResponse 基于上游原始响应构建云替换响应
+// 保持上游响应结构（CNAME链、owner、TTL均不变），仅将A/AAAA记录的IP值替换为替换域名的IP（轮询分配）
+// 若上游原始响应中无A/AAAA记录，回退为owner=查询域名的仅IP简单形状
+func buildCloudResponse(originalResp *dns.Msg, qtype uint16, v4 []*dns.A, v6 []*dns.AAAA) *dns.Msg {
+	if originalResp == nil {
+		return nil
+	}
+
+	// 判断原始响应是否含IP记录
+	hasIP := false
+	for _, rr := range originalResp.Answer {
+		switch rr.(type) {
+		case *dns.A, *dns.AAAA:
+			hasIP = true
 		}
 	}
 
-	// 检查是否获取到了IP记录
-	if len(ipRecords) == 0 {
-		ch.logger.Warn("⚠️ 云IP替换失败：没有解析到有效的IP记录", map[string]interface{}{
-			"original_domain": domain,
-			"replace_domain":  replaceDomain,
-			"qtype":           dns.TypeToString[qtype],
-		})
-		// 如果是AAAA查询且没有IPv6记录，返回空响应让客户端降级到IPv4
-		if qtype == dns.TypeAAAA {
-			ch.logger.Debug("🔄 AAAA查询无结果，返回空响应让客户端降级到A查询", map[string]interface{}{
-				"domain": domain,
-			})
-			resp := &dns.Msg{}
-			resp.SetReply(req)
-			resp.RecursionAvailable = true
-			resp.Authoritative = false
-			w.WriteMsg(resp)
-			ch.logger.Info("✅ [DNS查询完成-AAAA无结果降级] ", map[string]interface{}{
-				"domain":       domain,
-				"qtype":        dns.TypeToString[qtype],
-				"client_addr":  w.RemoteAddr().String(),
-				"source":       "aaaa_fallback",
-				"result":       "success",
-				"answer_count": 0,
-			})
-			return nil
-		}
-		// 如果是A查询且没有IPv4记录，返回服务器错误
-		return ch.sendErrorResponse(w, req, dns.RcodeServerFailure)
+	queryName := "."
+	if len(originalResp.Question) > 0 {
+		queryName = originalResp.Question[0].Name
 	}
 
-	// 创建最终响应，只包含IP记录，不包含CNAME记录
-	finalResp := &dns.Msg{}
-	finalResp.SetReply(req)
-	finalResp.Authoritative = false // 设置为非权威响应
-	finalResp.RecursionAvailable = true
-	finalResp.Answer = ipRecords
-
-	// 记录实际返回给客户端的响应详情
-	answerDetails := make([]map[string]interface{}, 0)
-	for _, ans := range finalResp.Answer {
-		answerDetail := map[string]interface{}{
-			"type": dns.TypeToString[ans.Header().Rrtype],
-			"name": ans.Header().Name,
+	if !hasIP {
+		// 回退形状：owner=查询域名，仅包含替换IP
+		resp := &dns.Msg{}
+		resp.MsgHdr = originalResp.MsgHdr
+		resp.Question = originalResp.Question
+		resp.Ns = originalResp.Ns
+		resp.Extra = originalResp.Extra
+		for _, rr := range v4 {
+			resp.Answer = append(resp.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: queryName, Rrtype: dns.TypeA, Class: rr.Hdr.Class, Ttl: rr.Hdr.Ttl},
+				A:   rr.A,
+			})
 		}
-		switch rr := ans.(type) {
+		for _, rr := range v6 {
+			resp.Answer = append(resp.Answer, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: queryName, Rrtype: dns.TypeAAAA, Class: rr.Hdr.Class, Ttl: rr.Hdr.Ttl},
+				AAAA: rr.AAAA,
+			})
+		}
+		return resp
+	}
+
+	// 结构保持：复制原始响应，仅替换IP值
+	resp := originalResp.Copy()
+	v4i, v6i := 0, 0
+	answer := make([]dns.RR, 0, len(resp.Answer))
+	for _, rr := range resp.Answer {
+		switch record := rr.(type) {
 		case *dns.A:
-			answerDetail["ip"] = rr.A.String()
+			if len(v4) == 0 {
+				continue // 无可替换IPv4，剔除云IP
+			}
+			rep := v4[v4i%len(v4)]
+			v4i++
+			answer = append(answer, &dns.A{Hdr: record.Hdr, A: rep.A})
 		case *dns.AAAA:
-			answerDetail["ip"] = rr.AAAA.String()
+			if len(v6) == 0 {
+				continue // 无可替换IPv6，剔除云IP
+			}
+			rep := v6[v6i%len(v6)]
+			v6i++
+			answer = append(answer, &dns.AAAA{Hdr: record.Hdr, AAAA: rep.AAAA})
+		default:
+			answer = append(answer, rr)
 		}
-		answerDetails = append(answerDetails, answerDetail)
 	}
-
-	ch.logger.Debug("📤 云替换后实际返回给客户端的响应", map[string]interface{}{
-		"domain":       req.Question[0].String(),
-		"answer_count": len(finalResp.Answer),
-		"answers":      answerDetails,
-		"rcode":        dns.RcodeToString[finalResp.Rcode],
-	})
-
-	// 将响应添加到云响应缓存
-	ch.cacheManager.SetCloudResponse(domain, qtype, finalResp, int(CloudType(cloudType)))
-	ch.logger.Info("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
-		"domain":         domain,
-		"qtype":          dns.TypeToString[qtype],
-		"client_addr":    w.RemoteAddr().String(),
-		"source":         "cloud_replacement",
-		"cloud_type":     cloudTypeName,
-		"replace_domain": replaceDomain,
-		"answer_count":   len(finalResp.Answer),
-		"result":         "success",
-		"cache_ttl":      replaceCacheTime.String(),
-	})
-
-	w.WriteMsg(finalResp)
-	return nil
+	resp.Answer = answer
+	return resp
 }
 
 // replaceCloudIPs 用替换域名的IP替换原始响应中的云服务IP
@@ -1570,10 +1585,10 @@ func (ch *CloudHandler) ensureMinimumTTL(resp *dns.Msg, minTTL time.Duration) {
 	}
 }
 
-// sendErrorResponse 发送错误响应
+// sendErrorResponse 发送错误响应（走统一响应出口，保证EDNS/TC处理一致）
 func (ch *CloudHandler) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode int) error {
 	resp := &dns.Msg{}
 	resp.SetRcode(req, rcode)
-	w.WriteMsg(resp)
+	ch.respond(w, req, resp)
 	return nil
 }

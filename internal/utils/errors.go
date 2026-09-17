@@ -21,4 +21,4 @@ func NewDNSError(code int, message string, err error) *DNSError {
 		Message: message,
 		Err:     err,
 	}
-} 
+}
