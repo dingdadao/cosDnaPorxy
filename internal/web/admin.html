@@ -224,6 +224,22 @@
   .mode-badge { display:inline-block; font-family:var(--mono); font-size:10.5px; color:var(--text-3); border:1px solid var(--border); border-radius:9px; padding:0 7px; }
   .log-list-name { color:var(--accent); }
   .log-answers { font-family:var(--mono); font-size:11.5px; color:var(--text-2); margin-top:2px; }
+  /* 日志表：固定列宽，长文本单行省略，避免域名被逐字折成竖排、结果超出卡片被裁掉 */
+  table.log-table { table-layout:fixed; }
+  table.log-table td { overflow:hidden; }
+  .rv { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        vertical-align:bottom; cursor:pointer; }
+  .rv:hover { color:var(--accent); }
+  /* 悬停/点击展开的全文浮层：文本可选中，也可一键复制 */
+  #reveal-tip { position:fixed; z-index:90; display:none; max-width:min(760px,86vw); max-height:46vh; overflow:auto;
+    padding:10px 12px 11px; background:var(--bg-inset); border:1px solid var(--border-strong); border-radius:8px;
+    box-shadow:0 14px 34px rgba(0,0,0,.5); color:var(--text-1);
+    font-family:var(--mono); font-size:12px; line-height:1.6; white-space:pre-wrap; word-break:break-all;
+    user-select:text; cursor:text; }
+  #reveal-tip.show { display:block; }
+  #reveal-tip .tip-head { position:sticky; top:-10px; display:flex; align-items:center; gap:10px;
+    margin:-10px -4px 8px; padding:9px 4px 8px; background:var(--bg-inset); }
+  #reveal-tip .tip-hint { flex:1; font-size:11px; color:var(--text-3); white-space:nowrap; }
   .log-rcode { font-family:var(--mono); font-size:11px; font-weight:600; }
   .log-rcode.good { color:var(--success); }
   .log-rcode.warn { color:var(--warning); }
@@ -1617,6 +1633,113 @@ window.addEventListener("beforeunload", e => {
   if (anyDirty()) { e.preventDefault(); e.returnValue = ""; }
 });
 
+/* ================= 长文本省略 + 全文浮层 ================= */
+/* 表格里放不下的一律单行省略，悬停显示全文（可选中），点击直接复制 */
+const rv = (text, cls) => text
+  ? `<span class="rv${cls ? " " + cls : ""}" data-full="${esc(text)}">${esc(text)}</span>`
+  : "";
+
+let revealTip = null, revealTimer = null;
+
+function ensureRevealTip() {
+  if (revealTip) return revealTip;
+  revealTip = document.createElement("div");
+  revealTip.id = "reveal-tip";
+  /* 指针移入浮层时取消隐藏，方便从单元格移到浮层里选中文本 */
+  revealTip.addEventListener("mouseenter", () => clearTimeout(revealTimer));
+  revealTip.addEventListener("mouseleave", () => { revealTimer = setTimeout(hideReveal, 120); });
+  revealTip.addEventListener("click", e => {
+    const btn = e.target.closest("[data-reveal-copy]");
+    if (!btn) return;
+    copyText(revealTip.dataset.full || "").then(() => {
+      btn.textContent = "已复制";
+      setTimeout(() => { btn.textContent = "复制"; }, 1200);
+    }).catch(() => {});
+  });
+  document.body.appendChild(revealTip);
+  return revealTip;
+}
+
+function copyText(text) {
+  /* 经 http://内网IP 打开时不是安全上下文，navigator.clipboard 不存在，回退到 execCommand */
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    ok ? resolve() : reject(new Error("copy failed"));
+  });
+}
+
+function showReveal(target) {
+  const text = target.dataset.full ?? target.textContent ?? "";
+  if (!text.trim()) return;
+  const tip = ensureRevealTip();
+  tip.dataset.full = text;
+  tip.innerHTML = `<div class="tip-head"><span class="tip-hint">点击复制，或直接选中文本</span>`
+    + `<button type="button" class="btn btn-ghost small" data-reveal-copy>复制</button></div>`;
+  const body = document.createElement("div");
+  body.textContent = text;
+  tip.appendChild(body);
+  tip.classList.add("show");
+  positionReveal(target);
+}
+
+function positionReveal(target) {
+  const tip = ensureRevealTip();
+  const r = target.getBoundingClientRect();
+  tip.style.visibility = "hidden";
+  tip.style.left = "0px";
+  tip.style.top = "0px";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  const left = Math.min(Math.max(8, r.left), Math.max(8, window.innerWidth - w - 8));
+  let top = r.bottom + 6;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+  tip.style.left = Math.round(left) + "px";
+  tip.style.top = Math.round(top) + "px";
+  tip.style.visibility = "";
+}
+
+function hideReveal() {
+  clearTimeout(revealTimer);
+  if (revealTip) revealTip.classList.remove("show");
+}
+
+/* 表格每次筛选/翻页都重建 DOM，统一用事件委托绑定 */
+function bindReveal() {
+  document.addEventListener("mouseover", e => {
+    const t = e.target.closest && e.target.closest(".rv");
+    if (!t) return;
+    clearTimeout(revealTimer);
+    showReveal(t);
+  });
+  document.addEventListener("mouseout", e => {
+    if (!(e.target.closest && e.target.closest(".rv"))) return;
+    clearTimeout(revealTimer);
+    revealTimer = setTimeout(hideReveal, 140);
+  });
+  document.addEventListener("click", e => {
+    const t = e.target.closest && e.target.closest(".rv");
+    if (!t) return;
+    const text = t.dataset.full ?? t.textContent ?? "";
+    if (!text.trim()) return;
+    /* 长文本（如整条 CNAME 链）截断后再提示，避免 toast 被撑高 */
+    const brief = text.length > 60 ? text.slice(0, 57) + "…" : text;
+    /* 复制失败（极老的浏览器）时退回显示浮层，让用户手动选中 */
+    copyText(text).then(() => toast("已复制：" + brief, "ok")).catch(() => showReveal(t));
+  });
+  window.addEventListener("scroll", e => {
+    /* 浮层内部滚动不应关闭自己 */
+    if (revealTip && e.target && revealTip.contains(e.target)) return;
+    hideReveal();
+  }, true);
+}
+bindReveal();
+
 /* ================= 解析日志页 ================= */
 const LOG_ACTIONS = [
   { v:"", label:"全部来源" },
@@ -1719,16 +1842,16 @@ function renderLogTable() {
       + (e.dns_mode ? ` <span class="mode-badge">${e.dns_mode === "failover" ? "串行" : "竞速"}</span>` : "");
     return `<tr>
       <td class="mono" data-label="时间">${logFmtTime(e.time)}</td>
-      <td class="wrap mono" data-label="域名">${esc(e.domain)}</td>
+      <td class="mono" data-label="域名">${rv(e.domain)}</td>
       <td data-label="类型"><span class="qtype">${esc(e.qtype)}</span></td>
       <td data-label="来源"><span class="src ${esc(e.action)}">${esc(LOG_SRC_LABEL[e.action] || e.action)}</span></td>
       <td data-label="分流策略">${strat || '<span style="color:var(--text-3)">—</span>'}</td>
       <td data-label="结果"><span class="log-rcode ${logRcodeClass(e.rcode)}">${esc(e.rcode || "—")}</span>
-        ${e.answers ? `<div class="log-answers">${esc(e.answers)}</div>` : ""}</td>
-      <td data-label="上游">${e.dns ? `<span class="mono">${esc(e.dns)}</span>` : '<span style="color:var(--text-3)">—</span>'}
-        ${e.ecs ? `<div class="help">${esc(e.ecs)}</div>` : ""}</td>
+        ${e.answers ? `<div class="log-answers">${rv(e.answers)}</div>` : ""}</td>
+      <td data-label="上游">${e.dns ? rv(e.dns, "mono") : '<span style="color:var(--text-3)">—</span>'}
+        ${e.ecs ? `<div class="help">${rv(e.ecs)}</div>` : ""}</td>
       <td data-label="耗时">${e.elapsed_ms} ms</td>
-      <td class="wrap mono" data-label="客户端">${esc(e.client || "—")}</td>
+      <td class="mono" data-label="客户端">${rv(e.client || "")}</td>
     </tr>`;
   }).join("");
 
@@ -1740,11 +1863,11 @@ function renderLogTable() {
     + `${st.enabled === false ? " · 记录已关闭" : ""}</div>`;
 
   box.innerHTML = `<div class="table-wrap">
-      <table class="rules">
+      <table class="rules log-table">
         <thead><tr>
-          <th style="width:146px">时间</th><th>域名</th><th style="width:62px">类型</th>
-          <th style="width:86px">来源</th><th style="width:140px">分流策略</th><th>结果</th>
-          <th style="width:180px">上游 / ECS</th><th style="width:72px">耗时</th><th style="width:136px">客户端</th>
+          <th style="width:13.5%">时间</th><th style="width:17%">域名</th><th style="width:6%">类型</th>
+          <th style="width:7.5%">来源</th><th style="width:9.5%">分流策略</th><th>结果</th>
+          <th style="width:11%">上游 / ECS</th><th style="width:6.5%">耗时</th><th style="width:8.5%">客户端</th>
         </tr></thead>
         <tbody>${tbody}</tbody>
       </table>
