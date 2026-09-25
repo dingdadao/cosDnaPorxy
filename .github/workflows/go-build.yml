@@ -53,9 +53,9 @@ jobs:
         run: |
           PACKAGE_NAME="dnsproxy-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            zip $PACKAGE_NAME.zip dnsproxy${{ matrix.ext }} config.yaml
+            zip $PACKAGE_NAME.zip dnsproxy${{ matrix.ext }}
           else
-            tar -czvf $PACKAGE_NAME.tar.gz dnsproxy${{ matrix.ext }} config.yaml
+            tar -czvf $PACKAGE_NAME.tar.gz dnsproxy${{ matrix.ext }}
           fi
 
       - name: Upload artifact

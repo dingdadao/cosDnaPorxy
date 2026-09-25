@@ -1,0 +1,53 @@
+# cosDnaProxy DNS 代理服务（systemd 单元）
+#
+# 安装位置: /etc/systemd/system/dnsproxy.service
+# 直接使用: sudo cp dnsproxy.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now dnsproxy
+# 或使用同目录的 install_service.sh 安装（会先备份已有的同名单元）
+#
+# 说明: 端口、上游、分流规则等全部存在 ./data/config.db（SQLite）里，不需要在本文件配置。
+
+[Unit]
+Description=cosDnaProxy DNS 代理（域名分流 / 云 IP 替换 / 本地篡改）
+After=network.target network-online.target
+Wants=network-online.target
+# 崩溃循环保护：5 分钟内重启超过 5 次就进入 failed，避免无脑刷日志
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# 程序以相对路径读写 ./data/config.db 与 ./logs，工作目录必须固定
+WorkingDirectory=/opt/dnsProxy
+ExecStart=/opt/dnsProxy/dnsproxy
+
+# 从 SQLite 重载本地域名篡改规则（配置热更新与 POST /api/restart 走程序内重启，不依赖本信号）
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 进程退出后拉起；systemctl stop 不会被本项复活。
+# 注意：这是原单元缺的一项（原单元为 Restart=no），崩溃后不会被守护。
+Restart=always
+RestartSec=3
+
+# 先 SIGTERM 优雅退出（关闭监听、冲刷解析日志），超时才强杀
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# DNS 代理并发连接多，放宽文件句柄上限（原单元为 4096）
+LimitNOFILE=65535
+LimitNPROC=4096
+LogRateLimitIntervalSec=10
+LogRateLimitBurst=50
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnsproxy
+
+# 轻量加固：不影响 /opt 下的数据与日志读写，可安全删除
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

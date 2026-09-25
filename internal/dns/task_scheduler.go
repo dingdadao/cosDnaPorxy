@@ -43,24 +43,25 @@ func (ts *TaskScheduler) StartBackgroundTasks() {
 	go func() {
 		time.Sleep(2 * time.Second) // 等待DNS服务器启动完成
 
-		// 定向域名刷新任务
-		if ts.config.DesignatedDomain != "" && ts.config.DesignatedRefreshInterval > 0 {
-			go ts.DesignatedRefreshTask()
-		}
-
-		// 中国域名刷新任务
-		if ts.config.EnableChinaDomainCheck && ts.config.ChinaDomainFile != "" && ts.config.ChinaDomainRefreshInterval > 0 {
-			ts.logger.Info("🔄 [中国域名定时刷新启动] ", map[string]interface{}{
-				"rule":     "CHINA_DOMAIN_REFRESH_TASK",
-				"interval": ts.config.ChinaDomainRefreshInterval.String(),
-				"enabled":  ts.config.EnableChinaDomainCheck,
+		// 各分流列表的定时刷新任务
+		for i, l := range ts.config.SplitLists {
+			if !l.Enabled || l.DomainFile == "" || l.DomainURL == "" || l.Refresh <= 0 {
+				ts.logger.Info("⏭️ [分流列表定时刷新已禁用] ", map[string]interface{}{
+					"rule":    "SPLIT_LIST_REFRESH_SKIPPED",
+					"list":    l.Name,
+					"enabled": l.Enabled,
+					"file":    l.DomainFile,
+					"url":     l.DomainURL,
+					"refresh": l.Refresh.String(),
+				})
+				continue
+			}
+			ts.logger.Info("🔄 [分流列表定时刷新启动] ", map[string]interface{}{
+				"rule":     "SPLIT_LIST_REFRESH_TASK",
+				"list":     l.Name,
+				"interval": l.Refresh.String(),
 			})
-			go ts.ChinaDomainRefreshTask()
-		} else {
-			ts.logger.Info("⏭️ [中国域名定时刷新已禁用] ", map[string]interface{}{
-				"rule":    "CHINA_DOMAIN_REFRESH_SKIPPED",
-				"enabled": ts.config.EnableChinaDomainCheck,
-			})
+			go ts.SplitListRefreshTask(i, l.Refresh)
 		}
 
 		// 网络段刷新任务（仅在启用云服务检查时启动）
@@ -82,72 +83,30 @@ func (ts *TaskScheduler) StartBackgroundTasks() {
 	}()
 }
 
-// DesignatedRefreshTask 定向域名刷新任务
-func (ts *TaskScheduler) DesignatedRefreshTask() {
-	ticker := time.NewTicker(ts.config.DesignatedRefreshInterval)
+// SplitListRefreshTask 第 index 条分流列表的定时刷新任务
+func (ts *TaskScheduler) SplitListRefreshTask(index int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	ts.logger.Info("🔄 [定向域名定时刷新启动] ", map[string]interface{}{
-		"rule":     "DESIGNATED_REFRESH_TASK",
-		"interval": ts.config.DesignatedRefreshInterval.String(),
-	})
 
 	for {
 		select {
 		case <-ticker.C:
-			ts.logger.Debug("开始定时定向域名刷新", map[string]interface{}{
-				"file": ts.config.DesignatedDomain,
-				"url":  ts.config.DesignatedDomainURL,
-			})
-			if err := ts.fileLoader.ForceDownloadAndReloadDesignatedDomains(); err != nil {
-				ts.logger.Error("❌ [定向域名刷新失败] ", map[string]interface{}{
-					"rule":  "DESIGNATED_REFRESH_FAILED",
+			if err := ts.fileLoader.ForceDownloadAndReloadSplitList(index); err != nil {
+				ts.logger.Error("❌ [分流列表刷新失败] ", map[string]interface{}{
+					"rule":  "SPLIT_LIST_REFRESH_FAILED",
+					"index": index,
 					"error": err.Error(),
 				})
 			} else {
-				ts.logger.Info("✅ [定向域名刷新成功] ", map[string]interface{}{
-					"rule": "DESIGNATED_REFRESH_SUCCESS",
+				ts.logger.Info("✅ [分流列表刷新成功] ", map[string]interface{}{
+					"rule":  "SPLIT_LIST_REFRESH_SUCCESS",
+					"index": index,
 				})
 			}
 		case <-ts.ctx.Done():
-			ts.logger.Info("📋 [定向域名刷新任务停止] ", map[string]interface{}{
-				"rule": "DESIGNATED_REFRESH_STOPPED",
-			})
-			return
-		}
-	}
-}
-
-// ChinaDomainRefreshTask 中国域名刷新任务
-func (ts *TaskScheduler) ChinaDomainRefreshTask() {
-	ticker := time.NewTicker(ts.config.ChinaDomainRefreshInterval)
-	defer ticker.Stop()
-
-	ts.logger.Info("🔄 [中国域名定时刷新启动] ", map[string]interface{}{
-		"rule":     "CHINA_DOMAIN_REFRESH_TASK",
-		"interval": ts.config.ChinaDomainRefreshInterval.String(),
-	})
-
-	for {
-		select {
-		case <-ticker.C:
-			ts.logger.Debug("开始定时中国域名刷新", map[string]interface{}{
-				"file": ts.config.ChinaDomainFile,
-				"url":  ts.config.ChinaDomainFileURL,
-			})
-			if err := ts.fileLoader.ForceDownloadAndReloadChinaDomains(); err != nil {
-				ts.logger.Error("❌ [中国域名刷新失败] ", map[string]interface{}{
-					"rule":  "CHINA_DOMAIN_REFRESH_FAILED",
-					"error": err.Error(),
-				})
-			} else {
-				ts.logger.Info("✅ [中国域名刷新成功] ", map[string]interface{}{
-					"rule": "CHINA_DOMAIN_REFRESH_SUCCESS",
-				})
-			}
-		case <-ts.ctx.Done():
-			ts.logger.Info("📋 [中国域名刷新任务停止] ", map[string]interface{}{
-				"rule": "CHINA_DOMAIN_REFRESH_STOPPED",
+			ts.logger.Info("📋 [分流列表刷新任务停止] ", map[string]interface{}{
+				"rule":  "SPLIT_LIST_REFRESH_STOPPED",
+				"index": index,
 			})
 			return
 		}

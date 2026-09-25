@@ -50,6 +50,11 @@ pids
 *.seed
 *.pid.lock
 
+# 运行时生成的 SQLite 库（配置库 / 解析日志库，含本机私有配置与查询记录）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
 # Coverage directory used by tools like istanbul
 coverage/
 

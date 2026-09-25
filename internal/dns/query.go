@@ -11,88 +11,102 @@ import (
 	"strings"
 	"time"
 
+	"cosDnaPorxy/internal/config"
+
 	"github.com/miekg/dns"
 )
 
-// proxyQuery 使用查询优化器执行并发DNS查询（支持多种优化器）
+// proxyQuery 内部通用查询入口（云替换/CNAME/刷新等链路）：按并发竞速执行并带 BackupDNS 兜底
 func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.Msg, error) {
+	resp, _, err := h.queryWithFallback(req, upstreams, config.DNSModeRace)
+	return resp, err
+}
+
+// queryWithFallback 执行上游查询（按 mode 选择竞速/串行），无有效结果时回退 BackupDNS
+// 第二个返回值是实际给出应答的上游服务器（用于解析日志），失败时为空
+func (h *RefactoredHandler) queryWithFallback(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, string, error) {
 	if len(upstreams) == 0 {
-		return nil, errors.New("no upstream servers available")
+		return nil, "", errors.New("no upstream servers available")
 	}
 
-	// 根据优化器类型选择查询方法
-	var result *ConcurrentQueryResult
-
-	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
-		// 使用现代查询优化器
-		result = modernOptimizer.Query(req, upstreams)
-	} else if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
-		// 使用传统查询优化器
-		result = traditionalOptimizer.Query(req, upstreams)
-	} else {
-		return nil, errors.New("unknown query optimizer type")
-	}
+	result := h.queryUpstream(req, upstreams, mode)
 
 	// 优先返回有效结果给客户端，如果没有有效结果才返回最快结果
 	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response != nil {
-		// 有有效结果，优先返回成功结果
-		return result.SuccessResult.Response, nil
+		return result.SuccessResult.Response, result.SuccessResult.Server, nil
 	}
 
 	// 没有有效结果，尝试使用备份DNS服务器
-	if h.config.BackupDNS != "" {
-		h.Logger.Debug("🔄 所有上游服务器查询失败，尝试使用备份DNS", map[string]interface{}{
-			"backup_dns": h.config.BackupDNS,
-		})
-		// 使用备份DNS进行单个服务器查询
-		backupResult := h.querySingleServer(req, h.config.BackupDNS)
-		if backupResult != nil && backupResult.Response != nil && backupResult.Error == nil {
-			h.Logger.Debug("✅ 备份DNS查询成功", map[string]interface{}{
-				"backup_dns": h.config.BackupDNS,
-			})
-			return backupResult.Response, nil
-		}
-		h.Logger.Debug("❌ 备份DNS查询也失败", map[string]interface{}{
-			"backup_dns": h.config.BackupDNS,
-			"error":      backupResult.Error,
-		})
+	if resp, ok := h.queryBackupDNS(req); ok {
+		return resp, h.getConfig().BackupDNS, nil
 	}
 
 	// 没有有效结果，返回最快结果（可能是错误）
 	if result.FastestResult == nil || result.FastestResult.Error != nil {
 		if result.FastestResult != nil {
-			return nil, result.FastestResult.Error
+			return nil, "", result.FastestResult.Error
 		}
-		return nil, errors.New("all upstream queries failed")
+		return nil, "", errors.New("all upstream queries failed")
 	}
 
-	return result.FastestResult.Response, nil
+	return result.FastestResult.Response, result.FastestResult.Server, nil
+}
+
+// queryBackupDNS 用备份DNS做单台兜底查询，成功返回响应与 true
+func (h *RefactoredHandler) queryBackupDNS(req *dns.Msg) (*dns.Msg, bool) {
+	backup := h.getConfig().BackupDNS
+	if backup == "" {
+		return nil, false
+	}
+
+	h.Logger.Debug("🔄 所有上游服务器查询失败，尝试使用备份DNS", map[string]interface{}{
+		"backup_dns": backup,
+	})
+	backupResult := h.querySingleServer(req, backup)
+	if backupResult != nil && backupResult.Response != nil && backupResult.Error == nil {
+		h.Logger.Debug("✅ 备份DNS查询成功", map[string]interface{}{
+			"backup_dns": backup,
+		})
+		return backupResult.Response, true
+	}
+	h.Logger.Debug("❌ 备份DNS查询也失败", map[string]interface{}{
+		"backup_dns": backup,
+		"error":      backupResult.Error,
+	})
+	return nil, false
+}
+
+// queryUpstream 按解析模式执行上游查询
+// failover 仅现代优化器支持（传统优化器为旧格式 host:port 的兼容路径，不支持模式选择）
+func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode string) *ConcurrentQueryResult {
+	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
+		if mode == config.DNSModeFailover {
+			return modernOptimizer.QueryFailover(req, upstreams)
+		}
+		return modernOptimizer.Query(req, upstreams)
+	}
+	if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
+		return traditionalOptimizer.Query(req, upstreams)
+	}
+	return &ConcurrentQueryResult{
+		FastestResult: &QueryResult{Error: errors.New("unknown query optimizer type")},
+		HasSuccess:    false,
+	}
 }
 
 // proxyQueryWithCaching 代理查询并缓存原始上游响应
 // 云检测统一在processQuery中执行（仅一次），此处只做查询+缓存，不再处理CNAME或检测云
-func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16) (*dns.Msg, error) {
+// 第二个返回值是实际给出应答的上游服务器（用于解析日志）
+func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode string) (*dns.Msg, string, error) {
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
 
 	if len(upstreams) == 0 {
 		upstreamTimer.End() // 确保计时器关闭
-		return nil, errors.New("no upstream servers available")
+		return nil, "", errors.New("no upstream servers available")
 	}
 
-	// 根据优化器类型选择查询方法
-	var result *ConcurrentQueryResult
-
-	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
-		// 使用现代查询优化器
-		result = modernOptimizer.Query(req, upstreams)
-	} else if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
-		// 使用传统查询优化器
-		result = traditionalOptimizer.Query(req, upstreams)
-	} else {
-		upstreamTimer.End() // 确保计时器关闭
-		return nil, errors.New("unknown query optimizer type")
-	}
+	result := h.queryUpstream(req, upstreams, mode)
 
 	// 获取上游查询时间
 	upstreamTime := upstreamTimer.End()
@@ -109,20 +123,33 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 			"answers":        len(resp.Answer),
 			"upstream_time":  upstreamTime,
 		})
-		return resp, nil
+		return resp, result.SuccessResult.Server, nil
+	}
+
+	// 上游（含分流列表 DNS）全部失败时回退 BackupDNS，与非IP记录路径保持一致
+	if resp, ok := h.queryBackupDNS(req); ok {
+		if resp.Rcode == dns.RcodeSuccess {
+			h.cacheManager.Set(domain, qtype, resp, false)
+		}
+		h.Logger.Debug("✅ 已回退备份DNS", map[string]interface{}{
+			"domain": domain,
+			"qtype":  dns.TypeToString[qtype],
+			"rcode":  dns.RcodeToString[resp.Rcode],
+		})
+		return resp, h.getConfig().BackupDNS, nil
 	}
 
 	// 没有有效结果，返回最快结果（可能是错误）
 	if result.FastestResult != nil {
 		if result.FastestResult.Error != nil {
-			return nil, result.FastestResult.Error
+			return nil, "", result.FastestResult.Error
 		}
 		if result.FastestResult.Response != nil {
-			return result.FastestResult.Response, nil
+			return result.FastestResult.Response, result.FastestResult.Server, nil
 		}
 	}
 
-	return nil, errors.New("all upstream queries failed")
+	return nil, "", errors.New("all upstream queries failed")
 }
 
 // ValidateDNSResult 验证查询结果是否包含有效的 DNS 记录
@@ -215,28 +242,28 @@ func (h *RefactoredHandler) querySingleServer(req *dns.Msg, server string) *Quer
 	// 根据URL scheme选择协议和超时时间
 	if strings.HasPrefix(server, "udp://") {
 		protocol = "UDP"
-		timeout = h.config.Timeout // 传统协议使用普通超时
+		timeout = h.getConfig().Timeout // 传统协议使用普通超时
 		resp, err = h.queryUDP(req, server)
 	} else if strings.HasPrefix(server, "tcp://") {
 		protocol = "TCP"
-		timeout = h.config.Timeout // 传统协议使用普通超时
+		timeout = h.getConfig().Timeout // 传统协议使用普通超时
 		resp, err = h.queryTCP(req, server)
 	} else if strings.HasPrefix(server, "https://") {
 		protocol = "DoH"
-		timeout = h.config.ModernTimeout // 现代协议使用更短超时
+		timeout = h.getConfig().ModernTimeout // 现代协议使用更短超时
 		resp, err = h.queryDoH(req, server)
 	} else if strings.HasPrefix(server, "tls://") {
 		protocol = "DoT"
-		timeout = h.config.ModernTimeout // 现代协议使用更短超时
+		timeout = h.getConfig().ModernTimeout // 现代协议使用更短超时
 		resp, err = h.queryDoT(req, server)
 	} else if strings.HasPrefix(server, "h3://") {
 		protocol = "DoH3"
-		timeout = h.config.ModernTimeout // 现代协议使用更短超时
+		timeout = h.getConfig().ModernTimeout // 现代协议使用更短超时
 		resp, err = h.queryDoH3(req, server)
 	} else {
 		// 兼容旧格式：传统UDP/TCP
 		protocol = "UDP/TCP"
-		timeout = h.config.Timeout
+		timeout = h.getConfig().Timeout
 		resp, err = h.queryTraditional(req, server)
 	}
 
@@ -274,7 +301,7 @@ func (h *RefactoredHandler) queryUDP(req *dns.Msg, server string) (*dns.Msg, err
 	addr := strings.TrimPrefix(server, "udp://")
 
 	// 使用连接池获取客户端
-	client := h.udpConnPool.GetClient(addr, h.config.Timeout)
+	client := h.udpConnPool.GetClient(addr, h.getConfig().Timeout)
 
 	// 确保在函数结束时归还客户端到池中
 	defer func() {
@@ -291,7 +318,7 @@ func (h *RefactoredHandler) queryTCP(req *dns.Msg, server string) (*dns.Msg, err
 	addr := strings.TrimPrefix(server, "tcp://")
 
 	// 使用连接池获取客户端
-	client := h.tcpConnPool.GetClient(addr, h.config.Timeout)
+	client := h.tcpConnPool.GetClient(addr, h.getConfig().Timeout)
 
 	// 确保在函数结束时归还客户端到池中
 	defer func() {
@@ -325,7 +352,7 @@ func (h *RefactoredHandler) queryDoH(req *dns.Msg, server string) (*dns.Msg, err
 	}
 
 	// 创建带超时的上下文
-	ctx, cancel := context.WithTimeout(context.Background(), h.config.ModernTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), h.getConfig().ModernTimeout)
 	defer cancel()
 
 	// 创建HTTP请求

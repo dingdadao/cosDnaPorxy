@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -34,10 +35,34 @@ type LogEntry struct {
 
 // EnhancedLogger 增强的结构化日志器
 type EnhancedLogger struct {
+	levelMu    sync.RWMutex
 	level      LogLevel
 	component  string
 	useJSON    bool
 	fileLogger *FileLogger
+}
+
+// SetLevel 热更新日志级别
+func (l *EnhancedLogger) SetLevel(levelStr string) {
+	l.levelMu.Lock()
+	defer l.levelMu.Unlock()
+	switch levelStr {
+	case "debug":
+		l.level = LogDebug
+	case "info":
+		l.level = LogInfo
+	case "warn":
+		l.level = LogWarn
+	case "error":
+		l.level = LogError
+	}
+}
+
+// getLevel 读取当前日志级别
+func (l *EnhancedLogger) getLevel() LogLevel {
+	l.levelMu.RLock()
+	defer l.levelMu.RUnlock()
+	return l.level
 }
 
 // NewEnhancedLogger 创建增强日志器
@@ -122,7 +147,7 @@ func (l *EnhancedLogger) getCallerInfo() (string, string, int) {
 
 // log 通用日志方法
 func (l *EnhancedLogger) log(level LogLevel, message string, fields map[string]interface{}, duration *time.Duration) {
-	if level < l.level {
+	if level < l.getLevel() {
 		return
 	}
 

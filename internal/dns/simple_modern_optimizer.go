@@ -23,6 +23,7 @@ type SimpleModernOptimizer struct {
 	logger *utils.EnhancedLogger
 
 	// 配置
+	cfgMu          sync.RWMutex
 	timeout        time.Duration // 传统协议超时时间
 	modernTimeout  time.Duration // 现代协议超时时间
 	retryCount     int
@@ -76,6 +77,28 @@ func NewSimpleModernOptimizer(logger *utils.EnhancedLogger, timeout time.Duratio
 	return optimizer
 }
 
+// UpdateTimeouts 热更新查询超时配置
+func (qo *SimpleModernOptimizer) UpdateTimeouts(timeout, modernTimeout time.Duration) {
+	qo.cfgMu.Lock()
+	qo.timeout = timeout
+	qo.modernTimeout = modernTimeout
+	qo.cfgMu.Unlock()
+}
+
+// getTimeout 读取传统协议超时
+func (qo *SimpleModernOptimizer) getTimeout() time.Duration {
+	qo.cfgMu.RLock()
+	defer qo.cfgMu.RUnlock()
+	return qo.timeout
+}
+
+// getModernTimeout 读取现代协议超时
+func (qo *SimpleModernOptimizer) getModernTimeout() time.Duration {
+	qo.cfgMu.RLock()
+	defer qo.cfgMu.RUnlock()
+	return qo.modernTimeout
+}
+
 // initHTTPClient 初始化HTTP客户端
 func (qo *SimpleModernOptimizer) initHTTPClient() {
 	// 配置TLS
@@ -86,18 +109,18 @@ func (qo *SimpleModernOptimizer) initHTTPClient() {
 	// HTTP客户端（支持HTTP/1.1, HTTP/2, 和部分HTTP/3）
 	// 使用更短的超时时间给现代协议
 	qo.httpClient = &http.Client{
-		Timeout: qo.modernTimeout, // 使用现代协议超时
+		Timeout: qo.getModernTimeout(), // 使用现代协议超时
 		Transport: &http.Transport{
-			MaxIdleConns:          200,              // 增加空闲连接到200
-			MaxIdleConnsPerHost:   20,               // 增加每个主机的空闲连接到20
-			IdleConnTimeout:       90 * time.Second, // 延长空闲超时到90秒
-			TLSHandshakeTimeout:   qo.modernTimeout, // 使用现代协议超时
+			MaxIdleConns:          200,                   // 增加空闲连接到200
+			MaxIdleConnsPerHost:   20,                    // 增加每个主机的空闲连接到20
+			IdleConnTimeout:       90 * time.Second,      // 延长空闲超时到90秒
+			TLSHandshakeTimeout:   qo.getModernTimeout(), // 使用现代协议超时
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig:       qo.tlsConfig,
 			DisableKeepAlives:     false, // 启用keep-alive
 			DialContext: (&net.Dialer{
-				Timeout:   qo.modernTimeout, // 连接超时
-				KeepAlive: 30 * time.Second, // 启用TCP keep-alive并设置更长时间
+				Timeout:   qo.getModernTimeout(), // 连接超时
+				KeepAlive: 30 * time.Second,      // 启用TCP keep-alive并设置更长时间
 			}).DialContext,
 		},
 	}
@@ -119,11 +142,11 @@ func (qo *SimpleModernOptimizer) Query(req *dns.Msg, upstreams []string) *Concur
 
 // ServerStats 服务器统计信息
 type ServerStats struct {
-	Server       string
+	Server          string
 	AvgResponseTime time.Duration
-	SuccessRate  float64
-	QueryCount   int
-	LastSuccess  time.Time
+	SuccessRate     float64
+	QueryCount      int
+	LastSuccess     time.Time
 }
 
 // concurrentQuery 并发查询多个上游服务器
@@ -168,7 +191,10 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 		var successResult *QueryResult
 		var fastestValidResult *QueryResult
 
-		if result.Error == nil && result.Response != nil && result.Response.Rcode == dns.RcodeSuccess {
+		if result.Error == nil && result.Response != nil &&
+			(result.Response.Rcode == dns.RcodeSuccess || result.Response.Rcode == dns.RcodeNameError) {
+			// NXDOMAIN 是权威否定答案（RFC 2308），同样属于终态有效结果，
+			// 不能当成"查询失败"交给备用DNS去改写
 			result.IsSuccess = true
 			successResult = result
 			hasSuccess = true
@@ -213,7 +239,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	}
 
 	// 多个上游服务器时使用并发查询
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	// 创建结果通道
@@ -342,6 +368,22 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 							}
 						}
 					}
+				} else if result.Response.Rcode == dns.RcodeNameError && !hasValidResponse {
+					// NXDOMAIN 是权威否定答案（RFC 2308）：本身就是终态有效结果。
+					// 立即收尾，既不必等其它上游超时，也不能让备用DNS把它改写成垃圾IP
+					result.IsSuccess = true
+					successResult = result
+					hasSuccess = true
+					qo.logger.Debug("🚫 收到权威否定答案 NXDOMAIN", map[string]interface{}{
+						"server": result.Server,
+						"time":   result.ResponseTime.String(),
+					})
+					select {
+					case quickReturnChan <- result:
+						cancel()
+					default:
+					}
+					return
 				}
 			}
 		}
@@ -368,7 +410,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 		})
 		// 等待结果处理完成（应该很快）
 		<-resultProcessingDone
-	case <-time.After(qo.modernTimeout):
+	case <-time.After(qo.getModernTimeout()):
 		// 超时后等待结果处理完成
 		<-resultProcessingDone
 		qo.logger.Debug("⏰ 等待超时，使用已收集的结果")
@@ -455,6 +497,86 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 	}
 }
 
+// QueryFailover 串行故障转移：按上游顺序逐个查询，第一个成功（NOERROR）即返回，
+// 前一台失败/超时才用下一台。用于分流列表选择 failover 模式时，避免把上游 QPS 放大 N 倍。
+func (qo *SimpleModernOptimizer) QueryFailover(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	start := time.Now()
+
+	validUpstreams := qo.filterValidUpstreams(upstreams)
+	if len(validUpstreams) == 0 {
+		return &ConcurrentQueryResult{
+			FastestResult: &QueryResult{
+				Error: fmt.Errorf("no valid upstream servers after filtering"),
+			},
+			HasSuccess: false,
+		}
+	}
+
+	var allResults []*QueryResult
+	var last *QueryResult
+
+	for i, server := range validUpstreams {
+		result := qo.queryServer(req, server)
+		if result == nil {
+			continue
+		}
+		allResults = append(allResults, result)
+		last = result
+
+		if result.Error == nil && result.Response != nil &&
+			(result.Response.Rcode == dns.RcodeSuccess || result.Response.Rcode == dns.RcodeNameError) {
+			// NXDOMAIN 与 NOERROR 一样是终态答案（RFC 2308），无需再试下一台
+			result.IsSuccess = true
+			qo.logger.Debug("✅ 串行模式查询成功", map[string]interface{}{
+				"server":       server,
+				"attempt":      i + 1,
+				"total":        len(validUpstreams),
+				"time":         result.ResponseTime.String(),
+				"total_time":   time.Since(start).String(),
+				"answer_count": len(result.Response.Answer),
+				"rcode":        dns.RcodeToString[result.Response.Rcode],
+			})
+			return &ConcurrentQueryResult{
+				FastestResult:  result,
+				SuccessResult:  result,
+				AllResults:     allResults,
+				HasSuccess:     true,
+				FastestTime:    result.ResponseTime,
+				TotalQueryTime: time.Since(start),
+			}
+		}
+
+		qo.logger.Debug("⏭️ 串行模式当前上游未成功，尝试下一个", map[string]interface{}{
+			"server":  server,
+			"attempt": i + 1,
+			"total":   len(validUpstreams),
+			"error":   result.Error,
+		})
+	}
+
+	if last == nil {
+		last = &QueryResult{
+			Server:       "none",
+			Error:        fmt.Errorf("all %d upstream queries failed", len(validUpstreams)),
+			ResponseTime: time.Since(start),
+		}
+	}
+
+	qo.logger.Warn("⚠️ 串行模式所有上游均未成功", map[string]interface{}{
+		"total":      len(validUpstreams),
+		"server":     last.Server,
+		"total_time": time.Since(start).String(),
+	})
+
+	return &ConcurrentQueryResult{
+		FastestResult:  last,
+		AllResults:     allResults,
+		HasSuccess:     false,
+		FastestTime:    last.ResponseTime,
+		TotalQueryTime: time.Since(start),
+	}
+}
+
 // filterValidUpstreams 过滤有效的上游服务器
 func (qo *SimpleModernOptimizer) filterValidUpstreams(upstreams []string) []string {
 	var validUpstreams []string
@@ -514,7 +636,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 	// 根据URL scheme选择协议和超时时间
 	if strings.HasPrefix(server, "udp://") {
 		protocol = "UDP"
-		timeout = qo.timeout // 传统协议使用普通超时
+		timeout = qo.getTimeout() // 传统协议使用普通超时
 		// 使用外部提供的UDP查询函数（如果已设置，即使用连接池）
 		if qo.udpQueryFunc != nil {
 			resp, err = qo.udpQueryFunc(req, server)
@@ -523,7 +645,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		}
 	} else if strings.HasPrefix(server, "tcp://") {
 		protocol = "TCP"
-		timeout = qo.timeout // 传统协议使用普通超时
+		timeout = qo.getTimeout() // 传统协议使用普通超时
 		// 使用外部提供的TCP查询函数（如果已设置，即使用连接池）
 		if qo.tcpQueryFunc != nil {
 			resp, err = qo.tcpQueryFunc(req, server)
@@ -532,7 +654,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		}
 	} else if strings.HasPrefix(server, "https://") {
 		protocol = "DoH"
-		timeout = qo.modernTimeout // 现代协议使用更短超时
+		timeout = qo.getModernTimeout() // 现代协议使用更短超时
 		// 使用外部提供的DoH查询函数（如果已设置）
 		if qo.doHQueryFunc != nil {
 			resp, err = qo.doHQueryFunc(req, server)
@@ -541,7 +663,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		}
 	} else if strings.HasPrefix(server, "tls://") {
 		protocol = "DoT"
-		timeout = qo.modernTimeout // 现代协议使用更短超时
+		timeout = qo.getModernTimeout() // 现代协议使用更短超时
 		// 使用外部提供的DoT查询函数（如果已设置）
 		if qo.doTQueryFunc != nil {
 			resp, err = qo.doTQueryFunc(req, server)
@@ -550,12 +672,12 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		}
 	} else if strings.HasPrefix(server, "h3://") {
 		protocol = "DoH3"
-		timeout = qo.modernTimeout // 现代协议使用更短超时
+		timeout = qo.getModernTimeout() // 现代协议使用更短超时
 		resp, err = qo.queryDoH3(req, server)
 	} else {
 		// 兼容旧格式：传统UDP/TCP
 		protocol = "UDP/TCP"
-		timeout = qo.timeout
+		timeout = qo.getTimeout()
 		resp, err = qo.queryTraditional(req, server)
 	}
 
@@ -601,12 +723,12 @@ func (qo *SimpleModernOptimizer) queryUDP(req *dns.Msg, serverURL string) (*dns.
 		address += ":53" // 默认DNS端口
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	client := &dns.Client{
 		Net:     "udp",
-		Timeout: qo.timeout,
+		Timeout: qo.getTimeout(),
 	}
 
 	resp, _, err := client.ExchangeContext(ctx, req, address)
@@ -627,12 +749,12 @@ func (qo *SimpleModernOptimizer) queryTCP(req *dns.Msg, serverURL string) (*dns.
 		address += ":53" // 默认DNS端口
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	client := &dns.Client{
 		Net:     "tcp",
-		Timeout: qo.timeout,
+		Timeout: qo.getTimeout(),
 	}
 
 	resp, _, err := client.ExchangeContext(ctx, req, address)
@@ -641,13 +763,13 @@ func (qo *SimpleModernOptimizer) queryTCP(req *dns.Msg, serverURL string) (*dns.
 
 // queryTraditional 传统UDP/TCP查询（兼容旧格式）
 func (qo *SimpleModernOptimizer) queryTraditional(req *dns.Msg, server string) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	// 优先尝试UDP
 	client := &dns.Client{
 		Net:     "udp",
-		Timeout: qo.timeout,
+		Timeout: qo.getTimeout(),
 	}
 
 	resp, _, err := client.ExchangeContext(ctx, req, server)

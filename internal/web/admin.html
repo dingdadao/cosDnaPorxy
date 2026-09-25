@@ -1,0 +1,1804 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNS 代理配置中心</title>
+<style>
+  :root {
+    --bg-app:#0d1117; --bg-surface:#161b22; --bg-inset:#0b0f14; --bg-hover:#1c232d;
+    --border:#2a313c; --border-strong:#3a4451;
+    --text-1:#e6edf3; --text-2:#9aa7b4; --text-3:#6b7681;
+    --accent:#4da3ff; --accent-soft:rgba(77,163,255,.14); --accent-fg:#0b1d33;
+    --success:#3fb950; --success-soft:rgba(63,185,80,.14);
+    --warning:#e0a53c; --warning-soft:rgba(224,165,60,.13);
+    --danger:#f85149; --danger-soft:rgba(248,81,73,.12);
+    --purple:#bc8cff; --cyan:#39c5cf;
+    --radius:8px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    margin:0; background:var(--bg-app); color:var(--text-1);
+    font:13px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  button { font:inherit; }
+  ::selection { background:var(--accent-soft); }
+
+  /* ---------- 顶栏 ---------- */
+  .topbar {
+    height:56px; display:flex; align-items:center; gap:14px; padding:0 20px;
+    background:var(--bg-surface); border-bottom:1px solid var(--border);
+    position:sticky; top:0; z-index:40;
+  }
+  .hamburger { display:none; background:none; border:none; color:var(--text-1); cursor:pointer; padding:6px; border-radius:6px; }
+  .hamburger:hover { background:var(--bg-hover); }
+  .brand { font-size:15px; font-weight:650; white-space:nowrap; }
+  .brand .dns-addr { font-family:var(--mono); font-size:12px; font-weight:400; color:var(--text-2); margin-left:10px; padding:2px 8px; border:1px solid var(--border); border-radius:10px; }
+  .topbar .spacer { flex:1; }
+  .save-state { display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--text-2); white-space:nowrap; }
+  .save-state .dot { width:8px; height:8px; border-radius:50%; background:var(--success); }
+  .save-state.dirty .dot { background:var(--warning); }
+  .btn { border-radius:6px; cursor:pointer; border:1px solid transparent; padding:7px 16px; font-size:13px; white-space:nowrap; transition:background .15s,border-color .15s,opacity .15s; }
+  .btn:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .btn-primary { background:var(--accent); color:var(--accent-fg); font-weight:600; }
+  .btn-primary:hover { background:#6bb3ff; }
+  .btn-primary:disabled { background:#2b3a4d; color:var(--text-3); cursor:not-allowed; }
+  .btn-ghost { background:var(--bg-hover); color:var(--text-1); border-color:var(--border); }
+  .btn-ghost:hover { border-color:var(--border-strong); }
+  .btn-danger-ghost { background:transparent; color:var(--danger); border-color:transparent; }
+  .btn-danger-ghost:hover { background:var(--danger-soft); }
+  .btn-danger { background:var(--danger); color:#1d0908; font-weight:600; }
+  .btn-danger:hover { background:#ff6b63; }
+  .btn.loading { opacity:.65; pointer-events:none; }
+  .btn.small { padding:4px 11px; font-size:12px; }
+
+  /* ---------- 重启横幅 ---------- */
+  .restart-banner {
+    display:flex; align-items:flex-start; gap:10px; padding:10px 20px;
+    background:var(--warning-soft); border-bottom:1px solid rgba(224,165,60,.35);
+    color:#ecc87f; font-size:12.5px;
+  }
+  .restart-banner b { color:var(--warning); }
+  .restart-banner .close { margin-left:auto; background:none; border:none; color:var(--text-2); cursor:pointer; font-size:15px; line-height:1; padding:2px 6px; border-radius:4px; }
+  .restart-banner .close:hover { background:rgba(255,255,255,.06); color:var(--text-1); }
+  .restart-banner[hidden] { display:none; }
+
+  /* ---------- 布局骨架 ---------- */
+  .layout { display:flex; min-height:calc(100vh - 56px); }
+  .sidebar {
+    width:208px; flex:none; background:var(--bg-surface); border-right:1px solid var(--border);
+    padding:16px 12px 24px; display:flex; flex-direction:column; gap:2px;
+  }
+  .sidebar .nav-group { margin:10px 10px 5px; font-size:11px; color:var(--text-3); letter-spacing:.08em; }
+  .nav-item {
+    display:flex; align-items:center; gap:8px; width:100%; text-align:left;
+    padding:8px 11px; border-radius:7px; border:none; background:none; color:var(--text-2);
+    cursor:pointer; font-size:13px;
+  }
+  .nav-item:hover { background:var(--bg-hover); color:var(--text-1); }
+  .nav-item.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .nav-item .nav-dot { width:6px; height:6px; border-radius:50%; background:var(--warning); margin-left:auto; display:none; }
+  .nav-item.dirty .nav-dot { display:block; }
+  .nav-item.dirty:not(.active) { color:var(--text-1); }
+  .sidebar .nav-foot { margin-top:auto; }
+  .sidebar-backdrop { display:none; }
+
+  .view { flex:1; min-width:0; padding:26px 30px 70px; }
+  .view-inner { max-width:960px; margin:0 auto; }
+  .view-inner.wide { max-width:1120px; }
+
+  /* ---------- 页面/卡片标题 ---------- */
+  .page-head { margin-bottom:20px; }
+  .page-head h1 { margin:0 0 5px; font-size:19px; font-weight:650; }
+  .page-head p { margin:0; color:var(--text-2); font-size:13px; max-width:720px; }
+
+  .cards { display:flex; flex-direction:column; gap:16px; }
+  .card { background:var(--bg-surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .card-head { padding:15px 18px 0; }
+  .card-head h2 { margin:0; font-size:14px; font-weight:620; }
+  .card-desc { margin:4px 0 0; font-size:12px; color:var(--text-3); }
+  .card-body { padding:15px 18px 17px; }
+  .card-body.grid { display:grid; grid-template-columns:1fr 1fr; gap:15px 20px; }
+  .card-body.grid .span-2 { grid-column:1/-1; }
+  @media (max-width:680px){ .card-body.grid { grid-template-columns:1fr; } }
+
+  /* 开关卡片 */
+  .switch-head { display:flex; align-items:center; gap:14px; justify-content:space-between; padding-bottom:13px; }
+  .switch-head .txt h2 { margin:0; font-size:14px; }
+  .switch-head .txt p { margin:3px 0 0; font-size:12px; color:var(--text-3); }
+  .toggle-card.is-off .card-body { opacity:.42; }
+  .toggle-card.is-off .card-body input,
+  .toggle-card.is-off .card-body select,
+  .toggle-card.is-off .card-body button { pointer-events:none; }
+  .switch {
+    width:38px; height:22px; flex:none; border-radius:11px; border:none; cursor:pointer;
+    background:#343d49; position:relative; transition:background .18s;
+  }
+  .switch::after {
+    content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%;
+    background:#c6cfd8; transition:transform .18s,background .18s;
+  }
+  .switch[aria-checked="true"] { background:var(--success); }
+  .switch[aria-checked="true"]::after { transform:translateX(16px); background:#fff; }
+
+  /* 高级折叠区 */
+  details.advanced { background:var(--bg-surface); border:1px dashed var(--border-strong); border-radius:10px; }
+  details.advanced > summary {
+    list-style:none; cursor:pointer; padding:12px 16px; color:var(--text-2); font-size:13px;
+    display:flex; align-items:center; gap:8px; user-select:none;
+  }
+  details.advanced > summary::-webkit-details-marker { display:none; }
+  details.advanced > summary .chev { transition:transform .15s; color:var(--text-3); }
+  details.advanced[open] > summary .chev { transform:rotate(90deg); }
+  details.advanced > summary:hover { color:var(--text-1); }
+  details.advanced .adv-body { padding:2px 16px 16px; display:flex; flex-direction:column; gap:15px; }
+  details.advanced .adv-body.grid { display:grid; grid-template-columns:1fr 1fr; }
+  @media (max-width:680px){ details.advanced .adv-body.grid { grid-template-columns:1fr; } }
+
+  /* ---------- 表单字段 ---------- */
+  .field { min-width:0; }
+  .field label { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--text-2); margin-bottom:5px; }
+  .field label .dirty-dot { display:none; width:6px; height:6px; border-radius:50%; background:var(--warning); }
+  .field.is-dirty label .dirty-dot { display:inline-block; }
+  .badge-restart {
+    font-size:10.5px; color:var(--warning); border:1px solid rgba(224,165,60,.45);
+    padding:0 6px; border-radius:9px; line-height:1.7; white-space:nowrap;
+  }
+  input[type=text],input[type=number],select,textarea {
+    width:100%; background:var(--bg-inset); color:var(--text-1);
+    border:1px solid var(--border); border-radius:6px; padding:7px 10px; font:inherit;
+  }
+  input.mono { font-family:var(--mono); font-size:12.5px; }
+  textarea { font-family:var(--mono); font-size:12.5px; resize:vertical; min-height:74px; }
+  input:focus,select:focus,textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft); }
+  input.invalid,textarea.invalid,select.invalid { border-color:var(--danger); box-shadow:0 0 0 2px var(--danger-soft); }
+  input:disabled,select:disabled,textarea:disabled { opacity:.55; cursor:not-allowed; }
+  select { appearance:none; background-image:linear-gradient(45deg,transparent 50%,var(--text-3) 50%),linear-gradient(135deg,var(--text-3) 50%,transparent 50%); background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%; background-size:5px 5px,5px 5px; background-repeat:no-repeat; padding-right:28px; }
+  .help { font-size:11.5px; color:var(--text-3); margin-top:5px; }
+  .err { font-size:11.5px; color:var(--danger); margin-top:4px; min-height:0; display:none; }
+  .err.show { display:block; }
+
+  /* 上游列表编辑器 */
+  .list-editor { display:flex; flex-direction:column; gap:8px; }
+  .list-row { display:flex; gap:8px; align-items:center; }
+  .list-row input { flex:1; min-width:0; }
+  .list-row .proto { font-family:var(--mono); font-size:10.5px; padding:2px 7px; border-radius:5px; border:1px solid var(--border); color:var(--text-2); min-width:46px; text-align:center; }
+  .list-row .proto.ok { color:var(--success); border-color:rgba(63,185,80,.4); background:var(--success-soft); }
+  .list-row .proto.bad { color:var(--danger); border-color:rgba(248,81,73,.4); background:var(--danger-soft); }
+
+  /* 域名分流列表编辑器 */
+  .sl-editor { display:flex; flex-direction:column; gap:12px; }
+  .sl-item { border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; background:var(--bg-inset); }
+  .sl-item.is-dirty { border-color:var(--warning); }
+  .sl-item.is-dirty .dirty-dot { display:inline-block; }
+  .sl-head { display:flex; align-items:center; gap:10px; }
+  .sl-idx { font-family:var(--mono); font-size:11px; color:var(--text-3); min-width:14px; text-align:center; }
+  .sl-name { flex:1; min-width:0; font-weight:600; }
+  .sl-item .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px 20px; margin-top:12px; }
+  .sl-item .grid .span-2 { grid-column:1/-1; }
+  .sl-opt { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
+  .sl-opt .txt { display:flex; flex-direction:column; gap:3px; min-width:0; }
+  .sl-opt .txt span { font-size:12px; color:var(--text-2); }
+  .sl-opt .txt small { font-size:11.5px; color:var(--text-3); }
+  .sl-opt .switch { flex:none; }
+  @media (max-width:680px){ .sl-item .grid { grid-template-columns:1fr; } }
+  .icon-btn { background:none; border:none; color:var(--text-3); cursor:pointer; padding:5px; border-radius:5px; display:flex; }
+  .icon-btn:hover { color:var(--danger); background:var(--danger-soft); }
+  .icon-btn.move:hover { color:var(--accent); background:var(--accent-soft); }
+  .icon-btn:disabled { opacity:.28; cursor:not-allowed; color:var(--text-3); background:none; }
+  .list-add { align-self:flex-start; margin-top:2px; }
+
+  .form-actions { display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-top:2px; }
+
+  /* ---------- 规则页 ---------- */
+  .rules-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .rules-toolbar .search { position:relative; flex:1 1 150px; min-width:150px; max-width:340px; }
+  .rules-toolbar .search svg { position:absolute; left:9px; top:50%; transform:translateY(-50%); color:var(--text-3); pointer-events:none; }
+  .rules-toolbar .search input { padding-left:30px; }
+  .rules-toolbar select { width:auto; min-width:110px; }
+  .rules-toolbar .spacer { flex:1; }
+  .table-wrap { background:var(--bg-surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  table.rules { width:100%; border-collapse:collapse; }
+  table.rules th,table.rules td { text-align:left; padding:10px 14px; font-size:12.5px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  table.rules th { color:var(--text-3); font-weight:500; font-size:11.5px; background:rgba(255,255,255,.015); }
+  table.rules tbody tr:last-child td { border-bottom:none; }
+  table.rules tbody tr:hover { background:var(--bg-hover); }
+  table.rules td.wrap,table.rules th.wrap { white-space:normal; word-break:break-all; }
+  table.rules .mono { font-family:var(--mono); font-size:12px; }
+  .qtype { display:inline-block; font-family:var(--mono); font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:9px; border:1px solid transparent; }
+  .qtype.A { color:var(--accent); background:var(--accent-soft); }
+  .qtype.AAAA { color:var(--purple); background:rgba(188,140,255,.13); }
+  .qtype.CNAME { color:var(--cyan); background:rgba(57,197,207,.12); }
+
+  /* ---------- 解析日志 ---------- */
+  .src { display:inline-block; font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:9px; border:1px solid transparent; white-space:nowrap; }
+  .src.override { color:var(--warning); background:var(--warning-soft); }
+  .src.split { color:var(--accent); background:var(--accent-soft); }
+  .src.upstream { color:var(--text-2); background:rgba(154,167,180,.12); }
+  .src.cache { color:var(--cyan); background:rgba(57,197,207,.12); }
+  .src.cloud { color:var(--purple); background:rgba(188,140,255,.13); }
+  .src.filtered { color:var(--text-2); background:rgba(154,167,180,.12); border-color:var(--border); }
+  .src.refused { color:var(--warning); background:var(--warning-soft); }
+  .src.error { color:var(--danger); background:var(--danger-soft); }
+  .mode-badge { display:inline-block; font-family:var(--mono); font-size:10.5px; color:var(--text-3); border:1px solid var(--border); border-radius:9px; padding:0 7px; }
+  .log-list-name { color:var(--accent); }
+  .log-answers { font-family:var(--mono); font-size:11.5px; color:var(--text-2); margin-top:2px; }
+  .log-rcode { font-family:var(--mono); font-size:11px; font-weight:600; }
+  .log-rcode.good { color:var(--success); }
+  .log-rcode.warn { color:var(--warning); }
+  .log-rcode.bad { color:var(--danger); }
+  .pager { display:flex; align-items:center; gap:8px; justify-content:flex-end; margin-top:12px; }
+  .pager .page-info { font-size:12px; color:var(--text-3); margin-right:auto; }
+  .rules-toolbar input[type="datetime-local"] { width:auto; }
+  .bool-field { padding-top:4px; }
+  .row-switch { margin:0; transform:scale(.88); transform-origin:left center; }
+  .count-note { font-size:12px; color:var(--text-3); margin:10px 2px 0; }
+  .empty { padding:54px 20px; text-align:center; color:var(--text-2); }
+  .empty .big { font-size:15px; color:var(--text-1); margin-bottom:6px; }
+  .empty .sub { font-size:12.5px; color:var(--text-3); margin-bottom:16px; }
+
+  /* ---------- 抽屉 ---------- */
+  .overlay-backdrop { position:fixed; inset:0; background:rgba(3,6,10,.55); z-index:60; animation:fade .15s; }
+  @keyframes fade { from{opacity:0} to{opacity:1} }
+  .drawer {
+    position:fixed; top:0; right:0; bottom:0; width:440px; max-width:92vw; z-index:61;
+    background:var(--bg-surface); border-left:1px solid var(--border-strong);
+    display:flex; flex-direction:column; animation:slideIn .2s ease;
+  }
+  @keyframes slideIn { from{transform:translateX(24px);opacity:.4} to{transform:none;opacity:1} }
+  .drawer-head { padding:17px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  .drawer-head h3 { margin:0; font-size:15px; }
+  .drawer-body { padding:20px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:16px; }
+  .drawer-foot { padding:14px 20px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; }
+  .seg { display:flex; background:var(--bg-inset); border:1px solid var(--border); border-radius:7px; padding:3px; gap:3px; }
+  .seg button { flex:1; border:none; background:none; color:var(--text-2); padding:7px 0; border-radius:5px; cursor:pointer; font-family:var(--mono); font-size:13px; }
+  .seg button.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .match-hint { font-size:11.5px; color:var(--text-3); margin-top:5px; }
+  .match-hint b { color:var(--text-2); font-weight:500; }
+  .check-row { display:flex; align-items:center; gap:10px; }
+  .check-row .switch { margin:0; }
+  .check-row span { font-size:13px; }
+
+  /* ---------- 模态 ---------- */
+  .modal-wrap { position:fixed; inset:0; z-index:70; display:flex; align-items:center; justify-content:center; padding:20px; background:rgba(3,6,10,.55); }
+  .modal { width:420px; max-width:100%; background:var(--bg-surface); border:1px solid var(--border-strong); border-radius:11px; animation:pop .16s ease; }
+  @keyframes pop { from{transform:scale(.96);opacity:.5} to{transform:none;opacity:1} }
+  .modal h3 { margin:0 0 8px; font-size:15px; }
+  .modal .modal-body { padding:20px 20px 4px; }
+  .modal .modal-body p { margin:0; color:var(--text-2); font-size:13px; }
+  .modal .modal-body code { font-family:var(--mono); color:var(--text-1); background:var(--bg-inset); padding:1px 6px; border-radius:4px; }
+  .modal .modal-foot { padding:18px 20px; display:flex; justify-content:flex-end; gap:10px; }
+
+  /* ---------- Toast ---------- */
+  .toasts { position:fixed; top:68px; right:18px; z-index:80; display:flex; flex-direction:column; gap:9px; }
+  .toast {
+    background:var(--bg-hover); border:1px solid var(--border-strong); border-left:3px solid var(--text-3);
+    border-radius:7px; padding:10px 14px; font-size:12.5px; color:var(--text-1);
+    box-shadow:0 8px 24px rgba(0,0,0,.4); display:flex; align-items:center; gap:12px;
+    animation:toastIn .18s ease; max-width:380px;
+  }
+  @keyframes toastIn { from{transform:translateY(-6px);opacity:0} to{transform:none;opacity:1} }
+  .toast.ok { border-left-color:var(--success); }
+  .toast.err { border-left-color:var(--danger); }
+  .toast.warn { border-left-color:var(--warning); }
+  .toast button { background:none; border:none; color:var(--accent); cursor:pointer; font-size:12.5px; padding:0; font-weight:600; }
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width:768px){
+    .hamburger { display:flex; }
+    .topbar { gap:9px; padding:0 12px; }
+    .brand { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+    .brand .dns-addr { display:none; }
+    #btn-save, #btn-restart { flex-shrink:0; padding:7px 12px; }
+    .sidebar { position:fixed; top:56px; bottom:0; left:0; z-index:50; transform:translateX(-100%); transition:transform .2s ease; }
+    body.sidebar-open .sidebar { transform:none; }
+    body.sidebar-open .sidebar-backdrop { display:block; position:fixed; inset:56px 0 0 0; background:rgba(3,6,10,.5); z-index:45; }
+    .view { padding:18px 15px 60px; }
+    .save-state .label-text { display:none; }
+    table.rules thead { display:none; }
+    table.rules tr { display:block; padding:9px 14px; border-bottom:1px solid var(--border); }
+    table.rules td { display:flex; justify-content:space-between; gap:14px; border-bottom:none; padding:4px 0; white-space:normal; }
+    table.rules td::before { content:attr(data-label); color:var(--text-3); font-size:11.5px; }
+    table.rules td.cell-switch::before,table.rules td.cell-actions::before { content:""; }
+    table.rules td.cell-switch,table.rules td.cell-actions { justify-content:flex-start; gap:10px; }
+  }
+  @media (prefers-reduced-motion:reduce){ *{animation:none!important;transition:none!important;} }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="hamburger" id="hamburger" aria-label="打开导航菜单">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+  </button>
+  <div class="brand">DNS 代理配置中心<span class="dns-addr" id="dns-addr">DNS :--</span></div>
+  <div class="spacer"></div>
+  <div class="save-state" id="save-state"><span class="dot"></span><span class="label-text" id="save-state-text">所有更改已保存</span></div>
+  <button class="btn btn-ghost" id="btn-restart" title="按数据库中的配置重启 DNS 服务">重启服务</button>
+  <button class="btn btn-primary" id="btn-save" hidden>保存并应用</button>
+</header>
+
+<div class="restart-banner" id="restart-banner" hidden>
+  <span>⚠️</span>
+  <div><b>以下更改需重启生效：</b><span id="restart-fields"></span>。已写入数据库，点右上角「重启服务」应用（日志格式与 Web 地址需重启进程）。</div>
+  <button class="close" id="restart-close" aria-label="关闭提示">✕</button>
+</div>
+
+<div class="layout">
+  <nav class="sidebar" id="sidebar" aria-label="配置分区导航"></nav>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+  <main class="view" id="view"></main>
+</div>
+
+<div id="drawer-root"></div>
+<div id="modal-root"></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const clone = o => JSON.parse(JSON.stringify(o));
+const getPath = (o,p) => p.split(".").reduce((a,k)=> a==null ? a : a[k], o);
+const setPath = (o,p,v) => { const ks=p.split("."), last=ks.pop(); const t=ks.reduce((a,k)=>a[k],o); t[last]=v; };
+
+/* ================= 配置分区 schema（字段元数据驱动渲染） ================= */
+const RESTART_KEYS = new Set([
+  "listen_port","web_addr","log_format","cache.max_items","cache.max_async_workers",
+  "cloudflare_net_file","cloudflare_net_file6","aws_net_file","network_refresh",
+]);
+const FIELD_LABELS = {}; // 渲染时填充，用于重启横幅显示中文名
+
+const SECTIONS = [
+  { id:"general", title:"常规服务", desc:"日志级别、A/AAAA 解析偏好与服务监听参数。", cards:[
+    { title:"日志", body:[
+      { id:"log_level", label:"日志级别", type:"select", options:["debug","info","warn","error"],
+        help:"debug 最详尽（排障用），长期运行建议 info" },
+      { id:"query_log.enabled", label:"记录解析日志", type:"bool", span2:true,
+        help:"记录每次查询走的路径（篡改/缓存/分流/上游/云替换）、命中的列表与 DNS、以及最终应答，可在「解析日志」页检索" },
+      { id:"query_log.retention", label:"解析日志保留时长", type:"duration", placeholder:"72h",
+        help:"超过该时长的记录会被自动清理；留空按 72h" },
+      { id:"query_log.max_rows", label:"解析日志条数上限", type:"number",
+        help:"超过上限时从最旧的记录开始清理" },
+    ]},
+    { title:"A/AAAA 解析偏好（全局默认）", body:[
+      { id:"ip_prefer", label:"默认档位", type:"select", span2:true, options:[
+        { v:"", label:"不干预：完全按客户端的查询类型返回（默认）" },
+        { v:"prefer_a", label:"优先A：客户端查 AAAA 时，若域名有 A 记录则返回空结果，引导改走 A" },
+        { v:"prefer_aaaa", label:"优先AAAA：不抑制 A；AAAA 不再因云替换缺少 IPv6 而被置空" },
+        { v:"only_a", label:"只能A：客户端查 AAAA 一律返回空结果（纯 IPv6 客户端将不可达）" },
+      ], help:"作用于未命中分流列表（或列表未单独配置档位）的域名，可在分流列表里单独覆盖。客户端查询类型始终被尊重（查A回A、查AAAA回AAAA），「优先」只体现为把次优类型置空；本地域名篡改不受影响。" },
+    ]},
+    { kind:"advanced", title:"监听与服务（修改需重启进程）", body:[
+      { id:"listen_port", label:"DNS 监听端口", type:"number", restart:true, help:"1–65535，DNS 服务实际监听端口" },
+      { id:"web_addr", label:"Web 管理端地址", type:"text", mono:true, restart:true, help:"如 :5380 或 127.0.0.1:5380" },
+      { id:"log_format", label:"日志格式", type:"select", options:["text","json"], restart:true },
+    ]},
+  ]},
+  { id:"upstream", title:"上游与域名分流", desc:"上游 DNS、查询超时，以及按域名列表定向到不同 DNS 解析。", cards:[
+    { title:"上游 DNS 与超时", body:[
+      { id:"upstream", label:"上游 DNS 服务器", type:"list", span2:true,
+        help:"按顺序查询；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://(DoH3)，至少保留一个" },
+      { id:"timeout", label:"传统协议超时（UDP/TCP）", type:"duration", placeholder:"1.5s" },
+      { id:"modern_timeout", label:"现代协议超时（DoH/DoT/DoH3）", type:"duration", placeholder:"1s" },
+      { id:"backup_dns", label:"备用 DNS", type:"text", mono:true, span2:true,
+        help:"所有上游均失败后的兜底解析器" },
+    ]},
+    { title:"域名分流列表", body:[
+      { id:"split_lists", label:"分流列表", type:"splitlist", span2:true,
+        help:"自上而下即匹配优先级：命中第一条启用的列表即按其 DNS 处理，后面的不再参与。每条列表：命中后使用的 DNS（可多条，按「解析模式」并发竞速或串行故障转移）+ 域名列表文件（本地 YAML，mihomo 风格 payload）+ 可选下载 URL 与刷新间隔；开启「取反匹配」则该列表变为排除清单（域名不在清单里才命中）。列表增删、文件路径、刷新间隔、启用状态变更需重启；调整顺序、DNS、解析模式、取反、ECS、A/AAAA 偏好均可热更新。" },
+    ]},
+  ]},
+  { id:"cloud", title:"云 IP 检测与替换", desc:"识别 Cloudflare / AWS 地址并替换为优选 IP。", cards:[
+    { kind:"toggle", key:"enable_cloudflare_check", title:"Cloudflare 检测替换",
+      desc:"响应 IP 命中 Cloudflare 网段时，替换为查询替换域名得到的优选 IP。", body:[
+      { id:"replace_cf_domain", label:"CF 替换域名", type:"text", mono:true, span2:true },
+      { id:"replace_cf_api", label:"CF 替换接口", type:"text", mono:true, span2:true,
+        help:"留空则按上面的替换域名解析；填了则改从该接口取优选 IP（如 https://cf.niao.fun/api/results?select=cm），结果按「云替换响应缓存时间」缓存，过期后台提前预取" },
+      { id:"replace_api_count", label:"接口取前 N 条 IP", type:"number",
+        help:"默认 1（取第一条）；接口只提供 IPv4，AAAA 查询按无 v6 替换处理" },
+    ]},
+    { kind:"toggle", key:"enable_aws_check", title:"AWS 检测替换",
+      desc:"响应 IP 命中 AWS 网段时，替换为查询替换域名得到的优选 IP。", body:[
+      { id:"replace_aws_domain", label:"AWS 替换域名", type:"text", mono:true, span2:true },
+    ]},
+    { title:"替换参数", body:[
+      { id:"replace_cache_time", label:"云替换响应缓存时间", type:"duration", placeholder:"30m" },
+      { id:"max_ip_records", label:"替换域名最大 IP 数", type:"number" },
+      { id:"cname_recursion_depth", label:"CNAME 链收集深度", type:"number" },
+    ]},
+    { kind:"advanced", title:"IP 段数据文件（改动需重启）", body:[
+      { id:"cloudflare_net_file", label:"CF IP 段文件（v4）", type:"text", mono:true, restart:true },
+      { id:"cloudflare_net_file6", label:"CF IP 段文件（v6）", type:"text", mono:true, restart:true },
+      { id:"aws_net_file", label:"AWS IP 段文件", type:"text", mono:true, restart:true },
+      { id:"network_refresh", label:"IP 段刷新间隔", type:"duration", restart:true, placeholder:"96h" },
+    ]},
+  ]},
+  { id:"cache", title:"缓存与高级", desc:"DNS 响应缓存参数。其余配置请见对应分区。", cards:[
+    { title:"缓存", body:[
+      { id:"cache.ttl", label:"兜底缓存 TTL", type:"duration", placeholder:"5m",
+        help:"上游响应未携带 TTL 时使用；不会抬高上游给定的 TTL" },
+    ]},
+    { kind:"advanced", title:"缓存容量（修改需重启进程）", body:[
+      { id:"cache.max_items", label:"最大缓存条目数", type:"number", restart:true },
+      { id:"cache.max_async_workers", label:"异步刷新线程数", type:"number", restart:true },
+    ]},
+  ]},
+];
+
+/* ================= 状态 ================= */
+let CFG = null, BASELINE = null, OVERRIDES = [];
+let advOpen = new Set();            // 折叠区保持展开状态
+let ovFilter = { q:"", type:"", enabled:"" };
+let lastFocusKey = null;            // 开关重渲染后焦点归还
+
+/* ================= 工具函数 ================= */
+async function api(method, url, body) {
+  const opt = { method, headers:{ "Content-Type":"application/json" } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const resp = await fetch(url, opt);
+  const data = await resp.json().catch(()=>({}));
+  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+
+/* Go duration 解析与人性化显示：30m0s→30m，24h0m0s→24h，1500ms→1.5s */
+const DUR_RE = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/;
+/* DNS 地址协议前缀（udp/tcp/https=DoH/tls=DoT/h3=DoH3） */
+const DNS_RE = /^(udp|tcp|https|tls|h3):\/\//;
+/* ECS 线路类型（仅这些取值会向上游注入 ECS） */
+const ECS_TYPES = [{v:"telecom",label:"电信 telecom"},{v:"unicom",label:"联通 unicom"},{v:"mobile",label:"移动 mobile"}];
+/* ECS 地址校验：IPv4/IPv6，可带 /前缀长度（裸 IP 由后端按 /24、IPv6 按 /56 补齐） */
+function ecsSubnetValid(s) {
+  const parts = String(s).split("/");
+  const addr = parts[0].trim();
+  const v4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(addr) && addr.split(".").every(n => Number(n) <= 255);
+  const v6 = addr.includes(":") && /^[0-9a-fA-F:]{2,39}$/.test(addr);
+  if (!v4 && !v6) return false;
+  if (parts.length === 1) return true;
+  const mask = Number(parts[1]);
+  return Number.isInteger(mask) && mask > 0 && mask <= (v4 ? 32 : 128);
+}
+function parseDur(s) {
+  if (!s) return null;
+  const unit = { ms:1, s:1000, m:60000, h:3600000 };
+  let ms = 0, n = 0, m;
+  const re = /(\d+(?:\.\d+)?)(ms|s|m|h)/g;
+  while ((m = re.exec(s))) { ms += parseFloat(m[1]) * unit[m[2]]; n++; }
+  return n ? ms : null;
+}
+function humanDur(s) {
+  const ms = parseDur(s);
+  if (ms == null) return s;
+  if (ms >= 3600000 && ms % 3600000 === 0) return (ms/3600000) + "h";
+  if (ms >= 60000 && ms % 60000 === 0) return (ms/60000) + "m";
+  if (ms % 1000 === 0) return (ms/1000) + "s";
+  return String(+(ms/1000).toFixed(3)) + "s";
+}
+function humanizeConfig(c) {
+  const durs = ["timeout","modern_timeout","replace_cache_time","network_refresh"];
+  durs.forEach(k => { if (c[k]) c[k] = humanDur(c[k]); });
+  if (c.cache && c.cache.ttl) c.cache.ttl = humanDur(c.cache.ttl);
+  if (c.query_log && c.query_log.retention) c.query_log.retention = humanDur(c.query_log.retention);
+  if (!Array.isArray(c.split_lists)) c.split_lists = [];
+  c.split_lists.forEach(l => {
+    if (l.refresh) l.refresh = humanDur(l.refresh);
+    /* dns 兼容旧的单字符串写法，统一归一化为数组 */
+    if (!Array.isArray(l.dns)) l.dns = (l.dns == null || l.dns === "") ? [] : [l.dns];
+    /* dns_mode 空值按默认「并发竞速」归一化 */
+    l.dns_mode = String(l.dns_mode || "").trim() || "race";
+    /* ip_prefer 空值＝跟随全局默认 */
+    l.ip_prefer = String(l.ip_prefer || "").trim();
+  });
+  return c;
+}
+
+/* ================= Toast / 模态 ================= */
+function toast(msg, type="ok", action) {
+  const el = document.createElement("div");
+  el.className = "toast " + type;
+  el.innerHTML = `<span>${esc(msg)}</span>`;
+  let timer;
+  if (action) {
+    const b = document.createElement("button");
+    b.textContent = action.text;
+    b.onclick = () => { clearTimeout(timer); el.remove(); action.fn(); };
+    el.appendChild(b);
+  }
+  $("#toasts").appendChild(el);
+  timer = setTimeout(() => el.remove(), 5000);
+}
+
+function confirmModal({ title, bodyHTML, confirmText="确认", danger=false }) {
+  return new Promise(resolve => {
+    const root = $("#modal-root");
+    root.innerHTML = `
+      <div class="modal-wrap" data-modal-cancel>
+        <div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+          <div class="modal-body"><h3>${esc(title)}</h3><p>${bodyHTML}</p></div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" data-modal-cancel>取消</button>
+            <button class="btn ${danger ? "btn-danger" : "btn-primary"}" data-modal-ok>${esc(confirmText)}</button>
+          </div>
+        </div>
+      </div>`;
+    const done = v => { root.innerHTML=""; resolve(v); };
+    root.addEventListener("click", e => {
+      if (e.target.closest("[data-modal-ok]")) done(true);
+      else if (e.target.closest("[data-modal-cancel]") === e.target || e.target.classList.contains("modal-wrap")) done(false);
+    }, { once:true });
+    trapFocus($(".modal"), () => done(false));
+    setTimeout(() => root.querySelector(danger ? ".modal-foot [data-modal-cancel]" : "[data-modal-ok]").focus(), 0);
+  });
+}
+
+/* ================= 侧栏 / 路由 ================= */
+function currentRoute() {
+  let h = location.hash.replace(/^#\/?/, "").replace(/^settings\//, "");
+  if (h === "overrides") return { type:"overrides" };
+  if (h === "logs") return { type:"logs" };
+  if (h === "all") return { type:"all" };
+  const id = SECTIONS.some(s => s.id === h) ? h : "general";
+  return { type:"settings", id };
+}
+
+function buildSidebar(active) {
+  const item = (id, name) => `
+    <button class="nav-item" data-nav="${id}" aria-current="${active===id?'page':undefined}">
+      <span>${name}</span><span class="nav-dot"></span>
+    </button>`;
+  $("#sidebar").innerHTML =
+    `<div class="nav-group">设置</div>` +
+    SECTIONS.map(s => item("settings/"+s.id, s.title)).join("") +
+    `<div class="nav-group">规则</div>` +
+    item("overrides","域名篡改") +
+    `<div class="nav-group">日志</div>` +
+    item("logs","解析日志") +
+    `<div class="nav-foot"><button class="nav-item" data-nav="all"><span>全部配置（单页视图）</span><span class="nav-dot"></span></button></div>`;
+}
+
+function sectionDirty(section) {
+  let dirty = false;
+  walkFields(section.cards, f => {
+    if (JSON.stringify(getPath(CFG,f.id)) !== JSON.stringify(getPath(BASELINE,f.id))) dirty = true;
+  });
+  return dirty;
+}
+function anyDirty() { return SECTIONS.some(sectionDirty); }
+
+function updateChrome() {
+  $("#dns-addr").textContent = "DNS :" + (CFG ? CFG.listen_port : "--");
+  const route = currentRoute();
+  $$(".nav-item").forEach(btn => {
+    const target = btn.dataset.nav;
+    btn.classList.toggle("active",
+      (route.type==="settings" && target==="settings/"+route.id) ||
+      (route.type!=="settings" && target===route.type));
+    let d = false;
+    if (target.startsWith("settings/")) {
+      const sec = SECTIONS.find(s => s.id === target.split("/")[1]);
+      d = sec && sectionDirty(sec);
+    } else if (target === "all") {
+      d = anyDirty();
+    }
+    btn.classList.toggle("dirty", d);
+  });
+  const dirty = anyDirty();
+  const state = $("#save-state");
+  state.classList.toggle("dirty", dirty);
+  $("#save-state-text").textContent = dirty ? "有未保存更改" : "所有更改已保存";
+  const onSettings = route.type === "settings" || route.type === "all";
+  $("#btn-save").hidden = !onSettings;
+  $("#btn-save").disabled = !dirty;
+  /* 分区内保存按钮随该分区脏状态启停 */
+  $$('[data-action="save"]').forEach(btn => {
+    const sec = SECTIONS.find(s => s.id === btn.dataset.section);
+    btn.disabled = !(sec && sectionDirty(sec));
+  });
+}
+
+function walkFields(cards, cb) {
+  cards.forEach(card => {
+    (card.body || []).forEach(node => {
+      if (node.kind === "advanced" || node.kind === "toggle") walkFields([node], cb);
+      else if (node.id) { FIELD_LABELS[node.id] = node.label; cb(node); }
+    });
+  });
+}
+
+async function navigate(target) {
+  if (currentRouteStr() !== target && anyDirty()) {
+    const ok = await confirmModal({
+      title:"放弃未保存的更改？",
+      bodyHTML:"当前有尚未保存的配置修改，离开本页将丢失这些更改。",
+      confirmText:"放弃更改", danger:true,
+    });
+    if (!ok) { syncNavActive(); return; }
+    CFG = clone(BASELINE);
+  }
+  location.hash = "#/" + target;
+}
+function currentRouteStr() {
+  const r = currentRoute();
+  return r.type === "settings" ? "settings/"+r.id : r.type;
+}
+function syncNavActive(){ updateChrome(); }
+
+window.addEventListener("hashchange", renderRoute);
+
+/* ================= 设置分区渲染 ================= */
+function fieldHTML(f) {
+  const val = getPath(CFG, f.id);
+  const dirty = JSON.stringify(val) !== JSON.stringify(getPath(BASELINE, f.id));
+  const badge = f.restart ? `<span class="badge-restart">需重启</span>` : "";
+  const label = `<label for="f_${f.id}"><span class="dirty-dot"></span>${esc(f.label)}${badge}</label>`;
+  const help = f.help ? `<div class="help">${esc(f.help)}</div>` : "";
+  const err = `<div class="err" data-err="${esc(f.id)}"></div>`;
+  let control;
+  if (f.type === "select") {
+    /* options 支持纯字符串或 { v, label }（带说明的选项） */
+    const opts = f.options.map(o => typeof o === "string" ? { v:o, label:o } : o);
+    const cur = String(val ?? "");
+    control = `<select id="f_${f.id}" data-bind="${f.id}" data-kind="text">` +
+      opts.map(o => `<option value="${esc(o.v)}" ${o.v===cur?"selected":""}>${esc(o.label)}</option>`).join("") + `</select>`;
+  } else if (f.type === "bool") {
+    control = `<div class="bool-field"><button type="button" role="switch" aria-checked="${!!val}"
+      class="switch" data-bool-bind="${f.id}" aria-label="${esc(f.label)}"></button></div>`;
+  } else if (f.type === "list") {
+    control = listEditorHTML(f.id, val || []);
+  } else if (f.type === "splitlist") {
+    control = splitListEditorHTML(val || []);
+  } else {
+    const cls = f.mono ? "mono" : "";
+    const ph = f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : "";
+    control = `<input type="${f.type==='number'?'number':'text'}" id="f_${f.id}" class="${cls}"${ph}
+      data-bind="${f.id}" data-kind="${f.type==='number'?'number':(f.type==='duration'?'duration':'text')}"
+      value="${esc(val ?? "")}">`;
+  }
+  return `<div class="field ${f.span2?"span-2":""} ${dirty?"is-dirty":""}">${label}${control}${help}${err}</div>`;
+}
+
+function listEditorHTML(id, items) {
+  const rows = items.map((v,i) => {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(v||"") || [,""])[1];
+    const proto = scheme ? ["udp","tcp","https","tls","h3"].includes(scheme) ? scheme : "?" : "";
+    return `<div class="list-row">
+      <span class="proto ${scheme==="" ? "" : proto==="?"?"bad":"ok"}">${proto || "scheme"}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-list="${id}" data-idx="${i}" placeholder="https://1.1.1.1/dns-query">
+      <button type="button" class="icon-btn" data-action="list-del" data-id="${id}" data-idx="${i}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`;
+  }).join("");
+  return `<div class="list-editor" data-list-group="${id}">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="list-add" data-id="${id}">+ 添加一条</button></div>`;
+}
+
+/* 分流列表内嵌的 DNS 列表编辑器：多值按顺序失败切换（支持 udp/tcp/https(DoH)/tls(DoT)/h3） */
+function splitListDNSHTML(listIdx, servers) {
+  const rows = (servers || []).map((v, j) => {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(v||"") || [,""])[1];
+    const proto = scheme ? ["udp","tcp","https","tls","h3"].includes(scheme) ? scheme : "?" : "";
+    return `<div class="list-row">
+      <span class="proto ${scheme==="" ? "" : proto==="?"?"bad":"ok"}">${proto || "scheme"}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-sldns-list="${listIdx}" data-sldns-idx="${j}" placeholder="https://223.6.6.6/dns-query">
+      <button type="button" class="icon-btn" data-action="sldns-del" data-sldns-list="${listIdx}" data-sldns-idx="${j}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`;
+  }).join("");
+  return `<div class="list-editor">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="sldns-add" data-sldns-list="${listIdx}">+ 添加一条 DNS</button></div>`;
+}
+
+/* 分流列表编辑器：数组顺序即匹配优先级，命中第一条启用中的列表 */
+function splitListEditorHTML(items) {
+  const rows = items.map((l, i) => {
+    const dirty = splitListDirty(l);
+    const field = (key, label, opts = {}) => `
+      <div class="field ${opts.span2?"span-2":""}">
+        <label for="sl_${i}_${key}"><span class="dirty-dot"></span>${esc(label)}</label>
+        ${opts.list ? splitListDNSHTML(i, l.dns)
+          : opts.select ? `<select id="sl_${i}_${key}" data-sl-idx="${i}" data-sl-field="${key}">
+          ${opts.select.map(o => {
+            const cur = String(l[key] ?? "").trim() || opts.def || opts.select[0].v;
+            return `<option value="${esc(o.v)}"${cur === o.v ? " selected" : ""}>${esc(o.label)}</option>`;
+          }).join("")}
+        </select>`
+          : `<input type="text" id="sl_${i}_${key}" class="mono" value="${esc(l[key] ?? "")}"
+          data-sl-idx="${i}" data-sl-field="${key}" placeholder="${esc(opts.ph || "")}">`}
+        ${opts.help ? `<div class="help">${esc(opts.help)}</div>` : ""}
+        <div class="err" data-sl-err="${i}.${key}"></div>
+      </div>`;
+    return `<div class="sl-item ${dirty?"is-dirty":""}">
+      <div class="sl-head">
+        <span class="sl-idx">${i+1}</span>
+        <input type="text" class="sl-name" value="${esc(l.name ?? "")}" data-sl-idx="${i}"
+          data-sl-field="name" placeholder="列表名称（如 定向域名）" aria-label="列表名称">
+        <button type="button" role="switch" aria-checked="${!!l.enabled}" class="switch"
+          data-sl-switch="${i}" aria-label="启用该列表"></button>
+        <button type="button" class="icon-btn move" data-action="sl-up" data-sl-idx="${i}" ${i===0?"disabled":""} aria-label="上移（提高优先级）">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 12.5V3.5M4.5 7L8 3.5l3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn move" data-action="sl-down" data-sl-idx="${i}" ${i===items.length-1?"disabled":""} aria-label="下移（降低优先级）">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 3.5v9M4.5 9l3.5 3.5L11.5 9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn" data-action="sl-del" data-sl-idx="${i}" aria-label="删除该分流列表">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div class="err" data-sl-err="${i}.name"></div>
+      <div class="grid">
+        ${field("dns", "命中时使用的 DNS", { span2:true, ph:"https://223.6.6.6/dns-query", list:true,
+          help:"可添加多个，按下面「解析模式」处理（互为备份）；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://" })}
+        ${field("dns_mode", "多 DNS 解析模式", { span2:true, def:"race", select:[
+          { v:"race", label:"并发竞速：同时查询全部 DNS，取最快成功的结果（默认）" },
+          { v:"failover", label:"串行故障转移：按上面顺序依次查询，前一个失败/超时才用下一个" },
+        ], help:"仅当本列表配置了多个 DNS 时生效；串行模式下上游查询量最小，但故障切换需等超时" })}
+        ${field("ip_prefer", "A/AAAA 解析偏好", { span2:true, select:[
+          { v:"", label:"跟随全局默认（在「常规服务」里配置）" },
+          { v:"prefer_a", label:"优先A：客户端查 AAAA 时，若域名有 A 记录则返回空结果" },
+          { v:"prefer_aaaa", label:"优先AAAA：不抑制 A；AAAA 不因云替换缺 IPv6 而被置空" },
+          { v:"only_a", label:"只能A：客户端查 AAAA 一律返回空结果" },
+        ], help:"只影响本列表命中的域名，覆盖全局默认；客户端查询类型始终被尊重，本地域名篡改不受影响" })}
+        ${field("domain_file", "域名列表文件", { ph:"./data/designated.yaml" })}
+        ${field("refresh", "列表刷新间隔", { ph:"30m（留空表示不自动刷新）" })}
+        ${field("domain_url", "域名列表 URL（优先于本地文件）", { span2:true, ph:"https://example.com/designated.yaml" })}
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>取反匹配（排除清单）</span>
+          <small>开启后，域名「不在」上面文件/URL 的清单里时才命中本列表；清单为空时本列表不参与匹配</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!l.invert}" class="switch"
+          data-sl-invert="${i}" aria-label="取反匹配（排除清单）"></button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>命中后仍做 CF/AWS 云检测</span>
+          <small>关闭时，该列表命中的域名不做云 IP 替换（默认关闭）</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!l.enable_cloud_check}" class="switch"
+          data-sl-cloudcheck="${i}" aria-label="命中后仍做 CF/AWS 云检测"></button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>EDNS 客户端子网（按线路解析）</span>
+          <small>开启后向上游注入下面填的公网 IP，让上游返回对应线路（电信/联通/移动）的结果；关闭时不传 ECS</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!(l.ecs||{}).enabled}" class="switch"
+          data-sl-ecs="${i}" aria-label="向上游注入 EDNS 客户端子网"></button>
+      </div>
+      ${(l.ecs||{}).enabled ? `<div class="grid">
+        <div class="field">
+          <label for="sl_${i}_ecs_isp"><span class="dirty-dot"></span>线路类型</label>
+          <select id="sl_${i}_ecs_isp" data-sl-idx="${i}" data-sl-field="ecs.isp_type">
+            ${ECS_TYPES.map(t => `<option value="${t.v}"${((l.ecs||{}).isp_type||"telecom")===t.v?" selected":""}>${esc(t.label)}</option>`).join("")}
+          </select>
+          <div class="err" data-sl-err="${i}.ecs.isp_type"></div>
+        </div>
+        <div class="field">
+          <label for="sl_${i}_ecs_subnet"><span class="dirty-dot"></span>本地公网 IP / CIDR</label>
+          <input type="text" id="sl_${i}_ecs_subnet" class="mono" value="${esc((l.ecs||{}).subnet ?? "")}"
+            data-sl-idx="${i}" data-sl-field="ecs.subnet" placeholder="1.2.3.0/24">
+          <div class="help">填本机公网地址段；裸 IP 按 /24（IPv6 按 /56）补齐前缀</div>
+          <div class="err" data-sl-err="${i}.ecs.subnet"></div>
+        </div>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="sl-editor" data-sl-group="split_lists">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="sl-add">+ 添加一条分流列表</button></div>`;
+}
+
+function cardHTML(card) {
+  if (card.kind === "advanced") {
+    const key = "adv:" + card.title;
+    return `<details class="advanced span-2" ${advOpen.has(key)?"open":""} data-adv="${esc(key)}">
+      <summary><svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>${esc(card.title)}</summary>
+      <div class="adv-body grid">${card.body.map(nodeHTML).join("")}</div></details>`;
+  }
+  if (card.kind === "toggle") {
+    const on = !!getPath(CFG, card.key);
+    return `<section class="card toggle-card ${on?"":"is-off"}">
+      <div class="card-head switch-head">
+        <div class="txt"><h2>${esc(card.title)}</h2><p>${esc(card.desc||"")}</p></div>
+        <button type="button" role="switch" aria-checked="${on}" class="switch" data-switch-key="${card.key}" aria-label="${esc(card.title)}"></button>
+      </div>
+      <div class="card-body grid">${card.body.map(nodeHTML).join("")}</div></section>`;
+  }
+  return `<section class="card">
+    ${card.title ? `<div class="card-head"><h2>${esc(card.title)}</h2></div>` : ""}
+    <div class="card-body grid">${card.body.map(nodeHTML).join("")}</div></section>`;
+}
+function nodeHTML(node) {
+  return node.id ? fieldHTML(node) : cardHTML(node);
+}
+
+function sectionHTML(sec) {
+  return `<div class="page-head"><h1>${esc(sec.title)}</h1><p>${esc(sec.desc||"")}</p></div>
+    <div class="cards" data-section="${sec.id}">
+      ${sec.cards.map(cardHTML).join("")}
+      <div class="form-actions">
+        <button class="btn btn-danger-ghost" data-action="discard" data-section="${sec.id}">放弃更改</button>
+        <button class="btn btn-primary" data-action="save" data-section="${sec.id}">保存并应用</button>
+      </div>
+    </div>`;
+}
+
+function renderSettings(ids /* section id array */, isAll) {
+  const secs = ids.map(id => SECTIONS.find(s => s.id === id));
+  const head = isAll
+    ? `<div class="page-head"><h1>全部配置</h1><p>单页视图展示所有分区，保存时将一次性提交全部配置。</p></div>`
+    : "";
+  const inner = secs.map(sectionHTML).join('<div style="height:4px"></div>');
+  $("#view").innerHTML = `<div class="view-inner">${head}${inner}</div>`;
+  /* 开关关闭的卡片：字段真正禁用（不仅是视觉置灰），值仍保留在 CFG 中随保存提交 */
+  $$(".toggle-card.is-off .card-body input, .toggle-card.is-off .card-body select, .toggle-card.is-off .card-body button")
+    .forEach(el => { if (!el.classList.contains("icon-btn")) el.disabled = true; });
+  if (lastFocusKey) {
+    const el = $(`[data-switch-key="${lastFocusKey}"]`);
+    if (el) el.focus();
+    lastFocusKey = null;
+  }
+  updateChrome();
+}
+
+/* ================= 校验 / 保存 ================= */
+function validateField(f) {
+  const raw = getPath(CFG, f.id);
+  const v = raw == null ? "" : String(raw).trim();
+  if (f.type === "duration") {
+    if (v && !DUR_RE.test(v)) return "时长格式无效，示例：1.5s、30m、24h";
+  }
+  if (f.type === "number") {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) return "请输入正整数";
+    if (f.id === "listen_port" && n > 65535) return "端口范围为 1–65535";
+  }
+  if (f.type === "list") {
+    const arr = raw || [];
+    if (f.id === "upstream") {
+      if (!arr.some(x => x.trim())) return "至少配置一个上游 DNS";
+      const bad = arr.findIndex(x => x.trim() && !/^(udp|tcp|https|tls|h3):\/\//.test(x.trim()));
+      if (bad >= 0) return `第 ${bad+1} 条协议头无效，仅支持 udp:// tcp:// https:// tls:// h3://`;
+    }
+  }
+  return "";
+}
+
+function validateSections(secs) {
+  const errors = {};
+  walkFields(secs.flatMap(s => s.cards), f => {
+    const msg = validateField(f);
+    if (msg) errors[f.id] = msg;
+  });
+  return errors;
+}
+
+function showErrors(errors) {
+  $$("[data-err]").forEach(el => {
+    const msg = errors[el.dataset.err];
+    el.textContent = msg || "";
+    el.classList.toggle("show", !!msg);
+  });
+  $$("[data-bind]").forEach(inp => inp.classList.toggle("invalid", !!errors[inp.dataset.bind]));
+  $$("[data-sl-err]").forEach(el => {
+    const msg = errors[el.dataset.slErr];
+    el.textContent = msg || "";
+    el.classList.toggle("show", !!msg);
+  });
+  $$("[data-sl-field]").forEach(inp =>
+    inp.classList.toggle("invalid", !!errors[inp.dataset.slIdx + "." + inp.dataset.slField]));
+  $$("[data-list-group]").forEach(g => {
+    const id = g.dataset.listGroup;
+    g.classList.toggle("invalid-group", !!errors[id]);
+  });
+  $$("[data-sldns-list]").forEach(inp =>
+    inp.classList.toggle("invalid", !!errors[inp.dataset.sldnsList + ".dns"]));
+  const first = Object.keys(errors)[0];
+  if (first) {
+    const el = $(`[data-bind="${first}"]`) || $(`[data-list-group="${first}"]`) || $(`[data-sl-err="${first}"]`);
+    if (el) el.scrollIntoView({ behavior:"smooth", block:"center" });
+    const inp = $(`[data-bind="${first}"]`) ||
+      $(`[data-sl-err="${first}"]`)?.parentElement.querySelector("[data-sl-field], [data-sldns-list]");
+    if (inp) setTimeout(()=>inp.focus(), 250);
+  }
+}
+
+/* 归一化一条分流列表的 DNS：去空格去空项，始终返回数组 */
+function splitListDNS(l) {
+  const raw = Array.isArray(l.dns) ? l.dns : (l.dns == null || l.dns === "" ? [] : [l.dns]);
+  return raw.map(s => String(s || "").trim()).filter(Boolean);
+}
+
+/* 校验分流列表：名称/DNS/文件必填，刷新间隔须为合法时长 */
+function validateSplitLists(errors) {
+  (CFG.split_lists || []).forEach((l, i) => {
+    if (!String(l.name || "").trim()) errors[`${i}.name`] = "请填写列表名称";
+    const servers = splitListDNS(l);
+    if (!servers.length) errors[`${i}.dns`] = "请填写命中时使用的 DNS";
+    else if (servers.some(s => !DNS_RE.test(s))) errors[`${i}.dns`] = "DNS 地址须以 udp:// tcp:// https:// tls:// h3:// 开头";
+    if (!String(l.domain_file || "").trim()) errors[`${i}.domain_file`] = "请填写域名列表文件路径";
+    const ref = String(l.refresh || "").trim();
+    if (ref && !DUR_RE.test(ref)) errors[`${i}.refresh`] = "时长格式无效，示例：30m、24h";
+    const ecs = l.ecs || {};
+    if (ecs.enabled) {
+      if (!ECS_TYPES.some(t => t.v === ecs.isp_type)) errors[`${i}.ecs.isp_type`] = "请选择线路类型";
+      const subnet = String(ecs.subnet || "").trim();
+      if (!subnet) errors[`${i}.ecs.subnet`] = "请填写本地公网 IP 或 CIDR";
+      else if (!ecsSubnetValid(subnet)) errors[`${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
+    }
+  });
+}
+
+/* 分流列表中需重启才生效的变更（DNS/顺序/取反/ECS 均可热更新）
+   与顺序无关：按身份（名称/文件/URL）比对，避免仅调整顺序被误报为需重启 */
+function splitListsRestartNames() {
+  const base = BASELINE.split_lists || [], cur = CFG.split_lists || [];
+  if (base.length !== cur.length) return ["分流列表（数量变化）"];
+  const key = l => `${l.name || ""}\u0000${l.domain_file || ""}\u0000${l.domain_url || ""}`;
+  const byKey = new Map(base.map(l => [key(l), l]));
+  const names = [];
+  cur.forEach(l => {
+    const o = byKey.get(key(l));
+    if (!o) { names.push(l.name || "分流列表（新增）"); return; }
+    if (l.enabled !== o.enabled || l.refresh !== o.refresh) names.push(l.name || "分流列表");
+  });
+  return names;
+}
+
+function changedRestartFields() {
+  const names = [];
+  RESTART_KEYS.forEach(k => {
+    if (JSON.stringify(getPath(CFG,k)) !== JSON.stringify(getPath(BASELINE,k))) {
+      names.push(FIELD_LABELS[k] || k);
+    }
+  });
+  return names.concat(splitListsRestartNames());
+}
+
+async function saveSections(secs) {
+  /* 提交前清理列表编辑器产生的空行 */
+  CFG.upstream = (CFG.upstream || []).map(s => s.trim()).filter(Boolean);
+  CFG.split_lists = (CFG.split_lists || []).map(l => ({
+    name: String(l.name || "").trim(),
+    enabled: !!l.enabled,
+    invert: !!l.invert,
+    dns: splitListDNS(l),
+    dns_mode: (String(l.dns_mode || "").trim() || "race"),
+    domain_file: String(l.domain_file || "").trim(),
+    domain_url: String(l.domain_url || "").trim(),
+    refresh: String(l.refresh || "").trim(),
+    enable_cloud_check: !!l.enable_cloud_check,
+    ip_prefer: String(l.ip_prefer || "").trim(),
+    ecs: {
+      enabled: !!(l.ecs || {}).enabled,
+      isp_type: String((l.ecs || {}).isp_type || "").trim(),
+      subnet: String((l.ecs || {}).subnet || "").trim(),
+    },
+  }));
+  const errors = validateSections(secs);
+  validateSplitLists(errors);
+  showErrors(errors);
+  if (Object.keys(errors).length) {
+    toast("请修正标红的字段后再保存", "err");
+    return;
+  }
+  const btn = $(`.btn[data-action="save"]`);
+  if (btn) btn.classList.add("loading");
+  try {
+    const r = await api("PUT", "/api/config", CFG);
+    const restartFields = changedRestartFields();
+    BASELINE = clone(CFG);
+    renderRoute();
+    if (r.restart_required && restartFields.length) {
+      $("#restart-fields").textContent = restartFields.join("、");
+      $("#restart-banner").hidden = false;
+      toast("已保存，部分更改需重启后生效", "warn");
+    } else {
+      toast("已保存并热更新生效", "ok");
+    }
+  } catch (e) {
+    toast("保存失败：" + e.message, "err");
+    if (btn) btn.classList.remove("loading");
+  }
+}
+
+/* ================= 域名篡改规则页 ================= */
+function isIPv4(s) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  return !!m && m.slice(1).every(n => +n >= 0 && +n <= 255);
+}
+function isIPv6(s) { return s.includes(":") && /^[0-9a-fA-F:]+$/.test(s) && !s.includes("."); }
+
+function renderOverrides() {
+  const q = ovFilter.q.trim().toLowerCase();
+  const rows = OVERRIDES.filter(o =>
+    (!ovFilter.type || o.qtype === ovFilter.type) &&
+    (!ovFilter.enabled || (ovFilter.enabled==="yes") === !!o.enabled) &&
+    (!q || (o.domain+" "+o.value).toLowerCase().includes(q))
+  );
+  const tbody = rows.map(o => `
+    <tr>
+      <td class="cell-switch" data-label="">
+        <button role="switch" aria-checked="${o.enabled}" class="switch row-switch" data-action="ov-switch" data-id="${o.id}" aria-label="${o.enabled?'停用':'启用'}规则"></button>
+      </td>
+      <td class="wrap mono" data-label="域名">${esc(o.domain)}</td>
+      <td data-label="类型"><span class="qtype ${o.qtype}">${o.qtype}</span></td>
+      <td class="wrap mono" data-label="记录值">${esc(o.value)}</td>
+      <td data-label="TTL">${o.ttl}</td>
+      <td class="cell-actions" data-label="">
+        <button class="btn btn-ghost small" data-action="ov-edit" data-id="${o.id}">编辑</button>
+        <button class="btn btn-danger-ghost small" data-action="ov-del" data-id="${o.id}">删除</button>
+      </td>
+    </tr>`).join("");
+
+  const table = rows.length ? `
+    <div class="table-wrap">
+      <table class="rules">
+        <thead><tr><th style="width:46px">启用</th><th>域名</th><th style="width:78px">类型</th><th>记录值</th><th style="width:64px">TTL</th><th style="width:130px">操作</th></tr></thead>
+        <tbody>${tbody}</tbody>
+      </table>
+    </div>
+    <div class="count-note">共 ${rows.length} 条规则${OVERRIDES.length!==rows.length ? `（已从 ${OVERRIDES.length} 条中筛选）` : ""}</div>`
+  : (OVERRIDES.length === 0
+      ? `<div class="table-wrap"><div class="empty">
+          <div class="big">还没有篡改规则</div>
+          <div class="sub">命中规则的查询直接返回本地构造的响应，优先级高于缓存与所有上游。</div>
+          <button class="btn btn-primary" data-action="ov-add">+ 新增第一条规则</button>
+        </div></div>`
+      : `<div class="table-wrap"><div class="empty">
+          <div class="big">没有匹配的规则</div><div class="sub">试试调整搜索关键词或筛选条件。</div></div></div>`);
+
+  $("#view").innerHTML = `<div class="view-inner wide">
+    <div class="page-head">
+      <h1>域名篡改规则</h1>
+      <p>命中规则后直接返回本地构造的响应，<b>优先级高于缓存与所有上游</b>。域名支持精确（example.com）与后缀（.example.com 或 *.example.com）匹配；A/AAAA 未命中时可回退 CNAME 规则。</p>
+    </div>
+    <div class="rules-toolbar">
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <input type="text" id="ov-search" placeholder="搜索域名或记录值…" value="${esc(ovFilter.q)}">
+      </div>
+      <select id="ov-type-filter">
+        <option value="">全部类型</option>
+        <option ${ovFilter.type==="A"?"selected":""}>A</option>
+        <option ${ovFilter.type==="AAAA"?"selected":""}>AAAA</option>
+        <option ${ovFilter.type==="CNAME"?"selected":""}>CNAME</option>
+      </select>
+      <select id="ov-en-filter">
+        <option value="">全部状态</option>
+        <option value="yes" ${ovFilter.enabled==="yes"?"selected":""}>启用</option>
+        <option value="no" ${ovFilter.enabled==="no"?"selected":""}>停用</option>
+      </select>
+      <div class="spacer"></div>
+      <button class="btn btn-primary" data-action="ov-add">
+        <svg width="13" height="13" viewBox="0 0 13 13" style="vertical-align:-2px;margin-right:4px" fill="none"><path d="M6.5 2v9M2 6.5h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>新增规则
+      </button>
+    </div>
+    ${table}
+  </div>`;
+  updateChrome();
+}
+
+async function loadOverrides() {
+  const r = await api("GET", "/api/overrides");
+  OVERRIDES = r.overrides || [];
+}
+
+/* ---------- 抽屉：新增/编辑 ---------- */
+let drawerRule = null;       // 正在编辑的规则（null=新增）
+let drawerForm = null;
+
+function matchHint(domain) {
+  const d = domain.trim();
+  if (!d) return '输入 <b>example.com</b> 为精确匹配；<b>.example.com</b> 或 <b>*.example.com</b> 为后缀匹配';
+  if (d.startsWith(".") || d.startsWith("*.")) return "当前为<b>后缀匹配</b>，该域名及其所有子域名都会命中";
+  return "当前为<b>精确匹配</b>，仅该域名本身命中（子域名不命中）";
+}
+
+async function openDrawer(rule) {
+  drawerRule = rule ? clone(rule) : null;
+  drawerForm = rule ? clone(rule) : { domain:"", qtype:"A", value:"", ttl:60, enabled:true };
+
+  $("#drawer-root").innerHTML = `
+    <div class="overlay-backdrop" data-drawer-cancel></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <div class="drawer-head">
+        <h3 id="drawer-title">${rule ? "编辑规则 #" + rule.id : "新增篡改规则"}</h3>
+        <button class="icon-btn" data-drawer-cancel aria-label="关闭"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+      </div>
+      <div class="drawer-body">
+        <div class="field">
+          <label for="d-domain"><span class="dirty-dot"></span>域名</label>
+          <input type="text" class="mono" id="d-domain" placeholder="example.com / .example.com" value="${esc(drawerForm.domain)}">
+          <div class="match-hint" id="d-match">${matchHint(drawerForm.domain)}</div>
+          <div class="err" id="d-domain-err"></div>
+        </div>
+        <div class="field">
+          <label>记录类型</label>
+          <div class="seg" id="d-seg">
+            <button type="button" data-qtype="A">A</button>
+            <button type="button" data-qtype="AAAA">AAAA</button>
+            <button type="button" data-qtype="CNAME">CNAME</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="d-value" id="d-value-label">记录值（IPv4 地址）</label>
+          <input type="text" class="mono" id="d-value" value="${esc(drawerForm.value)}">
+          <div class="help" id="d-value-help"></div>
+          <div class="err" id="d-value-err"></div>
+        </div>
+        <div class="field" style="max-width:160px">
+          <label for="d-ttl">TTL（秒）</label>
+          <input type="number" id="d-ttl" value="${drawerForm.ttl}">
+          <div class="err" id="d-ttl-err"></div>
+        </div>
+        <div class="check-row">
+          <button type="button" role="switch" aria-checked="${drawerForm.enabled}" class="switch" id="d-enabled" aria-label="启用规则"></button>
+          <span>保存后立即${drawerForm.enabled ? "启用" : "停用"}</span>
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button class="btn btn-ghost" data-drawer-cancel>取消</button>
+        <button class="btn btn-primary" id="d-save">${rule ? "保存修改" : "保存规则"}</button>
+      </div>
+    </aside>`;
+
+  syncDrawerQType();
+  $("#d-domain").focus();
+  trapFocus($(".drawer"));
+
+  $("#drawer-root").addEventListener("click", drawerClick, { once:true });
+}
+
+function syncDrawerQType() {
+  const q = drawerForm.qtype;
+  $$("#d-seg button").forEach(b => b.classList.toggle("active", b.dataset.qtype === q));
+  const labels = { A:"记录值（IPv4 地址）", AAAA:"记录值（IPv6 地址）", CNAME:"记录值（目标域名）" };
+  const helps = { A:"如 127.0.0.1", AAAA:"如 ::1 或 2001:db8::1", CNAME:"如 target.example.com，不含空格" };
+  const phs = { A:"1.2.3.4", AAAA:"2001:db8::1", CNAME:"target.example.com" };
+  $("#d-value-label").textContent = labels[q];
+  $("#d-value-help").textContent = helps[q];
+  $("#d-value").placeholder = phs[q];
+}
+
+function validateDrawer() {
+  const errs = { domain:"", value:"", ttl:"" };
+  drawerForm.domain = drawerForm.domain.trim();
+  drawerForm.value = drawerForm.value.trim();
+  if (!drawerForm.domain) errs.domain = "域名不能为空";
+  else if (/\s/.test(drawerForm.domain)) errs.domain = "域名不能包含空格";
+  if (drawerForm.qtype === "A" && !isIPv4(drawerForm.value)) errs.value = "A 记录值必须是合法 IPv4 地址";
+  if (drawerForm.qtype === "AAAA" && !isIPv6(drawerForm.value)) errs.value = "AAAA 记录值必须是合法 IPv6 地址";
+  if (drawerForm.qtype === "CNAME" && (!drawerForm.value || /\s/.test(drawerForm.value))) errs.value = "CNAME 记录值必须是合法域名";
+  const ttl = Number($("#d-ttl").value);
+  if (!Number.isInteger(ttl) || ttl <= 0) errs.ttl = "TTL 必须是正整数";
+  Object.entries(errs).forEach(([k,v]) => {
+    const el = $("#d-" + k + "-err");
+    el.textContent = v; el.classList.toggle("show", !!v);
+  });
+  $("#d-domain").classList.toggle("invalid", !!errs.domain);
+  $("#d-value").classList.toggle("invalid", !!errs.value);
+  $("#d-ttl").classList.toggle("invalid", !!errs.ttl);
+  return !errs.domain && !errs.value && !errs.ttl;
+}
+
+async function drawerClick(e) {
+  const cancelBtn = e.target.closest("[data-drawer-cancel]");
+  if (cancelBtn) {
+    const changed = JSON.stringify(drawerForm) !== JSON.stringify(drawerRule ?? { domain:"", qtype:"A", value:"", ttl:60, enabled:true });
+    if (changed) {
+      const ok = await confirmModal({ title:"放弃当前编辑？", bodyHTML:"抽屉中的修改尚未保存。", confirmText:"放弃", danger:true });
+      if (!ok) { $("#drawer-root").addEventListener("click", drawerClick, { once:true }); return; }
+    }
+    $("#drawer-root").innerHTML = "";
+    return;
+  }
+  const qb = e.target.closest("[data-qtype]");
+  if (qb) {
+    drawerForm.qtype = qb.dataset.qtype;
+    syncDrawerQType();
+    $("#drawer-root").addEventListener("click", drawerClick, { once:true });
+    return;
+  }
+  if (e.target.closest("#d-enabled")) {
+    drawerForm.enabled = !drawerForm.enabled;
+    e.target.setAttribute("aria-checked", drawerForm.enabled);
+    $(".check-row span").textContent = "保存后立即" + (drawerForm.enabled ? "启用" : "停用");
+    $("#drawer-root").addEventListener("click", drawerClick, { once:true });
+    return;
+  }
+  const domainInp = e.target.closest("#d-domain");
+  if (domainInp) { /* 输入事件在全局监听处理 */ }
+
+  if (e.target.closest("#d-save")) {
+    drawerForm.domain = $("#d-domain").value;
+    drawerForm.value = $("#d-value").value;
+    if (!validateDrawer()) { $("#drawer-root").addEventListener("click", drawerClick, { once:true }); return; }
+    drawerForm.ttl = Number($("#d-ttl").value) || 60;
+    const saveBtn = $("#d-save");
+    saveBtn.classList.add("loading");
+    try {
+      if (drawerRule) await api("PUT", "/api/overrides/" + drawerRule.id, drawerForm);
+      else await api("POST", "/api/overrides", drawerForm);
+      $("#drawer-root").innerHTML = "";
+      await loadOverrides(); renderOverrides();
+      toast(drawerRule ? "规则已保存并即时生效" : "规则已新增并即时生效", "ok");
+    } catch (err) {
+      toast("保存失败：" + err.message, "err");
+      saveBtn.classList.remove("loading");
+      $("#drawer-root").addEventListener("click", drawerClick, { once:true });
+    }
+  } else {
+    $("#drawer-root").addEventListener("click", drawerClick, { once:true });
+  }
+}
+/* 抽屉内输入实时同步（click 监听之外的 input/change） */
+$("#drawer-root").addEventListener("input", e => {
+  if (!drawerForm) return;
+  if (e.target.id === "d-domain") {
+    drawerForm.domain = e.target.value;
+    $("#d-match").innerHTML = matchHint(e.target.value);
+  }
+  if (e.target.id === "d-value") drawerForm.value = e.target.value;
+  if (e.target.id === "d-ttl") drawerForm.ttl = Number(e.target.value) || 0;
+});
+
+function trapFocus(container, onEsc) {
+  container.addEventListener("keydown", e => {
+    if (e.key === "Escape") { e.stopPropagation(); onEsc ? onEsc() : $("[data-drawer-cancel]").click(); }
+    if (e.key !== "Tab") return;
+    const nodes = $$('button,[href],input,select,textarea', container).filter(n => !n.disabled && n.offsetParent !== null);
+    if (!nodes.length) return;
+    const first = nodes[0], last = nodes[nodes.length-1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+}
+
+/* ---------- 启停 / 删除 ---------- */
+async function toggleRule(id) {
+  const rule = OVERRIDES.find(o => o.id === id);
+  if (!rule) return;
+  rule.enabled = !rule.enabled;
+  renderOverrides();
+  try {
+    await api("PUT", "/api/overrides/" + id, rule);
+    toast(`规则已${rule.enabled ? "启用" : "停用"}，即时生效`, "ok");
+  } catch (e) {
+    toast("操作失败：" + e.message, "err");
+    await loadOverrides(); renderOverrides();
+  }
+}
+
+async function deleteRule(id) {
+  const rule = OVERRIDES.find(o => o.id === id);
+  if (!rule) return;
+  const ok = await confirmModal({
+    title:"删除篡改规则",
+    bodyHTML:`确认删除规则 <code>${esc(rule.domain)}</code>（${rule.qtype} → ${esc(rule.value)}）？此操作不可恢复。`,
+    confirmText:"删除", danger:true,
+  });
+  if (!ok) return;
+  const snapshot = clone(rule);
+  try {
+    await api("DELETE", "/api/overrides/" + id);
+    await loadOverrides(); renderOverrides();
+    toast("规则已删除", "warn", { text:"撤销", fn: async () => {
+      try {
+        delete snapshot.id;
+        await api("POST", "/api/overrides", snapshot);
+        await loadOverrides(); renderOverrides();
+        toast("规则已恢复", "ok");
+      } catch (e) { toast("恢复失败：" + e.message, "err"); }
+    }});
+  } catch (e) {
+    toast("删除失败：" + e.message, "err");
+  }
+}
+
+/* ================= 全局事件 ================= */
+function syncBoundInput(el) {
+  const bind = el.dataset.bind;
+  if (!bind) return;
+  const kind = el.dataset.kind;
+  let v = el.value;
+  if (kind === "number") v = v === "" ? 0 : Number(v);
+  setPath(CFG, bind, v);
+  el.closest(".field")?.classList.toggle("is-dirty",
+    JSON.stringify(getPath(CFG,bind)) !== JSON.stringify(getPath(BASELINE,bind)));
+  const errEl = $(`[data-err="${bind}"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+function syncListInput(el) {
+  const listId = el.dataset.list;
+  if (!listId) return;
+  const i = Number(el.dataset.idx);
+  CFG[listId][i] = el.value;
+  const protoEl = el.parentElement.querySelector(".proto");
+  if (protoEl) {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(el.value||"") || [,""])[1];
+    protoEl.textContent = scheme || "scheme";
+    protoEl.className = "proto " + (scheme === "" ? "" : (["udp","tcp","https","tls","h3"].includes(scheme) ? "ok" : "bad"));
+  }
+  updateChrome();
+}
+function syncSplitListInput(el) {
+  const key = el.dataset.slField;
+  if (!key) return;
+  const i = Number(el.dataset.slIdx);
+  const item = (CFG.split_lists || [])[i];
+  if (!item) return;
+  if (key === "ecs.isp_type" || key === "ecs.subnet") {
+    if (!item.ecs) item.ecs = { enabled: false, isp_type: "telecom", subnet: "" };
+  }
+  setPath(item, key, el.value);
+  el.closest(".sl-item")?.classList.toggle("is-dirty", splitListDirty(item));
+  const errEl = $(`[data-sl-err="${i}.${key}"]`);
+  if (errEl && errEl.classList.contains("show")) {
+    errEl.classList.remove("show"); errEl.textContent = ""; el.classList.remove("invalid");
+  }
+  updateChrome();
+}
+/* 分流列表脏标记：与基线中同身份（名称/文件/URL）的那条比对，调整顺序不误报 */
+function splitListDirty(l) {
+  const o = (BASELINE.split_lists || []).find(b =>
+    (b.name || "") === (l.name || "") && (b.domain_file || "") === (l.domain_file || "") &&
+    (b.domain_url || "") === (l.domain_url || ""));
+  return !o || JSON.stringify(l) !== JSON.stringify(o);
+}
+
+/* 分流列表内嵌 DNS 列表的输入同步 */
+function syncSplitDNSInput(el) {
+  if (el.dataset.sldnsList === undefined) return;
+  const i = Number(el.dataset.sldnsList);
+  const item = (CFG.split_lists || [])[i];
+  if (!item) return;
+  if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns];
+  item.dns[Number(el.dataset.sldnsIdx)] = el.value;
+  const protoEl = el.parentElement.querySelector(".proto");
+  if (protoEl) {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(el.value||"") || [,""])[1];
+    protoEl.textContent = scheme || "scheme";
+    protoEl.className = "proto " + (scheme === "" ? "" : (["udp","tcp","https","tls","h3"].includes(scheme) ? "ok" : "bad"));
+  }
+  el.closest(".sl-item")?.classList.toggle("is-dirty", splitListDirty(item));
+  const errEl = $(`[data-sl-err="${i}.dns"]`);
+  if (errEl && errEl.classList.contains("show")) {
+    errEl.classList.remove("show"); errEl.textContent = ""; el.classList.remove("invalid");
+  }
+  updateChrome();
+}
+document.addEventListener("input", e => { syncBoundInput(e.target); syncListInput(e.target); syncSplitListInput(e.target); syncSplitDNSInput(e.target); syncLogInput(e.target); });
+document.addEventListener("change", e => {
+  if (e.target.dataset.bind) { syncBoundInput(e.target); return; }
+  if (e.target.dataset.slField) { syncSplitListInput(e.target); return; }
+  if (e.target.id === "ov-search") { ovFilter.q = e.target.value; renderOverrides(); $("#ov-search").focus(); }
+  if (e.target.id === "ov-type-filter") { ovFilter.type = e.target.value; renderOverrides(); }
+  if (e.target.id === "ov-en-filter") { ovFilter.enabled = e.target.value; renderOverrides(); }
+});
+
+document.addEventListener("click", async e => {
+  /* 侧栏导航 */
+  const navBtn = e.target.closest("[data-nav]");
+  if (navBtn) { await navigate(navBtn.dataset.nav); document.body.classList.remove("sidebar-open"); return; }
+
+  /* 开关卡片 */
+  const sw = e.target.closest("[data-switch-key]");
+  if (sw && !sw.closest(".drawer")) {
+    const key = sw.dataset.switchKey;
+    setPath(CFG, key, !getPath(CFG, key));
+    lastFocusKey = key;
+    renderRoute();
+    return;
+  }
+
+  /* 布尔字段开关（如「记录解析日志」） */
+  const bs = e.target.closest("[data-bool-bind]");
+  if (bs && !bs.closest(".drawer")) {
+    const key = bs.dataset.boolBind;
+    setPath(CFG, key, !getPath(CFG, key));
+    renderRoute();
+    const el = $(`[data-bool-bind="${key}"]`);
+    if (el) el.focus();
+    return;
+  }
+
+  /* 解析日志页工具条 */
+  const logAct = e.target.closest('[data-action^="log-"]');
+  if (logAct) {
+    const a = logAct.dataset.action;
+    if (a === "log-refresh") { loadLogs(); return; }
+    if (a === "log-reset") {
+      logState.q = ""; logState.action = ""; logState.qtype = ""; logState.start = ""; logState.end = "";
+      logState.page = 0;
+      renderQueryLogs();
+      return;
+    }
+    if (a === "log-prev") { logState.page = Math.max(0, logState.page - 1); loadLogs(); return; }
+    if (a === "log-next") { logState.page += 1; loadLogs(); return; }
+  }
+
+  /* 列表编辑器 */
+  const listAdd = e.target.closest('[data-action="list-add"]');
+  if (listAdd) {
+    const id = listAdd.dataset.id;
+    CFG[id].push("");
+    renderRoute();
+    const rows = $$(`[data-list="${id}"]`);
+    if (rows.length) rows[rows.length-1].focus();
+    return;
+  }
+  const listDel = e.target.closest('[data-action="list-del"]');
+  if (listDel) {
+    CFG[listDel.dataset.id].splice(Number(listDel.dataset.idx), 1);
+    renderRoute();
+    return;
+  }
+
+  /* 分流列表编辑器 */
+  const slDnsAdd = e.target.closest('[data-action="sldns-add"]');
+  if (slDnsAdd) {
+    const item = CFG.split_lists[Number(slDnsAdd.dataset.sldnsList)];
+    if (item) {
+      if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns];
+      item.dns.push("");
+    }
+    renderRoute();
+    const rows = $$(`[data-sldns-list="${slDnsAdd.dataset.sldnsList}"]`);
+    if (rows.length) rows[rows.length-1].focus();
+    return;
+  }
+  const slDnsDel = e.target.closest('[data-action="sldns-del"]');
+  if (slDnsDel) {
+    const item = CFG.split_lists[Number(slDnsDel.dataset.sldnsList)];
+    if (item && Array.isArray(item.dns)) item.dns.splice(Number(slDnsDel.dataset.sldnsIdx), 1);
+    renderRoute();
+    return;
+  }
+  const slAdd = e.target.closest('[data-action="sl-add"]');
+  if (slAdd) {
+    CFG.split_lists.push({ name:"", enabled:true, invert:false, dns:[""], dns_mode:"race", domain_file:"", domain_url:"", refresh:"", enable_cloud_check:false, ip_prefer:"",
+      ecs:{ enabled:false, isp_type:"telecom", subnet:"" } });
+    renderRoute();
+    const names = $$('[data-sl-field="name"]');
+    if (names.length) names[names.length-1].focus();
+    return;
+  }
+  const slDel = e.target.closest('[data-action="sl-del"]');
+  if (slDel) {
+    CFG.split_lists.splice(Number(slDel.dataset.slIdx), 1);
+    renderRoute();
+    return;
+  }
+  /* 上移/下移：交换相邻两条，数组顺序即匹配优先级 */
+  const slMove = e.target.closest('[data-action="sl-up"],[data-action="sl-down"]');
+  if (slMove) {
+    const up = slMove.dataset.action === "sl-up";
+    const i = Number(slMove.dataset.slIdx);
+    const j = up ? i - 1 : i + 1;
+    const L = CFG.split_lists || [];
+    if (i >= 0 && j >= 0 && i < L.length && j < L.length) {
+      [L[i], L[j]] = [L[j], L[i]];
+      renderRoute();
+      $(`.sl-name[data-sl-idx="${j}"]`)?.focus();
+    }
+    return;
+  }
+  const slSw = e.target.closest("[data-sl-switch]");
+  if (slSw) {
+    const i = Number(slSw.dataset.slSwitch);
+    const item = CFG.split_lists[i];
+    if (item) {
+      item.enabled = !item.enabled;
+      renderRoute();
+      $(`[data-sl-switch="${i}"]`)?.focus();
+    }
+    return;
+  }
+  const slCc = e.target.closest("[data-sl-cloudcheck]");
+  if (slCc) {
+    const i = Number(slCc.dataset.slCloudcheck);
+    const item = CFG.split_lists[i];
+    if (item) {
+      item.enable_cloud_check = !item.enable_cloud_check;
+      renderRoute();
+      $(`[data-sl-cloudcheck="${i}"]`)?.focus();
+    }
+    return;
+  }
+  const slInv = e.target.closest("[data-sl-invert]");
+  if (slInv) {
+    const i = Number(slInv.dataset.slInvert);
+    const item = CFG.split_lists[i];
+    if (item) {
+      item.invert = !item.invert;
+      renderRoute();
+      $(`[data-sl-invert="${i}"]`)?.focus();
+    }
+    return;
+  }
+  const slEcs = e.target.closest("[data-sl-ecs]");
+  if (slEcs) {
+    const i = Number(slEcs.dataset.slEcs);
+    const item = CFG.split_lists[i];
+    if (item) {
+      if (!item.ecs) item.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
+      item.ecs.enabled = !item.ecs.enabled;
+      renderRoute();
+      $(`[data-sl-ecs="${i}"]`)?.focus();
+    }
+    return;
+  }
+
+  /* 折叠区状态保持 */
+  const adv = e.target.closest("[data-adv]");
+  if (adv && e.target.tagName === "SUMMARY") {
+    setTimeout(() => { adv.open ? advOpen.add(adv.dataset.adv) : advOpen.delete(adv.dataset.adv); }, 0);
+    return;
+  }
+
+  /* 设置保存/放弃 */
+  const saveBtn = e.target.closest('[data-action="save"]');
+  if (saveBtn) {
+    const secId = saveBtn.dataset.section;
+    const secs = secId ? [SECTIONS.find(s=>s.id===secId)] : SECTIONS;
+    await saveSections(secs.filter(Boolean));
+    return;
+  }
+  const discardBtn = e.target.closest('[data-action="discard"]');
+  if (discardBtn) {
+    const sec = SECTIONS.find(s => s.id === discardBtn.dataset.section);
+    if (sectionDirty(sec)) {
+      const ok = await confirmModal({ title:"放弃更改？", bodyHTML:"将恢复到上次保存的配置。", confirmText:"放弃更改", danger:true });
+      if (!ok) return;
+    }
+    walkFields(sec.cards, f => setPath(CFG, f.id, clone(getPath(BASELINE,f.id))));
+    renderRoute();
+    return;
+  }
+
+  /* 规则页操作 */
+  const act = e.target.closest("[data-action]");
+  if (act) {
+    const id = Number(act.dataset.id);
+    if (act.dataset.action === "ov-add") return openDrawer(null);
+    if (act.dataset.action === "ov-edit") return openDrawer(OVERRIDES.find(o=>o.id===id));
+    if (act.dataset.action === "ov-del") return deleteRule(id);
+    if (act.dataset.action === "ov-switch") return toggleRule(id);
+  }
+});
+
+/* 顶栏保存按钮 = 保存当前分区 */
+$("#btn-save").addEventListener("click", () => {
+  const route = currentRoute();
+  const secs = route.type === "all" ? SECTIONS : [SECTIONS.find(s => s.id === route.id)];
+  saveSections(secs.filter(Boolean));
+});
+$("#restart-close").addEventListener("click", () => { $("#restart-banner").hidden = true; });
+
+/* 重启服务：按数据库中的配置重建 DNS 处理器（未保存的修改不会生效） */
+$("#btn-restart").addEventListener("click", async () => {
+  const ok = await confirmModal({
+    title:"重启 DNS 服务？",
+    bodyHTML:"将按数据库中已保存的配置重建 DNS 服务，期间解析会中断数秒。未保存的修改不会生效。",
+    confirmText:"立即重启",
+  });
+  if (!ok) return;
+  const btn = $("#btn-restart");
+  btn.disabled = true;
+  try {
+    const r = await api("POST", "/api/restart");
+    if (r.web_addr_changed) {
+      toast("已下发重启；Web 监听地址变更需重启进程（systemctl restart dnsproxy）", "warn");
+    } else {
+      toast("已下发重启，DNS 服务将在数秒内恢复");
+    }
+    /* 重启以库中配置为准，重新拉取基线以清空脏状态 */
+    const res = await api("GET", "/api/config");
+    CFG = humanizeConfig(res.config);
+    BASELINE = clone(CFG);
+    $("#restart-banner").hidden = true;
+    renderRoute();
+  } catch (e) {
+    toast("重启失败：" + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("#hamburger").addEventListener("click", () => document.body.classList.toggle("sidebar-open"));
+$("#sidebar-backdrop").addEventListener("click", () => document.body.classList.remove("sidebar-open"));
+
+/* 离开页面前未保存提醒 */
+window.addEventListener("beforeunload", e => {
+  if (anyDirty()) { e.preventDefault(); e.returnValue = ""; }
+});
+
+/* ================= 解析日志页 ================= */
+const LOG_ACTIONS = [
+  { v:"", label:"全部来源" },
+  { v:"override", label:"本地篡改" },
+  { v:"split", label:"域名分流" },
+  { v:"upstream", label:"全局上游" },
+  { v:"cache", label:"缓存命中" },
+  { v:"cloud", label:"云 IP 替换" },
+  { v:"filtered", label:"偏好拦截" },
+  { v:"refused", label:"拒绝(RD=0)" },
+  { v:"error", label:"错误" },
+];
+const LOG_QTYPES = ["", "A", "AAAA", "CNAME", "NS", "MX", "TXT", "PTR", "SRV", "SOA", "CAA", "HTTPS", "OTHER"];
+const LOG_SRC_LABEL = {};
+LOG_ACTIONS.forEach(a => { LOG_SRC_LABEL[a.v] = a.label; });
+/* LOG_QTYPES 仅用于筛选下拉，服务端按 dns.TypeToString 存字符串 */
+let logState = { q:"", action:"", qtype:"", start:"", end:"", page:0, limit:50, total:0, resp:null };
+let logDebounce = null;
+
+function logFmtTime(ts) {
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function logRcodeClass(rcode) {
+  if (rcode === "NOERROR") return "good";
+  if (rcode === "NXDOMAIN" || rcode === "REFUSED") return "warn";
+  return "bad";
+}
+
+function renderQueryLogs() {
+  buildSidebar("logs");
+  $("#view").innerHTML = `<div class="view-inner wide">
+    <div class="page-head">
+      <h1>解析日志</h1>
+      <p>每次查询走的路径：本地篡改 / 域名分流 / 缓存 / 全局上游 / 云 IP 替换 / 偏好拦截，含命中的列表、实际应答的 DNS 与解析模式、ECS 处理与最终结果。日志存于独立库，按「常规服务 → 日志」的保留策略自动清理。</p>
+    </div>
+    <div class="rules-toolbar">
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <input type="text" id="log-q" placeholder="搜索域名 / 应答 / 客户端 / 列表 / DNS…" value="${esc(logState.q)}">
+      </div>
+      <select id="log-action" aria-label="来源筛选">${LOG_ACTIONS.map(a =>
+        `<option value="${a.v}"${logState.action===a.v?" selected":""}>${esc(a.label)}</option>`).join("")}</select>
+      <select id="log-qtype" aria-label="类型筛选">${LOG_QTYPES.map(t =>
+        `<option value="${t}"${logState.qtype===t?" selected":""}>${t || "全部类型"}</option>`).join("")}</select>
+      <input type="datetime-local" id="log-start" value="${esc(logState.start)}" aria-label="开始时间">
+      <span style="color:var(--text-3)">~</span>
+      <input type="datetime-local" id="log-end" value="${esc(logState.end)}" aria-label="结束时间">
+      <button class="btn btn-ghost small" data-action="log-reset">重置</button>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost small" data-action="log-refresh">刷新</button>
+    </div>
+    <div id="log-table"></div>
+  </div>`;
+  updateChrome();
+  loadLogs();
+}
+
+async function loadLogs() {
+  const box = $("#log-table");
+  if (!box) return;
+  box.innerHTML = `<div class="table-wrap"><div class="empty"><div class="big">加载中…</div></div></div>`;
+  const p = new URLSearchParams();
+  if (logState.q) p.set("q", logState.q);
+  if (logState.action) p.set("action", logState.action);
+  if (logState.qtype) p.set("qtype", logState.qtype);
+  if (logState.start) p.set("start", logState.start);
+  /* datetime-local 精确到分钟：结束时间补到该分钟末尾，避免漏掉当分钟的记录 */
+  if (logState.end) p.set("end", logState.end.length === 16 ? logState.end + ":59" : logState.end);
+  p.set("limit", logState.limit);
+  p.set("offset", logState.page * logState.limit);
+  try {
+    const r = await api("GET", "/api/logs?" + p.toString());
+    logState.resp = r;
+    logState.total = r.total || 0;
+    renderLogTable();
+  } catch (e) {
+    box.innerHTML = `<div class="table-wrap"><div class="empty">
+      <div class="big">查询失败</div><div class="sub">${esc(e.message)}</div></div></div>`;
+  }
+}
+
+function renderLogTable() {
+  const box = $("#log-table"), r = logState.resp;
+  if (!box || !r) return;
+  const logs = r.logs || [];
+  const filtered = !!(logState.q || logState.action || logState.qtype || logState.start || logState.end);
+
+  if (!logs.length) {
+    box.innerHTML = `<div class="table-wrap"><div class="empty">
+      <div class="big">${filtered ? "没有匹配的日志" : "暂无解析日志"}</div>
+      <div class="sub">${filtered ? "试试调整关键词、来源或时间区间。"
+        : "产生查询后，这里会显示每次解析的路径与结果；可在「常规服务 → 日志」里开关与调整保留策略。"}</div>
+    </div></div>`;
+    return;
+  }
+
+  const tbody = logs.map(e => {
+    const strat = (e.list_name ? `<span class="log-list-name">${esc(e.list_name)}</span>` : "")
+      + (e.dns_mode ? ` <span class="mode-badge">${e.dns_mode === "failover" ? "串行" : "竞速"}</span>` : "");
+    return `<tr>
+      <td class="mono" data-label="时间">${logFmtTime(e.time)}</td>
+      <td class="wrap mono" data-label="域名">${esc(e.domain)}</td>
+      <td data-label="类型"><span class="qtype">${esc(e.qtype)}</span></td>
+      <td data-label="来源"><span class="src ${esc(e.action)}">${esc(LOG_SRC_LABEL[e.action] || e.action)}</span></td>
+      <td data-label="分流策略">${strat || '<span style="color:var(--text-3)">—</span>'}</td>
+      <td data-label="结果"><span class="log-rcode ${logRcodeClass(e.rcode)}">${esc(e.rcode || "—")}</span>
+        ${e.answers ? `<div class="log-answers">${esc(e.answers)}</div>` : ""}</td>
+      <td data-label="上游">${e.dns ? `<span class="mono">${esc(e.dns)}</span>` : '<span style="color:var(--text-3)">—</span>'}
+        ${e.ecs ? `<div class="help">${esc(e.ecs)}</div>` : ""}</td>
+      <td data-label="耗时">${e.elapsed_ms} ms</td>
+      <td class="wrap mono" data-label="客户端">${esc(e.client || "—")}</td>
+    </tr>`;
+  }).join("");
+
+  const pages = Math.max(1, Math.ceil(r.total / logState.limit));
+  const st = r.stats || {};
+  const note = `<div class="count-note">本次筛选 ${r.total} 条 · 库内累计写入 ${st.written ?? 0} 条`
+    + `${st.dropped ? ` · 队列溢出丢弃 ${st.dropped} 条` : ""}`
+    + `${st.queued ? ` · 待落库 ${st.queued} 条` : ""}`
+    + `${st.enabled === false ? " · 记录已关闭" : ""}</div>`;
+
+  box.innerHTML = `<div class="table-wrap">
+      <table class="rules">
+        <thead><tr>
+          <th style="width:146px">时间</th><th>域名</th><th style="width:62px">类型</th>
+          <th style="width:86px">来源</th><th style="width:140px">分流策略</th><th>结果</th>
+          <th style="width:180px">上游 / ECS</th><th style="width:72px">耗时</th><th style="width:136px">客户端</th>
+        </tr></thead>
+        <tbody>${tbody}</tbody>
+      </table>
+    </div>${note}
+    <div class="pager">
+      <span class="page-info">共 ${r.total} 条 · 第 ${logState.page + 1}/${pages} 页</span>
+      <button class="btn btn-ghost small" data-action="log-prev" ${logState.page <= 0 ? "disabled" : ""}>上一页</button>
+      <button class="btn btn-ghost small" data-action="log-next" ${logState.page >= pages - 1 ? "disabled" : ""}>下一页</button>
+    </div>`;
+}
+
+/* 日志页筛选输入：改动即刷新（关键字防抖，只重绘表格以保持输入焦点） */
+function syncLogInput(el) {
+  const map = { "log-q":"q", "log-action":"action", "log-qtype":"qtype", "log-start":"start", "log-end":"end" };
+  const key = map[el.id];
+  if (!key) return;
+  logState[key] = el.value;
+  logState.page = 0;
+  if (el.id === "log-q") { clearTimeout(logDebounce); logDebounce = setTimeout(loadLogs, 300); }
+  else loadLogs();
+}
+
+/* ================= 路由渲染入口 ================= */
+function renderRoute() {
+  const route = currentRoute();
+  document.body.classList.remove("sidebar-open");
+  if (route.type === "overrides") {
+    buildSidebar("overrides");
+    renderOverrides();
+  } else if (route.type === "logs") {
+    renderQueryLogs();
+  } else if (route.type === "all") {
+    buildSidebar("all");
+    renderSettings(SECTIONS.map(s=>s.id), true);
+  } else {
+    buildSidebar("settings/" + route.id);
+    renderSettings([route.id], false);
+  }
+}
+
+/* ================= 启动 ================= */
+(async function init() {
+  try {
+    const [cfgRes] = await Promise.all([api("GET","/api/config"), loadOverrides()]);
+    CFG = humanizeConfig(cfgRes.config);
+    BASELINE = clone(CFG);
+    if (!location.hash) location.hash = "#/settings/general";
+    renderRoute();
+  } catch (e) {
+    $("#view").innerHTML = `<div class="view-inner"><div class="empty">
+      <div class="big">配置加载失败</div><div class="sub">${esc(e.message)}</div>
+      <button class="btn btn-ghost" onclick="location.reload()">重新加载</button></div></div>`;
+  }
+})();
+</script>
+</body>
+</html>

@@ -17,9 +17,24 @@ type FastQueryOptimizer struct {
 	logger *utils.EnhancedLogger
 
 	// 配置
+	cfgMu          sync.RWMutex
 	timeout        time.Duration
 	retryCount     int
 	enableFallback bool
+}
+
+// UpdateTimeouts 热更新查询超时配置
+func (qo *FastQueryOptimizer) UpdateTimeouts(timeout time.Duration) {
+	qo.cfgMu.Lock()
+	qo.timeout = timeout
+	qo.cfgMu.Unlock()
+}
+
+// getTimeout 读取查询超时
+func (qo *FastQueryOptimizer) getTimeout() time.Duration {
+	qo.cfgMu.RLock()
+	defer qo.cfgMu.RUnlock()
+	return qo.timeout
 }
 
 // QueryResult 查询结果
@@ -69,7 +84,7 @@ func (qo *FastQueryOptimizer) Query(req *dns.Msg, upstreams []string) *Concurren
 // concurrentQuery 并发查询多个上游服务器
 func (qo *FastQueryOptimizer) concurrentQuery(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	// 创建结果通道
@@ -202,13 +217,13 @@ func (qo *FastQueryOptimizer) queryServer(req *dns.Msg, server string) *QueryRes
 	start := time.Now()
 
 	// 创建带超时的上下文
-	ctx, cancel := context.WithTimeout(context.Background(), qo.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
 	// 优先尝试UDP
 	client := &dns.Client{
 		Net:     "udp",
-		Timeout: qo.timeout,
+		Timeout: qo.getTimeout(),
 	}
 
 	resp, rtt, err := client.ExchangeContext(ctx, req, server)

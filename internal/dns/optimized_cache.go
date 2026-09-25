@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -69,7 +70,7 @@ type OptimizedDNSCache struct {
 	shards     []*CacheShard
 	shardCount int
 	maxSize    int
-	defaultTTL time.Duration
+	defaultTTL atomic.Int64 // 兜底TTL（纳秒），支持热更新
 	entryPool  *CacheEntryPool
 }
 
@@ -93,14 +94,24 @@ func NewOptimizedDNSCache(maxSize int, defaultTTL time.Duration) *OptimizedDNSCa
 		shards:     shards,
 		shardCount: shardCount,
 		maxSize:    maxSize,
-		defaultTTL: defaultTTL,
 		entryPool:  NewCacheEntryPool(),
 	}
+	cache.defaultTTL.Store(int64(defaultTTL))
 
 	// 启动后台清理协程
 	go cache.cleanupRoutine()
 
 	return cache
+}
+
+// defTTL 返回当前兜底TTL
+func (c *OptimizedDNSCache) defTTL() time.Duration {
+	return time.Duration(c.defaultTTL.Load())
+}
+
+// SetDefaultTTL 热更新兜底TTL
+func (c *OptimizedDNSCache) SetDefaultTTL(ttl time.Duration) {
+	c.defaultTTL.Store(int64(ttl))
 }
 
 // key 生成缓存键
@@ -193,7 +204,7 @@ func (c *OptimizedDNSCache) SetCloudResponse(domain string, qType uint16, respon
 	shard := c.getShard(key)
 
 	// 使用自定义TTL或默认TTL
-	ttl := c.defaultTTL
+	ttl := c.defTTL()
 	if len(customTTL) > 0 {
 		ttl = customTTL[0]
 	}
@@ -508,7 +519,7 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 	responseCopy := response.Copy()
 
 	// 计算实际TTL：遵循上游响应中的最小TTL，绝不抬高；无有效TTL时用默认TTL兜底
-	actualTTL := c.defaultTTL
+	actualTTL := c.defTTL()
 	if responseCopy != nil && len(responseCopy.Answer) > 0 {
 		// 从响应中获取最小的TTL
 		var minTTL uint32 = 0
@@ -690,12 +701,12 @@ func (c *OptimizedDNSCache) ShouldRefresh(domain string, qType uint16) bool {
 		refreshThreshold = entry.RefreshThreshold
 	} else {
 		// 动态计算：使用条目总生存时间的30%作为刷新阈值
-		totalTTL := time.Since(entry.LastAccess.Add(-c.defaultTTL)) // 计算条目的总生存时间
+		totalTTL := time.Since(entry.LastAccess.Add(-c.defTTL())) // 计算条目的总生存时间
 		if totalTTL > 0 {
 			refreshThreshold = time.Duration(float64(totalTTL) * 0.3)
 		} else {
 			// 备用方案：使用默认TTL的30%
-			refreshThreshold = time.Duration(float64(c.defaultTTL) * 0.3)
+			refreshThreshold = time.Duration(float64(c.defTTL()) * 0.3)
 		}
 	}
 
@@ -867,8 +878,8 @@ func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time
 
 		// 延长过期时间，但不超过配置的最大TTL
 		newTTL := duration
-		if newTTL > c.defaultTTL*2 { // 最多延长到默认TTL的2倍
-			newTTL = c.defaultTTL * 2
+		if newTTL > c.defTTL()*2 { // 最多延长到默认TTL的2倍
+			newTTL = c.defTTL() * 2
 		}
 
 		entry.ExpireAt = time.Now().Add(newTTL)

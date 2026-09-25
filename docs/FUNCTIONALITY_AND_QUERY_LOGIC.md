@@ -5,7 +5,7 @@
 
 ## 一、功能总览
 
-cosDnaPorxy 是一个 DNS 代理服务器（默认监听 UDP/TCP `127.0.0.1:5354`），核心能力：
+cosDnaPorxy 是一个 DNS 代理服务器（默认监听 UDP/TCP `:53`），核心能力：
 
 | 功能 | 说明 | 主要实现 |
 |---|---|---|
@@ -92,7 +92,7 @@ writeResponse（统一响应出口）◄─────────────�
 - **query.go**：`proxyQueryWithCaching` 删除 `skipCloudDetection` 参数与内部云检测/CNAME 处理，简化为"查询 + 缓存原始响应"。
 - **refresh_handler.go**：`NewRefreshHandler` 增加 `rebuildCloud` 回调；5 处 `processDNSResponseWithCNAME + ensureMinimumTTL` 改为直接缓存原始响应；删除包级死代码 `processDNSResponseWithCNAME` / `processCloudResponse` / `ensureMinimumTTL`。
 - **cache_manager.go**：删除 `cloudDetector` 字段（检测上移）与孤立的 `calculateTTL`；失败响应改用 `soaNegativeTTL`。
-- **config.go / config.yaml**：删除 11 个死字段（`upstream_servers`、`cf_mrs_file_*`、`aws_mrs_file46`、`whitelist_file`、`tls_cert_file`/`tls_key_file`、`no_answer_cache_time` 等）；`ReplaceCacheTime` 改为 `time.Duration`；`DefaultConfigPath` 修正为 `config.yaml`；补齐默认值。
+- **config.go / config.yaml**：删除 11 个死字段（`upstream_servers`、`cf_mrs_file_*`、`aws_mrs_file46`、`whitelist_file`、`tls_cert_file`/`tls_key_file`、`no_answer_cache_time` 等）；`ReplaceCacheTime` 改为 `time.Duration`；补齐默认值。（该轮之后配置已整体迁到 SQLite `data/config.db`，`config.yaml` 与 `DefaultConfigPath` 均已不存在。）
 
 ### 3.3 验证记录（全部通过）
 

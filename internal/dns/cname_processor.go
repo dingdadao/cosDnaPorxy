@@ -2,6 +2,7 @@ package dns
 
 import (
 	"strings"
+	"sync"
 
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
@@ -17,10 +18,25 @@ import (
 // CNAME链递归仅作为内部云检测的IP收集手段（CollectChainIPs），其结果
 // 不会返回给客户端。
 type CNAMEProcessor struct {
+	cfgMu        sync.RWMutex
 	config       *config.Config
 	Logger       *utils.EnhancedLogger
 	proxyQuery   func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
 	cacheManager *CacheManager                              // 添加缓存管理器
+}
+
+// getConfig 获取当前配置（web保存后热切换）
+func (cp *CNAMEProcessor) getConfig() *config.Config {
+	cp.cfgMu.RLock()
+	defer cp.cfgMu.RUnlock()
+	return cp.config
+}
+
+// UpdateConfig 热更新配置引用
+func (cp *CNAMEProcessor) UpdateConfig(cfg *config.Config) {
+	cp.cfgMu.Lock()
+	cp.config = cfg
+	cp.cfgMu.Unlock()
 }
 
 // NewCNAMEProcessor 创建新的CNAME处理器
@@ -95,7 +111,7 @@ func (cp *CNAMEProcessor) CollectChainIPs(resp *dns.Msg, domain string, qtype ui
 	collect(resp)
 
 	// 沿CNAME链在缓存中查找更多IP（最多CNAMERecursionDepth跳）
-	maxDepth := cp.config.CNAMERecursionDepth
+	maxDepth := cp.getConfig().CNAMERecursionDepth
 	visited := map[string]bool{strings.ToLower(strings.TrimSuffix(domain, ".")): true}
 	current := resp
 	for depth := 0; depth < maxDepth && current != nil; depth++ {

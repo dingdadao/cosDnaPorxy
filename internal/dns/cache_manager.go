@@ -17,6 +17,7 @@ import (
 // CacheManager 缓存管理器
 type CacheManager struct {
 	cache  *OptimizedDNSCache
+	cfgMu  sync.RWMutex
 	config *config.Config
 	logger *utils.EnhancedLogger
 
@@ -89,6 +90,22 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger) *CacheMan
 	return cm
 }
 
+// getConfig 获取当前配置（web保存后热切换）
+func (cm *CacheManager) getConfig() *config.Config {
+	cm.cfgMu.RLock()
+	defer cm.cfgMu.RUnlock()
+	return cm.config
+}
+
+// UpdateConfig 热更新配置引用
+func (cm *CacheManager) UpdateConfig(cfg *config.Config) {
+	cm.cfgMu.Lock()
+	cm.config = cfg
+	cm.cfgMu.Unlock()
+	// 兜底TTL热更新传导到缓存层（容量/线程数仍需重启）
+	cm.cache.SetDefaultTTL(cfg.Cache.TTL)
+}
+
 // Get 获取缓存
 func (cm *CacheManager) Get(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
 	timer := cm.logger.StartTimer("cache_get", map[string]interface{}{
@@ -142,7 +159,7 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 
 		// 检查是否需要刷新
 		if cm.shouldRefresh(domain, qtype) { // 异步刷新默认启用
-			cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.config.Cache.TTL), 1)
+			cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.getConfig().Cache.TTL), 1)
 		}
 	} else {
 		cm.logger.Debug("☁️ 云响应缓存未命中详细信息", map[string]interface{}{
@@ -222,7 +239,7 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 	}
 
 	// 使用自定义TTL或默认TTL
-	ttl := cm.config.Cache.TTL
+	ttl := cm.getConfig().Cache.TTL
 	if len(customTTL) > 0 {
 		ttl = customTTL[0]
 	}
@@ -245,7 +262,7 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 	})
 
 	// 如果TTL较短，提交异步刷新任务（不再在这里检查，移到Get时检查）
-	// if cm.config.Cache.EnableAsyncRefresh && ttl <= cm.config.Cache.RefreshThreshold {
+	// if cm.getConfig().Cache.EnableAsyncRefresh && ttl <= cm.getConfig().Cache.RefreshThreshold {
 	//     cm.submitAsyncRefresh(domain, qtype, time.Now().Add(ttl), 1) // 高优先级
 	// }
 }
@@ -620,7 +637,7 @@ func (cm *CacheManager) startCacheScanTask() {
 
 	cm.logger.Info("🔍 定期缓存扫描任务已启动", map[string]interface{}{
 		"scan_interval":     "30s",
-		"refresh_threshold": cm.config.Cache.RefreshThreshold.String(),
+		"refresh_threshold": cm.getConfig().Cache.RefreshThreshold.String(),
 	})
 
 	for {
@@ -650,12 +667,12 @@ func (cm *CacheManager) scanCacheForRefresh() {
 	})
 
 	// 获取需要刷新的条目
-	entriesToRefresh := cm.cache.GetExpiringSoonEntries(cm.config.Cache.RefreshThreshold)
+	entriesToRefresh := cm.cache.GetExpiringSoonEntries(cm.getConfig().Cache.RefreshThreshold)
 
 	if len(entriesToRefresh) > 0 {
 		cm.logger.Info("🔄 发现需要刷新的缓存条目", map[string]interface{}{
 			"count":             len(entriesToRefresh),
-			"refresh_threshold": cm.config.Cache.RefreshThreshold.String(),
+			"refresh_threshold": cm.getConfig().Cache.RefreshThreshold.String(),
 		})
 
 		// 限制同时提交的刷新任务数量，防止队列溢出
@@ -672,7 +689,7 @@ func (cm *CacheManager) scanCacheForRefresh() {
 			}
 
 			// 计算过期时间（当前时间 + TTL）
-			expireTime := time.Now().Add(cm.config.Cache.TTL)
+			expireTime := time.Now().Add(cm.getConfig().Cache.TTL)
 			priority := 0
 			if entry.IsCloud {
 				priority = 1 // 云域名高优先级
@@ -703,7 +720,7 @@ type CacheEntryInfo struct {
 
 // startAsyncWorkers 启动异步工作器
 func (cm *CacheManager) startAsyncWorkers() {
-	workers := cm.config.Cache.MaxAsyncWorkers
+	workers := cm.getConfig().Cache.MaxAsyncWorkers
 	if workers <= 0 {
 		workers = 5
 	}
@@ -935,7 +952,9 @@ func (cm *CacheManager) Close() {
 	cm.workerPool.mu.Unlock()
 
 	cm.Clear()
-	close(cm.asyncChan)
+	// 注意：不能关闭 asyncChan。worker 统一由 stopCh 退出，一旦关闭该 channel，
+	// 晚一步进入 select 的 worker 会立刻读到 nil 任务并在 processAsyncTask 空指针崩溃；
+	// 提交端也会因 "send on closed channel" panic。
 
 	cm.logger.Info("📪 缓存管理器已关闭")
 }

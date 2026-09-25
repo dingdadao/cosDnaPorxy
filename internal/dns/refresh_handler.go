@@ -3,6 +3,7 @@ package dns
 import (
 	"fmt"
 	"runtime/debug"
+	"sync"
 
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
@@ -10,8 +11,23 @@ import (
 	"github.com/miekg/dns"
 )
 
+// getConfig 获取当前配置（web保存后热切换）
+func (rh *RefreshHandler) getConfig() *config.Config {
+	rh.cfgMu.RLock()
+	defer rh.cfgMu.RUnlock()
+	return rh.config
+}
+
+// UpdateConfig 热更新配置引用
+func (rh *RefreshHandler) UpdateConfig(cfg *config.Config) {
+	rh.cfgMu.Lock()
+	rh.config = cfg
+	rh.cfgMu.Unlock()
+}
+
 // RefreshHandler 处理异步刷新相关功能
 type RefreshHandler struct {
+	cfgMu          sync.RWMutex
 	config         *config.Config
 	logger         *utils.EnhancedLogger
 	cacheManager   *CacheManager
@@ -64,7 +80,7 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 
 			// 即使发生panic，也要尝试延长缓存TTL以防止频繁刷新
 			if rh != nil && rh.cacheManager != nil {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL/2)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL/2)
 			}
 		}
 	}()
@@ -91,8 +107,11 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 		"qtype":  dns.TypeToString[qtype],
 	})
 
+	// 分流决策：一次匹配同时得出上游 DNS 与 ECS 策略（与查询路径保持同一套判定）
+	decision := rh.matcherHandler.MatchDomain(domain)
+
 	// 确定应该使用的上游DNS服务器（遵循相同的优先级规则）
-	upstreams := rh.determineUpstreamsForDomain(domain)
+	upstreams := rh.upstreamsFor(domain, decision)
 
 	// 添加上游服务器检查
 	if len(upstreams) == 0 {
@@ -106,13 +125,13 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			isDomainCloud := rh.cacheManager.IsDomainCloud(domain)
 			if isDomainCloud {
 				// 对于云域名，使用配置的替换缓存时间
-				replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-				if rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+				if rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 				rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf("no valid upstream servers found")
@@ -120,6 +139,8 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(domain), qtype)
+	// 命中分流列表时按列表 ECS 策略处理请求副本，避免无 ECS 的结果回写覆盖带 ECS 的缓存
+	reqUpstream := applySplitECS(req, decision)
 
 	// 添加请求检查
 	if req == nil {
@@ -134,17 +155,17 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 				// 检查是否为替换域名，替换域名使用替换缓存时间，普通云域名使用普通缓存时间
 				if rh.cloudDetector.IsReplaceDomain(domain) {
 					// 替换域名使用替换缓存时间
-					replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-					if rh.config.ReplaceCacheTime > 0 {
-						replaceCacheTime = rh.config.ReplaceCacheTime
+					replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+					if rh.getConfig().ReplaceCacheTime > 0 {
+						replaceCacheTime = rh.getConfig().ReplaceCacheTime
 					}
 					rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 				} else {
 					// 普通云域名使用普通缓存时间
-					rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+					rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 				}
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf("request object is nil")
@@ -162,13 +183,13 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			isDomainCloud := rh.cacheManager.IsDomainCloud(domain)
 			if isDomainCloud {
 				// 对于云域名，使用配置的替换缓存时间
-				replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-				if rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+				if rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 				rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf("query optimizer is nil")
@@ -176,10 +197,10 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 
 	if modernOptimizer, ok := rh.queryOptimizer.(*SimpleModernOptimizer); ok {
 		// 使用现代查询优化器
-		result = modernOptimizer.Query(req, upstreams)
+		result = modernOptimizer.Query(reqUpstream, upstreams)
 	} else if traditionalOptimizer, ok := rh.queryOptimizer.(*FastQueryOptimizer); ok {
 		// 使用传统查询优化器
-		result = traditionalOptimizer.Query(req, upstreams)
+		result = traditionalOptimizer.Query(reqUpstream, upstreams)
 	} else {
 		rh.logger.Error("❌ [异步刷新失败] ", map[string]interface{}{
 			"domain": domain,
@@ -192,13 +213,13 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			isDomainCloud := rh.cacheManager.IsDomainCloud(domain)
 			if isDomainCloud {
 				// 对于云域名，使用配置的替换缓存时间
-				replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-				if rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+				if rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 				rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf("unknown query optimizer type")
@@ -214,13 +235,13 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			isDomainCloud := rh.cacheManager.IsDomainCloud(domain)
 			if isDomainCloud {
 				// 对于云域名，使用配置的替换缓存时间
-				replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-				if rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+				if rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 				rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf("query result is nil")
@@ -242,13 +263,13 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			isDomainCloud := rh.cacheManager.IsDomainCloud(domain)
 			if isDomainCloud {
 				// 对于云域名，使用配置的替换缓存时间
-				replaceCacheTime := rh.config.Cache.TTL // 默认使用缓存TTL
-				if rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL // 默认使用缓存TTL
+				if rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 				rh.cacheManager.ExtendTTL(domain, qtype, replaceCacheTime)
 			} else {
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL)
 			}
 		}
 		return fmt.Errorf(errorMsg)
@@ -268,30 +289,30 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 			return fmt.Errorf("cache manager is nil")
 		}
 
-		// 检查是否匹配定向域名
-		dnsServer, isDesignated := rh.matcherHandler.GetYAMLMatcher().GetDesignatedDomainOrDefault(domain)
-
-		if isDesignated {
-			rh.logger.Info("🎯 [异步刷新-定向域名处理开始] ", map[string]interface{}{
-				"domain": domain,
-				"dns":    dnsServer,
+		// 检查是否命中分流列表（列表未开启云检测时跳过云服务检测）
+		if decision.Matched && !decision.EnableCloudCheck {
+			rh.logger.Info("🎯 [异步刷新-分流列表域名处理开始] ", map[string]interface{}{
+				"domain":      domain,
+				"list":        decision.ListName,
+				"dns_servers": decision.DNS,
 			})
 
-			// 对于定向域名，跳过云服务检测
+			// 对于分流列表域名，跳过云服务检测
 			rh.logger.Info("⏭️ [异步刷新-跳过云服务检测] ", map[string]interface{}{
 				"domain": domain,
-				"reason": "designated_domain",
+				"reason": "split_list",
+				"list":   decision.ListName,
 			})
 
 			// 缓存原始上游响应（遵循上游TTL并按缓存时长递减，不再改写owner/裁剪RRset）
 			rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
 
-			rh.logger.Debug("🔄 [异步刷新完成-定向域名] ", map[string]interface{}{
+			rh.logger.Debug("🔄 [异步刷新完成-分流列表] ", map[string]interface{}{
 				"domain":       domain,
 				"qtype":        dns.TypeToString[qtype],
-				"source":       "designated",
+				"source":       decision.ListName,
 				"answer_count": len(result.SuccessResult.Response.Answer),
-				"upstreams":    []string{dnsServer},
+				"upstreams":    decision.DNS,
 			})
 		} else {
 			rh.logger.Info("🌐 [异步刷新-普通域名处理开始] ", map[string]interface{}{
@@ -304,7 +325,7 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 					"domain": domain,
 					"qtype":  dns.TypeToString[qtype],
 				})
-				rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL/2)
+				rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL/2)
 				return fmt.Errorf("cloud detector is nil")
 			}
 
@@ -326,9 +347,9 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 				rh.cacheManager.MarkDomainAsCloud(domain, qtype, cloudType)
 
 				// 检查是否为替换域名，替换域名使用替换缓存时间，普通云域名使用普通缓存时间
-				replaceCacheTime := rh.config.Cache.TTL
-				if rh.cloudDetector.IsReplaceDomain(domain) && rh.config.ReplaceCacheTime > 0 {
-					replaceCacheTime = rh.config.ReplaceCacheTime
+				replaceCacheTime := rh.getConfig().Cache.TTL
+				if rh.cloudDetector.IsReplaceDomain(domain) && rh.getConfig().ReplaceCacheTime > 0 {
+					replaceCacheTime = rh.getConfig().ReplaceCacheTime
 				}
 
 				// 通过回调重建与查询路径一致的云替换响应（保持上游结构，仅替换IP值）
@@ -352,86 +373,20 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 					"upstreams":    upstreams,
 				})
 			} else {
-				// 检查是否为中国域名（如果启用了中国域名检查）- 在云服务检测之后
-				if rh.config.EnableChinaDomainCheck {
-					rh.logger.Debug("🔍 [异步刷新-中国域名检测开始] ", map[string]interface{}{
-						"domain":  domain,
-						"enabled": rh.config.EnableChinaDomainCheck,
-					})
-					isChinaDomain := rh.matcherHandler.GetChinaMatcher().IsChinaDomain(domain)
-					if isChinaDomain {
-						rh.logger.Info("🇨🇳 [异步刷新-中国域名检测结果] ", map[string]interface{}{
-							"domain": domain,
-						})
+				rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
+					"domain": domain,
+				})
 
-						// 对于中国域名，使用中国DNS服务器进行查询
-						if rh.config.ChinaDNS != "" {
-							rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0) // 中国域名不标记为云服务
+				// 对于普通域名，缓存原始上游响应
+				rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
 
-							rh.logger.Debug("🔄 [异步刷新完成-中国域名] ", map[string]interface{}{
-								"domain":       domain,
-								"qtype":        dns.TypeToString[qtype],
-								"source":       "china",
-								"answer_count": len(result.SuccessResult.Response.Answer),
-								"upstreams":    []string{rh.config.ChinaDNS},
-							})
-						} else {
-							rh.logger.Warn("⚠️ [异步刷新-中国域名但未配置ChinaDNS] ", map[string]interface{}{
-								"domain": domain,
-							})
-							// 如果未配置ChinaDNS，按普通域名处理
-							rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
-
-							rh.logger.Debug("🔄 [异步刷新完成-中国域名-普通处理] ", map[string]interface{}{
-								"domain":       domain,
-								"qtype":        dns.TypeToString[qtype],
-								"source":       "china_fallback_normal",
-								"answer_count": len(result.SuccessResult.Response.Answer),
-								"upstreams":    upstreams,
-							})
-						}
-					} else {
-						rh.logger.Debug("❌ [异步刷新-非中国域名] ", map[string]interface{}{
-							"domain": domain,
-						})
-
-						rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
-							"domain": domain,
-						})
-
-						// 对于普通域名，缓存原始上游响应
-						rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
-
-						rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
-							"domain":       domain,
-							"qtype":        dns.TypeToString[qtype],
-							"source":       "normal",
-							"answer_count": len(result.SuccessResult.Response.Answer),
-							"upstreams":    upstreams,
-						})
-					}
-				} else {
-					// 如果中国域名检查被禁用，执行原来的逻辑
-					rh.logger.Debug("⏭️ [异步刷新-中国域名检查已禁用] ", map[string]interface{}{
-						"domain":  domain,
-						"enabled": rh.config.EnableChinaDomainCheck,
-					})
-
-					rh.logger.Info("❌ [异步刷新-非云服务域名] ", map[string]interface{}{
-						"domain": domain,
-					})
-
-					// 对于普通域名，缓存原始上游响应
-					rh.cacheManager.Set(domain, qtype, result.SuccessResult.Response, false, 0)
-
-					rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
-						"domain":       domain,
-						"qtype":        dns.TypeToString[qtype],
-						"source":       "normal",
-						"answer_count": len(result.SuccessResult.Response.Answer),
-						"upstreams":    upstreams,
-					})
-				}
+				rh.logger.Debug("🔄 [异步刷新完成-普通域名] ", map[string]interface{}{
+					"domain":       domain,
+					"qtype":        dns.TypeToString[qtype],
+					"source":       "normal",
+					"answer_count": len(result.SuccessResult.Response.Answer),
+					"upstreams":    upstreams,
+				})
 			}
 		}
 	} else {
@@ -461,45 +416,30 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 		// 这样可以避免缓存立即过期导致的查询失败
 		// 延长时间为配置TTL的一半，避免过于频繁的刷新
 		if rh.cacheManager != nil {
-			rh.cacheManager.ExtendTTL(domain, qtype, rh.config.Cache.TTL/2)
+			rh.cacheManager.ExtendTTL(domain, qtype, rh.getConfig().Cache.TTL/2)
 		}
 	}
 
 	return nil
 }
 
-// determineUpstreamsForDomain 确定域名应该使用的上游DNS服务器（使用统一的定向域名匹配）
-func (rh *RefreshHandler) determineUpstreamsForDomain(domain string) []string {
-	// 使用统一的定向域名匹配逻辑
-	if dnsServer, hasDesignated := rh.matcherHandler.GetYAMLMatcher().GetDesignatedDomainOrDefault(domain); hasDesignated {
-		rh.logger.Debug("异步刷新：定向域名或默认DNS", map[string]interface{}{
-			"domain":     domain,
-			"dns_server": dnsServer,
+// upstreamsFor 由分流决策得出上游DNS服务器（未命中分流列表时回退全局上游）
+func (rh *RefreshHandler) upstreamsFor(domain string, d SplitDecision) []string {
+	if d.Matched {
+		rh.logger.Debug("异步刷新：命中分流列表", map[string]interface{}{
+			"domain":      domain,
+			"list":        d.ListName,
+			"dns_servers": d.DNS,
 		})
-		return []string{dnsServer}
-	}
-
-	// 检查是否为中国域名（如果启用了中国域名检查）
-	if rh.config.EnableChinaDomainCheck && rh.matcherHandler.GetChinaMatcher().IsChinaDomain(domain) {
-		if rh.config.ChinaDNS != "" {
-			rh.logger.Info("🇨🇳 [异步刷新-中国域名处理开始] ", map[string]interface{}{
-				"domain": domain,
-				"dns":    rh.config.ChinaDNS,
-			})
-			return []string{rh.config.ChinaDNS}
-		} else {
-			rh.logger.Warn("⚠️ [异步刷新-中国域名但未配置ChinaDNS] ", map[string]interface{}{
-				"domain": domain,
-			})
-		}
+		return d.DNS
 	}
 
 	// 如果没有匹配到任何配置，使用上游DNS作为备用
 	rh.logger.Debug("异步刷新：使用上游DNS作为备用", map[string]interface{}{
 		"domain":    domain,
-		"upstreams": rh.config.Upstream,
+		"upstreams": rh.getConfig().Upstream,
 	})
-	return rh.config.Upstream
+	return rh.getConfig().Upstream
 }
 
 // 原 CNAME 递归改写 / ensureMinimumTTL 抬高 TTL 等辅助函数已删除：

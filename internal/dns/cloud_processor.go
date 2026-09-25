@@ -2,6 +2,7 @@ package dns
 
 import (
 	"net/netip"
+	"sync"
 	"time"
 
 	"cosDnaPorxy/internal/config"
@@ -12,9 +13,24 @@ import (
 
 // CloudProcessor 处理云服务IP替换逻辑
 type CloudProcessor struct {
+	cfgMu      sync.RWMutex
 	config     *config.Config
 	Logger     *utils.EnhancedLogger
 	proxyQuery func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
+}
+
+// getConfig 获取当前配置（web保存后热切换）
+func (cp *CloudProcessor) getConfig() *config.Config {
+	cp.cfgMu.RLock()
+	defer cp.cfgMu.RUnlock()
+	return cp.config
+}
+
+// UpdateConfig 热更新配置引用
+func (cp *CloudProcessor) UpdateConfig(cfg *config.Config) {
+	cp.cfgMu.Lock()
+	cp.config = cfg
+	cp.cfgMu.Unlock()
 }
 
 // NewCloudProcessor 创建新的云服务处理器
@@ -48,7 +64,7 @@ func (cp *CloudProcessor) ReplaceCloudIPs(originalResp *dns.Msg, originalDetecti
 	var replaceIPs []netip.Addr
 
 	// 获取替换域名的A记录
-	if replaceRespA, err := cp.proxyQuery(replaceReqA, cp.config.Upstream); err == nil && replaceRespA != nil && replaceRespA.Rcode == dns.RcodeSuccess {
+	if replaceRespA, err := cp.proxyQuery(replaceReqA, cp.getConfig().Upstream); err == nil && replaceRespA != nil && replaceRespA.Rcode == dns.RcodeSuccess {
 		for _, rr := range replaceRespA.Answer {
 			if a, ok := rr.(*dns.A); ok {
 				if ip, err := netip.ParseAddr(a.A.String()); err == nil {
@@ -69,7 +85,7 @@ func (cp *CloudProcessor) ReplaceCloudIPs(originalResp *dns.Msg, originalDetecti
 	}
 
 	// 获取替换域名的AAAA记录
-	if replaceRespAAAA, err := cp.proxyQuery(replaceReqAAAA, cp.config.Upstream); err == nil && replaceRespAAAA != nil && replaceRespAAAA.Rcode == dns.RcodeSuccess {
+	if replaceRespAAAA, err := cp.proxyQuery(replaceReqAAAA, cp.getConfig().Upstream); err == nil && replaceRespAAAA != nil && replaceRespAAAA.Rcode == dns.RcodeSuccess {
 		for _, rr := range replaceRespAAAA.Answer {
 			if aaaa, ok := rr.(*dns.AAAA); ok {
 				if ip, err := netip.ParseAddr(aaaa.AAAA.String()); err == nil {
@@ -162,7 +178,7 @@ func (cp *CloudProcessor) ProcessCloudResponse(resp *dns.Msg, domain string) *dn
 	// 使用通用的CNAME处理方法，传入上游DNS服务器为默认上游
 	// 使用不带缓存功能的CNAME处理器，因为CloudProcessor不需要缓存中间结果
 	cnameProcessor := NewCNAMEProcessorWithoutCache(cp.config, cp.Logger, cp.proxyQuery)
-	return cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, cp.config.Upstream)
+	return cnameProcessor.ProcessDNSResponseWithCNAME(resp, domain, cp.getConfig().Upstream)
 }
 
 // ensureMinimumTTL 确保响应中的TTL不低于最小值

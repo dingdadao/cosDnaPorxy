@@ -48,12 +48,12 @@ build-all: build-linux build-windows build-darwin
 # 运行服务
 run:
 	@echo "启动 DNS 代理服务..."
-	$(GO) run main.go -c $(CONFIG_DIR)/config.yaml
+	$(GO) run main.go
 
 # 开发模式运行（带调试信息）
 dev:
 	@echo "开发模式启动..."
-	$(GO) run -race main.go -c $(CONFIG_DIR)/config.yaml
+	$(GO) run -race main.go
 
 # 测试
 test:

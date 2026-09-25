@@ -15,14 +15,19 @@ import (
 
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/dns"
+	"cosDnaPorxy/internal/querylog"
 	"cosDnaPorxy/internal/utils"
+	"cosDnaPorxy/internal/web"
 )
 
 // RecoveryManager panic恢复管理器
 type RecoveryManager struct {
 	config          *config.Config
 	logger          *utils.EnhancedLogger
+	store           *config.Store
+	webServer       *web.Server
 	dnsHandler      *dns.RefactoredHandler
+	queryLog        *querylog.Store // 进程级解析日志库（独立于 DNS 服务生命周期）
 	udpServer       *dns.Server
 	tcpServer       *dns.Server
 	ctx             context.Context
@@ -32,26 +37,29 @@ type RecoveryManager struct {
 	restartCount    int
 	panicCount      int
 	lastRestart     time.Time
-	restartChan     chan struct{}
+	restartChan     chan bool // true=管理端手动重启（无需退避等待），false=panic/健康检查触发的恢复重启
 	maxRestarts     int
 	restartInterval time.Duration
 	startTime       time.Time
+	startWebAddr    string // 进程启动时绑定的 Web 监听地址（用于判断是否需进程级重启）
 }
 
 // NewRecoveryManager 创建新的panic恢复管理器
-func NewRecoveryManager(cfg *config.Config, logger *utils.EnhancedLogger) *RecoveryManager {
+func NewRecoveryManager(cfg *config.Config, logger *utils.EnhancedLogger, store *config.Store) *RecoveryManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &RecoveryManager{
 		config:          cfg,
 		logger:          logger,
+		store:           store,
 		ctx:             ctx,
 		cancel:          cancel,
-		restartChan:     make(chan struct{}, 1),
+		restartChan:     make(chan bool, 1),
 		maxRestarts:     100,             // 最大重启次数
 		restartInterval: 5 * time.Second, // 初始重启间隔
 		running:         false,
 		startTime:       time.Now(), // 初始化startTime
+		startWebAddr:    cfg.WebAddr,
 	}
 }
 
@@ -64,15 +72,138 @@ func (rm *RecoveryManager) Start() error {
 	// 设置信号处理
 	rm.setupSignalHandler()
 
+	// 打开进程级解析日志库（失败仅告警，不影响 DNS 解析）
+	rm.startQueryLog()
+
 	// 启动DNS服务
 	if err := rm.startDNSService(); err != nil {
 		return fmt.Errorf("启动DNS服务失败: %w", err)
 	}
 
+	// 启动Web管理端（配置保存在SQLite，管理端独立于DNS服务生命周期）
+	rm.startWebServer()
+
 	// 主循环
 	rm.mainLoop()
 
 	return nil
+}
+
+// GetDNSHandler 获取当前DNS处理器（web层配置热更新/规则重载使用）
+func (rm *RecoveryManager) GetDNSHandler() *dns.RefactoredHandler {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.dnsHandler
+}
+
+// RequestRestart 管理端触发：从配置库重载配置并重启 DNS 服务
+// 返回 web_addr_changed=true 表示 Web 监听地址自进程启动后已变更，需进程级重启（systemctl restart）才能生效
+func (rm *RecoveryManager) RequestRestart() (bool, error) {
+	if rm.store == nil {
+		return false, fmt.Errorf("配置库不可用")
+	}
+	if rm.GetDNSHandler() == nil {
+		return false, fmt.Errorf("DNS服务未在运行")
+	}
+
+	cfg, err := rm.store.LoadConfig()
+	if err != nil {
+		return false, fmt.Errorf("加载配置失败: %w", err)
+	}
+	if err := config.ValidateConfig(cfg); err != nil {
+		return false, fmt.Errorf("配置无效: %w", err)
+	}
+
+	rm.mu.Lock()
+	rm.config = cfg // 重启时 startDNSService 以该配置重建处理器
+	webAddrChanged := cfg.WebAddr != rm.startWebAddr
+	rm.mu.Unlock()
+
+	rm.logger.Warn("🔄 [管理端请求重启服务] ", map[string]interface{}{
+		"rule":             "WEB_RESTART_REQUESTED",
+		"web_addr_changed": webAddrChanged,
+	})
+
+	select {
+	case rm.restartChan <- true:
+	default:
+		// 已有重启在排队：其执行时读取的是最新配置，无需重复入队
+	}
+	return webAddrChanged, nil
+}
+
+// startQueryLog 打开进程级解析日志库（独立 SQLite，与配置库分离）
+func (rm *RecoveryManager) startQueryLog() {
+	opt := rm.config.QueryLog
+	store, err := querylog.Open(config.DefaultQueryLogPath, rm.logger, querylog.Options{
+		Enabled:   opt.Enabled,
+		Retention: opt.Retention,
+		MaxRows:   opt.MaxRows,
+	})
+	if err != nil {
+		rm.logger.Warn("⚠️ [解析日志库打开失败，将不记录解析日志] ", map[string]interface{}{
+			"rule":  "QUERY_LOG_OPEN_FAILED",
+			"path":  config.DefaultQueryLogPath,
+			"error": err.Error(),
+		})
+		return
+	}
+	rm.queryLog = store
+	rm.logger.Info("📝 [解析日志库已就绪] ", map[string]interface{}{
+		"rule":      "QUERY_LOG_READY",
+		"path":      config.DefaultQueryLogPath,
+		"enabled":   opt.Enabled,
+		"retention": opt.Retention.String(),
+		"max_rows":  opt.MaxRows,
+	})
+}
+
+// startWebServer 启动Web管理端（失败不阻塞DNS服务）
+func (rm *RecoveryManager) startWebServer() {
+	if rm.store == nil {
+		return
+	}
+
+	rm.webServer = web.NewServer(rm.store, rm.logger, rm.GetDNSHandler, rm.RequestRestart, rm.queryLog)
+	addr := rm.config.WebAddr
+	if addr == "" {
+		addr = config.DefaultWebAddr
+	}
+	if err := rm.webServer.Start(addr); err != nil {
+		rm.logger.Warn("⚠️ [Web管理端启动失败] ", map[string]interface{}{
+			"rule":  "WEB_SERVER_START_FAILED",
+			"addr":  addr,
+			"error": err.Error(),
+		})
+	}
+}
+
+// reloadConfig 从配置库重新加载配置并热更新（SIGHUP触发）
+func (rm *RecoveryManager) reloadConfig() {
+	if rm.store == nil {
+		return
+	}
+
+	cfg, err := rm.store.LoadConfig()
+	if err != nil {
+		rm.logger.Error("❌ [配置重载失败] ", map[string]interface{}{
+			"rule":  "CONFIG_RELOAD_FAILED",
+			"error": err.Error(),
+		})
+		return
+	}
+
+	handler := rm.GetDNSHandler()
+	if handler == nil {
+		rm.logger.Warn("⚠️ [配置重载跳过] DNS处理器不存在")
+		return
+	}
+
+	needsRestart := handler.ApplyConfig(cfg)
+	rm.logger.Info("🔄 [配置已重载] ", map[string]interface{}{
+		"rule":             "CONFIG_RELOADED",
+		"restart_required": needsRestart,
+	})
 }
 
 // mainLoop 主循环
@@ -89,8 +220,8 @@ func (rm *RecoveryManager) mainLoop() {
 			})
 			return
 
-		case <-rm.restartChan:
-			rm.handleRestart()
+		case manual := <-rm.restartChan:
+			rm.handleRestart(manual)
 
 		case <-time.After(30 * time.Second):
 			// 定期健康检查
@@ -120,11 +251,23 @@ func (rm *RecoveryManager) startDNSService() error {
 	})
 
 	// 创建DNS处理器
-	handler, err := dns.NewRefactoredHandler(rm.config, rm.logger)
+	handler, err := dns.NewRefactoredHandler(rm.config, rm.logger, rm.queryLog)
 	if err != nil {
 		return fmt.Errorf("创建DNS处理器失败: %w", err)
 	}
 	rm.dnsHandler = handler
+
+	// 从配置库加载本地域名篡改规则
+	if rm.store != nil {
+		if list, err := rm.store.ListOverrides(); err != nil {
+			rm.logger.Warn("⚠️ [域名篡改规则加载失败] ", map[string]interface{}{
+				"rule":  "OVERRIDE_LOAD_FAILED",
+				"error": err.Error(),
+			})
+		} else {
+			handler.LoadOverrides(list)
+		}
+	}
 
 	// 创建UDP DNS服务器
 	udpServer, err := dns.NewUDPServer(rm.config, handler)
@@ -191,7 +334,7 @@ func (rm *RecoveryManager) runDNSServer(server *dns.Server, serverType string) {
 			rm.handlePanic(r)
 			// 触发重启
 			select {
-			case rm.restartChan <- struct{}{}:
+			case rm.restartChan <- false:
 			default:
 			}
 		}
@@ -216,7 +359,7 @@ func (rm *RecoveryManager) runDNSServer(server *dns.Server, serverType string) {
 
 		// 触发重启
 		select {
-		case rm.restartChan <- struct{}{}:
+		case rm.restartChan <- false:
 		default:
 		}
 	}
@@ -290,18 +433,19 @@ func (rm *RecoveryManager) handlePanic(r interface{}) {
 
 	// 触发重启
 	select {
-	case rm.restartChan <- struct{}{}:
+	case rm.restartChan <- false:
 	default:
 	}
 }
 
-// handleRestart 处理重启
-func (rm *RecoveryManager) handleRestart() {
+// handleRestart 处理重启（manual=true 为管理端主动触发，跳过恢复用的退避等待以缩短中断）
+func (rm *RecoveryManager) handleRestart(manual bool) {
 	rm.restartCount++
 	rm.lastRestart = time.Now()
 
 	rm.logger.Warn("🔄 [开始服务重启] ", map[string]interface{}{
 		"rule":          "SERVICE_RESTART",
+		"manual":        manual,
 		"restart_count": rm.restartCount,
 		"panic_count":   rm.panicCount,
 	})
@@ -324,10 +468,14 @@ func (rm *RecoveryManager) handleRestart() {
 	time.Sleep(500 * time.Millisecond)
 
 	// 等待一段时间后重启
+	wait := rm.restartInterval
+	if manual {
+		wait = 0 // 手动重启不做退避等待，仅保留上方端口释放的缓冲
+	}
 	rm.logger.Debug("⏱️ 等待重启间隔", map[string]interface{}{
-		"interval": rm.restartInterval.String(),
+		"interval": wait.String(),
 	})
-	time.Sleep(rm.restartInterval)
+	time.Sleep(wait)
 
 	// 重新启动服务
 	if err := rm.startDNSService(); err != nil {
@@ -344,7 +492,7 @@ func (rm *RecoveryManager) handleRestart() {
 
 		time.Sleep(rm.restartInterval)
 		select {
-		case rm.restartChan <- struct{}{}:
+		case rm.restartChan <- manual:
 		default:
 		}
 		return
@@ -373,7 +521,7 @@ func (rm *RecoveryManager) healthCheck() {
 
 		// 触发重启
 		select {
-		case rm.restartChan <- struct{}{}:
+		case rm.restartChan <- false:
 		default:
 		}
 		return
@@ -462,7 +610,7 @@ func (rm *RecoveryManager) handleSignal(sig os.Signal) {
 			"signal": "SIGHUP",
 			"action": "reload_config",
 		})
-		// 这里可以实现配置重新加载
+		rm.reloadConfig()
 
 	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
 		rm.logger.Info("📪 [接收到退出信号] ", map[string]interface{}{
@@ -492,8 +640,27 @@ func (rm *RecoveryManager) gracefulShutdown() {
 		defer close(done)
 		// 停止服务
 		rm.stopDNSService()
+		// 关闭Web管理端
+		if rm.webServer != nil {
+			webCtx, webCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer webCancel()
+			if err := rm.webServer.Shutdown(webCtx); err != nil {
+				rm.logger.Warn("⚠️ [Web管理端关闭警告] ", map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+		}
 		// 额外等待一段时间确保端口完全释放
 		time.Sleep(500 * time.Millisecond)
+		// 关闭解析日志库（落库剩余日志）
+		if rm.queryLog != nil {
+			if err := rm.queryLog.Close(); err != nil {
+				rm.logger.Warn("⚠️ [解析日志库关闭警告] ", map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+			rm.queryLog = nil
+		}
 		// 取消上下文
 		rm.cancel()
 	}()

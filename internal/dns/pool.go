@@ -22,7 +22,7 @@ type DoTConnPool struct {
 	conns    map[string][]*DoTConn
 	maxConns int
 	timeout  time.Duration
-	
+
 	// 监控指标
 	metrics struct {
 		TotalConnsCreated int64
@@ -48,10 +48,10 @@ func NewDoTConnPool() *DoTConnPool {
 		maxConns: 20,               // 增加每个服务器的最大连接数到20
 		timeout:  90 * time.Second, // 增加连接超时时间到90秒
 	}
-	
+
 	// 启动健康检查协程
 	go pool.healthCheckRoutine()
-	
+
 	return pool
 }
 
@@ -62,29 +62,31 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 
 	// 检查现有连接
 	if connList, ok := p.conns[server]; ok {
-		// 遍历连接列表，寻找可用连接
-		for i, conn := range connList {
-			if !conn.inUse {
-				// 检查连接是否还有效
-				if time.Since(conn.lastUsed) < p.timeout {
-					conn.inUse = true
-					conn.lastUsed = time.Now()
-					p.metrics.TotalConnsReused++
-					p.metrics.ActiveConns++
-					log.Printf("[DoT连接池] 复用现有连接: %s", server)
-					return conn, nil
-				} else {
-					// 连接过期，关闭并移除
-					log.Printf("[DoT连接池] 连接已过期，关闭: %s", server)
-					conn.Close()
-					p.metrics.TotalConnsClosed++
-					p.metrics.ActiveConns--
-					// 从列表中移除过期连接
-					connList = append(connList[:i], connList[i+1:]...)
-					p.conns[server] = connList
-				}
+		// 先找可复用连接（过期连接放到循环外统一关闭清理，
+		// 否则边 range 边删元素会让后续迭代下标越界 panic）
+		for _, conn := range connList {
+			if !conn.inUse && time.Since(conn.lastUsed) < p.timeout {
+				conn.inUse = true
+				conn.lastUsed = time.Now()
+				p.metrics.TotalConnsReused++
+				p.metrics.ActiveConns++
+				log.Printf("[DoT连接池] 复用现有连接: %s", server)
+				return conn, nil
 			}
 		}
+		// 关闭并移除过期的空闲连接
+		alive := connList[:0]
+		for _, conn := range connList {
+			if !conn.inUse && time.Since(conn.lastUsed) >= p.timeout {
+				log.Printf("[DoT连接池] 连接已过期，关闭: %s", server)
+				conn.Close()
+				p.metrics.TotalConnsClosed++
+				p.metrics.ActiveConns--
+				continue
+			}
+			alive = append(alive, conn)
+		}
+		p.conns[server] = alive
 	}
 
 	// 创建新连接
@@ -273,12 +275,12 @@ func (p *DoTConnPool) healthCheckRoutine() {
 						// 尝试发送一个简单的DNS查询来检查连接是否健康
 						_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 						defer cancel()
-						
+
 						// 创建一个简单的DNS查询
 						req := new(dns.Msg)
 						req.SetQuestion("healthcheck.local.", dns.TypeA)
 						req.RecursionDesired = true
-						
+
 						// 使用连接发送查询
 						dnsConn := &dns.Conn{Conn: conn.tlsConn}
 						err := dnsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -292,7 +294,7 @@ func (p *DoTConnPool) healthCheckRoutine() {
 							connList = append(connList[:i], connList[i+1:]...)
 							continue
 						}
-						
+
 						err = dnsConn.WriteMsg(req)
 						if err != nil {
 							log.Printf("[DoT连接池] 健康检查：写入失败: %v, 关闭连接: %s", err, server)
@@ -304,7 +306,7 @@ func (p *DoTConnPool) healthCheckRoutine() {
 							connList = append(connList[:i], connList[i+1:]...)
 							continue
 						}
-						
+
 						// 不等待响应，只是检查写入是否成功
 					}
 				}
@@ -323,22 +325,22 @@ func (p *DoTConnPool) healthCheckRoutine() {
 func (p *DoTConnPool) GetMetrics() map[string]interface{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// 计算当前连接数
 	totalConns := 0
 	for _, connList := range p.conns {
 		totalConns += len(connList)
 	}
-	
+
 	return map[string]interface{}{
-		"total_connections":    totalConns,
-		"active_connections":   p.metrics.ActiveConns,
-		"total_created":        p.metrics.TotalConnsCreated,
-		"total_closed":         p.metrics.TotalConnsClosed,
-		"total_reused":         p.metrics.TotalConnsReused,
-		"max_connections":      p.maxConns,
-		"connection_timeout":   p.timeout.String(),
-		"servers_count":        len(p.conns),
+		"total_connections":  totalConns,
+		"active_connections": p.metrics.ActiveConns,
+		"total_created":      p.metrics.TotalConnsCreated,
+		"total_closed":       p.metrics.TotalConnsClosed,
+		"total_reused":       p.metrics.TotalConnsReused,
+		"max_connections":    p.maxConns,
+		"connection_timeout": p.timeout.String(),
+		"servers_count":      len(p.conns),
 	}
 }
 
@@ -350,7 +352,7 @@ type UDPConnPool struct {
 	clients  map[string][]*UDPClientInfo
 	maxConns int
 	timeout  time.Duration
-	
+
 	// 监控指标
 	metrics struct {
 		TotalClientsCreated int64
@@ -375,10 +377,10 @@ func NewUDPConnPool() *UDPConnPool {
 		maxConns: 50,               // 限制最大连接数
 		timeout:  60 * time.Second, // 连接超时时间
 	}
-	
+
 	// 启动健康检查协程
 	go pool.healthCheckRoutine()
-	
+
 	return pool
 }
 
@@ -389,27 +391,30 @@ func (p *UDPConnPool) GetClient(addr string, timeout time.Duration) *dns.Client 
 
 	// 检查现有客户端
 	if clientList, ok := p.clients[addr]; ok {
-		// 遍历客户端列表，寻找可用客户端
-		for i, clientInfo := range clientList {
-			if !clientInfo.inUse {
-				// 检查连接是否还有效
-				if time.Since(clientInfo.lastUsed) < p.timeout {
-					clientInfo.inUse = true
-					clientInfo.lastUsed = time.Now()
-					p.metrics.TotalClientsReused++
-					p.metrics.ActiveClients++
-					return clientInfo.client
-				} else {
-					// 连接过期，删除
-					clientList = append(clientList[:i], clientList[i+1:]...)
-					p.clients[addr] = clientList
-					p.metrics.TotalClientsClosed++
-					if p.metrics.ActiveClients > 0 {
-						p.metrics.ActiveClients--
-					}
-				}
+		// 先找可复用客户端（过期清理放到循环外一次性完成，
+		// 否则边 range 边删元素会让后续迭代下标越界 panic）
+		for _, clientInfo := range clientList {
+			if !clientInfo.inUse && time.Since(clientInfo.lastUsed) < p.timeout {
+				clientInfo.inUse = true
+				clientInfo.lastUsed = time.Now()
+				p.metrics.TotalClientsReused++
+				p.metrics.ActiveClients++
+				return clientInfo.client
 			}
 		}
+		// 清理过期的空闲客户端
+		alive := clientList[:0]
+		for _, clientInfo := range clientList {
+			if !clientInfo.inUse && time.Since(clientInfo.lastUsed) >= p.timeout {
+				p.metrics.TotalClientsClosed++
+				if p.metrics.ActiveClients > 0 {
+					p.metrics.ActiveClients--
+				}
+				continue
+			}
+			alive = append(alive, clientInfo)
+		}
+		p.clients[addr] = alive
 	}
 
 	// 创建新客户端
@@ -560,22 +565,22 @@ func (p *UDPConnPool) healthCheckRoutine() {
 func (p *UDPConnPool) GetMetrics() map[string]interface{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// 计算当前客户端数
 	totalClients := 0
 	for _, clientList := range p.clients {
 		totalClients += len(clientList)
 	}
-	
+
 	return map[string]interface{}{
-		"total_clients":     totalClients,
-		"active_clients":    p.metrics.ActiveClients,
-		"total_created":     p.metrics.TotalClientsCreated,
-		"total_closed":      p.metrics.TotalClientsClosed,
-		"total_reused":      p.metrics.TotalClientsReused,
-		"max_clients":       p.maxConns,
-		"client_timeout":    p.timeout.String(),
-		"servers_count":     len(p.clients),
+		"total_clients":  totalClients,
+		"active_clients": p.metrics.ActiveClients,
+		"total_created":  p.metrics.TotalClientsCreated,
+		"total_closed":   p.metrics.TotalClientsClosed,
+		"total_reused":   p.metrics.TotalClientsReused,
+		"max_clients":    p.maxConns,
+		"client_timeout": p.timeout.String(),
+		"servers_count":  len(p.clients),
 	}
 }
 
@@ -587,7 +592,7 @@ type TCPConnPool struct {
 	clients  map[string][]*TCPClientInfo
 	maxConns int
 	timeout  time.Duration
-	
+
 	// 监控指标
 	metrics struct {
 		TotalClientsCreated int64
@@ -604,10 +609,10 @@ func NewTCPConnPool() *TCPConnPool {
 		maxConns: 50,               // 限制最大连接数
 		timeout:  60 * time.Second, // 连接超时时间
 	}
-	
+
 	// 启动健康检查协程
 	go pool.healthCheckRoutine()
-	
+
 	return pool
 }
 
@@ -626,27 +631,30 @@ func (p *TCPConnPool) GetClient(addr string, timeout time.Duration) *dns.Client 
 
 	// 检查现有客户端
 	if clientList, ok := p.clients[addr]; ok {
-		// 遍历客户端列表，寻找可用客户端
-		for i, clientInfo := range clientList {
-			if !clientInfo.inUse {
-				// 检查连接是否还有效
-				if time.Since(clientInfo.lastUsed) < p.timeout {
-					clientInfo.inUse = true
-					clientInfo.lastUsed = time.Now()
-					p.metrics.TotalClientsReused++
-					p.metrics.ActiveClients++
-					return clientInfo.client
-				} else {
-					// 连接过期，删除
-					clientList = append(clientList[:i], clientList[i+1:]...)
-					p.clients[addr] = clientList
-					p.metrics.TotalClientsClosed++
-					if p.metrics.ActiveClients > 0 {
-						p.metrics.ActiveClients--
-					}
-				}
+		// 先找可复用客户端（过期清理放到循环外一次性完成，
+		// 否则边 range 边删元素会让后续迭代下标越界 panic）
+		for _, clientInfo := range clientList {
+			if !clientInfo.inUse && time.Since(clientInfo.lastUsed) < p.timeout {
+				clientInfo.inUse = true
+				clientInfo.lastUsed = time.Now()
+				p.metrics.TotalClientsReused++
+				p.metrics.ActiveClients++
+				return clientInfo.client
 			}
 		}
+		// 清理过期的空闲客户端
+		alive := clientList[:0]
+		for _, clientInfo := range clientList {
+			if !clientInfo.inUse && time.Since(clientInfo.lastUsed) >= p.timeout {
+				p.metrics.TotalClientsClosed++
+				if p.metrics.ActiveClients > 0 {
+					p.metrics.ActiveClients--
+				}
+				continue
+			}
+			alive = append(alive, clientInfo)
+		}
+		p.clients[addr] = alive
 	}
 
 	// 创建新客户端
@@ -797,22 +805,22 @@ func (p *TCPConnPool) healthCheckRoutine() {
 func (p *TCPConnPool) GetMetrics() map[string]interface{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// 计算当前客户端数
 	totalClients := 0
 	for _, clientList := range p.clients {
 		totalClients += len(clientList)
 	}
-	
+
 	return map[string]interface{}{
-		"total_clients":     totalClients,
-		"active_clients":    p.metrics.ActiveClients,
-		"total_created":     p.metrics.TotalClientsCreated,
-		"total_closed":      p.metrics.TotalClientsClosed,
-		"total_reused":      p.metrics.TotalClientsReused,
-		"max_clients":       p.maxConns,
-		"client_timeout":    p.timeout.String(),
-		"servers_count":     len(p.clients),
+		"total_clients":  totalClients,
+		"active_clients": p.metrics.ActiveClients,
+		"total_created":  p.metrics.TotalClientsCreated,
+		"total_closed":   p.metrics.TotalClientsClosed,
+		"total_reused":   p.metrics.TotalClientsReused,
+		"max_clients":    p.maxConns,
+		"client_timeout": p.timeout.String(),
+		"servers_count":  len(p.clients),
 	}
 }
 
@@ -820,17 +828,17 @@ func (p *TCPConnPool) GetMetrics() map[string]interface{} {
 
 // DoHConnPool DoH连接池
 type DoHConnPool struct {
-	mu         sync.RWMutex
-	clients    map[string][]*http.Client
-	maxClients int
-	timeout    time.Duration
+	mu               sync.RWMutex
+	clients          map[string][]*http.Client
+	maxClients       int
+	timeout          time.Duration
 	clientsPerServer int
-	
+
 	// 监控指标
 	metrics struct {
 		TotalClientsCreated int64
 		TotalClientsClosed  int64
-		TotalClientsUsed   int64
+		TotalClientsUsed    int64
 		ActiveClients       int64
 	}
 }
@@ -838,15 +846,15 @@ type DoHConnPool struct {
 // NewDoHConnPool 创建新的DoH连接池
 func NewDoHConnPool() *DoHConnPool {
 	pool := &DoHConnPool{
-		clients:    make(map[string][]*http.Client),
-		maxClients: 50,               // 总客户端数上限
-		timeout:    90 * time.Second, // 增加超时时间到90秒
-		clientsPerServer: 5,          // 每个服务器最多5个客户端
+		clients:          make(map[string][]*http.Client),
+		maxClients:       50,               // 总客户端数上限
+		timeout:          90 * time.Second, // 增加超时时间到90秒
+		clientsPerServer: 5,                // 每个服务器最多5个客户端
 	}
-	
+
 	// 启动健康检查协程
 	go pool.healthCheckRoutine()
-	
+
 	return pool
 }
 
@@ -985,22 +993,22 @@ func (p *DoHConnPool) healthCheckRoutine() {
 func (p *DoHConnPool) GetMetrics() map[string]interface{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// 计算当前客户端数
 	totalClients := 0
 	for _, clientList := range p.clients {
 		totalClients += len(clientList)
 	}
-	
+
 	return map[string]interface{}{
-		"total_clients":     totalClients,
-		"active_clients":    p.metrics.ActiveClients,
-		"total_created":     p.metrics.TotalClientsCreated,
-		"total_closed":      p.metrics.TotalClientsClosed,
-		"total_used":        p.metrics.TotalClientsUsed,
-		"max_clients":       p.maxClients,
-		"client_timeout":    p.timeout.String(),
+		"total_clients":      totalClients,
+		"active_clients":     p.metrics.ActiveClients,
+		"total_created":      p.metrics.TotalClientsCreated,
+		"total_closed":       p.metrics.TotalClientsClosed,
+		"total_used":         p.metrics.TotalClientsUsed,
+		"max_clients":        p.maxClients,
+		"client_timeout":     p.timeout.String(),
 		"clients_per_server": p.clientsPerServer,
-		"servers_count":     len(p.clients),
+		"servers_count":      len(p.clients),
 	}
 }

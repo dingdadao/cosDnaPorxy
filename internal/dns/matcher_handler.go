@@ -1,19 +1,22 @@
 package dns
 
 import (
+	"os"
+	"sync"
+
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
-	"os"
 
 	"github.com/miekg/dns"
 )
 
 // MatcherHandler 处理域名匹配相关功能
 type MatcherHandler struct {
+	// mu 保护 config 与 matchers：配置热更新（含顺序变更重建）与请求路径并发访问
+	mu            sync.RWMutex
 	config        *config.Config
 	logger        *utils.EnhancedLogger
-	yamlMatcher   *YAMLMatcher
-	chinaMatcher  *ChinaDomainMatcher
+	matchers      []*YAMLMatcher // 与 config.SplitLists 一一对应
 	cloudDetector *CloudDetector
 	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error) // 代理查询函数
 }
@@ -26,11 +29,8 @@ func NewMatcherHandler(config *config.Config, logger *utils.EnhancedLogger, hand
 		proxyQuery: handler.proxyQuery, // 从handler获取proxyQuery函数
 	}
 
-	// 初始化YAML匹配器
-	mh.yamlMatcher = NewYAMLMatcher(logger)
-
-	// 初始化中国域名匹配器
-	mh.chinaMatcher = NewChinaDomainMatcher(logger)
+	// 为每个分流列表初始化一个匹配器
+	mh.matchers = mh.buildMatchers(config)
 
 	// 从handler获取cloudDetector实例
 	if handler != nil && handler.cloudDetector != nil {
@@ -40,54 +40,195 @@ func NewMatcherHandler(config *config.Config, logger *utils.EnhancedLogger, hand
 	return mh
 }
 
-// 初始化配置 - 这个方法应该在handler初始化后调用
-func (mh *MatcherHandler) InitializeConfig() error {
-	// 检查YAML配置文件是否存在，如果不存在则跳过加载
-	if mh.config.DesignatedDomain != "" {
-		if _, err := os.Stat(mh.config.DesignatedDomain); err == nil {
-			// 文件存在，加载配置
-			if err := mh.yamlMatcher.LoadYAMLConfig(mh.config.DesignatedDomain); err != nil {
-				mh.logger.Error("❌ 加载YAML配置失败", map[string]interface{}{
-					"file":  mh.config.DesignatedDomain,
-					"error": err.Error(),
-				})
-				return err
-			}
-			mh.logger.Info("✅ YAML配置加载成功", map[string]interface{}{
-				"file": mh.config.DesignatedDomain,
+// buildMatchers 按给定配置重建分流列表匹配器（DNS 来自列表配置，规则待文件加载）
+func (mh *MatcherHandler) buildMatchers(cfg *config.Config) []*YAMLMatcher {
+	matchers := make([]*YAMLMatcher, len(cfg.SplitLists))
+	for i, l := range cfg.SplitLists {
+		ym := NewYAMLMatcher(mh.logger)
+		ym.SetDefaultDNS(l.DNS)
+		matchers[i] = ym
+	}
+	return matchers
+}
+
+// rebuildMatchersWithRules 重建匹配器并从本地文件重载规则
+// 顺序变更后必须重建，否则会出现「A 列表的规则配 B 列表的 DNS」错配
+func (mh *MatcherHandler) rebuildMatchersWithRules(cfg *config.Config) []*YAMLMatcher {
+	matchers := mh.buildMatchers(cfg)
+	for i, l := range cfg.SplitLists {
+		if !l.Enabled || l.DomainFile == "" {
+			continue
+		}
+		if _, err := os.Stat(l.DomainFile); err != nil {
+			mh.logger.Warn("⚠️ [顺序变更后重载分流列表跳过：文件不存在] ", map[string]interface{}{
+				"rule": "SPLIT_LIST_RELOAD_MISSING",
+				"list": l.Name,
+				"file": l.DomainFile,
 			})
-		} else {
-			mh.logger.Info("📋 YAML配置文件不存在，等待定时任务下载", map[string]interface{}{
-				"file": mh.config.DesignatedDomain,
+			continue
+		}
+		if err := matchers[i].LoadYAMLConfig(l.DomainFile); err != nil {
+			mh.logger.Error("❌ [顺序变更后重载分流列表失败] ", map[string]interface{}{
+				"rule":  "SPLIT_LIST_RELOAD_FAILED",
+				"list":  l.Name,
+				"file":  l.DomainFile,
+				"error": err.Error(),
 			})
 		}
 	}
+	return matchers
+}
 
-	// 检查中国域名配置文件是否存在，如果不存在则跳过加载
-	if mh.config.EnableChinaDomainCheck && mh.config.ChinaDomainFile != "" {
-		if _, err := os.Stat(mh.config.ChinaDomainFile); err == nil {
-			// 文件存在，加载配置
-			if err := mh.chinaMatcher.LoadChinaDomains(mh.config.ChinaDomainFile); err != nil {
-				mh.logger.Error("❌ 加载中国域名配置失败", map[string]interface{}{
-					"file":  mh.config.ChinaDomainFile,
-					"error": err.Error(),
-				})
-				return err
-			}
-			mh.logger.Info("✅ 中国域名配置加载成功", map[string]interface{}{
-				"file": mh.config.ChinaDomainFile,
-			})
-		} else {
-			mh.logger.Info("📋 中国域名配置文件不存在，等待定时任务下载", map[string]interface{}{
-				"file": mh.config.ChinaDomainFile,
-			})
+// sameSplitListOrder 判断分流列表的顺序与身份（名称/本地文件/远程URL）是否一致
+func sameSplitListOrder(old, cur []config.SplitList) bool {
+	if len(old) != len(cur) {
+		return false
+	}
+	for i := range old {
+		if old[i].Name != cur[i].Name || old[i].DomainFile != cur[i].DomainFile ||
+			old[i].DomainURL != cur[i].DomainURL {
+			return false
 		}
-	} else if !mh.config.EnableChinaDomainCheck {
-		mh.logger.Info("⏭️ 中国域名检查已禁用，跳过加载", map[string]interface{}{
-			"enabled": mh.config.EnableChinaDomainCheck,
+	}
+	return true
+}
+
+// UpdateConfig 应用最新配置：DNS 变更原地热更新；顺序/身份变更时重建匹配器并重载规则
+// （列表增删/文件路径/刷新间隔/enabled 变更仍需重启，见 ApplyConfig 的 restart 判定）
+func (mh *MatcherHandler) UpdateConfig(cfg *config.Config) {
+	mh.mu.Lock()
+	defer mh.mu.Unlock()
+
+	if !sameSplitListOrder(mh.config.SplitLists, cfg.SplitLists) {
+		mh.config = cfg
+		mh.matchers = mh.rebuildMatchersWithRules(cfg)
+		mh.logger.Info("🔀 [分流列表顺序变更，已重建匹配器] ", map[string]interface{}{
+			"rule":  "SPLIT_LIST_REORDERED",
+			"lists": len(cfg.SplitLists),
+		})
+		return
+	}
+
+	mh.config = cfg
+	for i, l := range cfg.SplitLists {
+		if i < len(mh.matchers) && mh.matchers[i] != nil {
+			mh.matchers[i].SetDefaultDNS(l.DNS)
+		}
+	}
+}
+
+// MatcherFor 返回第 i 条分流列表的匹配器
+func (mh *MatcherHandler) MatcherFor(i int) *YAMLMatcher {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+	if i < 0 || i >= len(mh.matchers) {
+		return nil
+	}
+	return mh.matchers[i]
+}
+
+// SplitDecision 分流匹配决策：命中第一条启用中的列表后，其 DNS、解析模式、云检测开关、ECS 策略与 A/AAAA 偏好一并生效
+type SplitDecision struct {
+	Matched          bool
+	DNS              []string
+	DNSMode          string
+	ListName         string
+	EnableCloudCheck bool
+	ECS              config.ECSPolicy
+	IPPrefer         string // 列表级 A/AAAA 偏好档位（空值=由调用方回退全局默认）
+}
+
+// MatchDomain 按配置顺序匹配分流列表，命中第一条启用中的列表即返回其决策（未命中时 Matched=false）
+// 取反列表（Invert）在域名「不在清单内」时命中；清单为空或未配置 DNS 时跳过，避免无差别命中
+func (mh *MatcherHandler) MatchDomain(domain string) SplitDecision {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	for i, l := range mh.config.SplitLists {
+		if !l.Enabled || i >= len(mh.matchers) {
+			continue
+		}
+		m := mh.matchers[i]
+		if m == nil {
+			continue
+		}
+
+		if l.Invert {
+			// 取反匹配依赖已加载的清单与非空 DNS，否则会退化成「命中一切」
+			if m.RuleCount() == 0 || len(l.DNS) == 0 {
+				continue
+			}
+			if _, hit := m.MatchDomain(domain); !hit {
+				return SplitDecision{
+					Matched:          true,
+					DNS:              l.DNS,
+					DNSMode:          normDNSMode(l.DNSMode),
+					ListName:         l.Name,
+					EnableCloudCheck: l.EnableCloudCheck,
+					ECS:              l.ECS,
+					IPPrefer:         l.IPPrefer,
+				}
+			}
+			continue
+		}
+
+		if dns, hit := m.MatchDomain(domain); hit {
+			return SplitDecision{
+				Matched:          true,
+				DNS:              dns,
+				DNSMode:          normDNSMode(l.DNSMode),
+				ListName:         l.Name,
+				EnableCloudCheck: l.EnableCloudCheck,
+				ECS:              l.ECS,
+				IPPrefer:         l.IPPrefer,
+			}
+		}
+	}
+	return SplitDecision{}
+}
+
+// normDNSMode 空值按默认的并发竞速（race）处理，与解析路径的判定保持一致
+func normDNSMode(mode string) string {
+	if mode == "" {
+		return config.DNSModeRace
+	}
+	return mode
+}
+
+// InitializeConfig 加载各分流列表的域名规则文件（不存在则跳过，等待定时任务下载）
+func (mh *MatcherHandler) InitializeConfig() error {
+	for i, l := range mh.config.SplitLists {
+		if !l.Enabled {
+			mh.logger.Info("⏭️ 分流列表已禁用，跳过加载", map[string]interface{}{
+				"list": l.Name,
+			})
+			continue
+		}
+		if l.DomainFile == "" {
+			continue
+		}
+
+		ym := mh.MatcherFor(i)
+		if _, err := os.Stat(l.DomainFile); err != nil {
+			mh.logger.Info("📋 分流列表文件不存在，等待定时任务下载", map[string]interface{}{
+				"list": l.Name,
+				"file": l.DomainFile,
+			})
+			continue
+		}
+		if err := ym.LoadYAMLConfig(l.DomainFile); err != nil {
+			mh.logger.Error("❌ 分流列表加载失败", map[string]interface{}{
+				"list":  l.Name,
+				"file":  l.DomainFile,
+				"error": err.Error(),
+			})
+			return err
+		}
+		mh.logger.Info("✅ 分流列表加载成功", map[string]interface{}{
+			"list": l.Name,
+			"file": l.DomainFile,
 		})
 	}
-
 	return nil
 }
 
@@ -129,14 +270,4 @@ func (mh *MatcherHandler) HandleChinaDomain(domain string, qtype uint16, upstrea
 	}
 
 	return resp, nil
-}
-
-// GetYAMLMatcher 返回YAML匹配器
-func (mh *MatcherHandler) GetYAMLMatcher() *YAMLMatcher {
-	return mh.yamlMatcher
-}
-
-// GetChinaMatcher 返回中国域名匹配器
-func (mh *MatcherHandler) GetChinaMatcher() *ChinaDomainMatcher {
-	return mh.chinaMatcher
 }

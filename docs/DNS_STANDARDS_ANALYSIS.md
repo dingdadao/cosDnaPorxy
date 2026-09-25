@@ -11,7 +11,8 @@
 
 ```
 main.go
- ├─ config.LoadAndValidateConfig()          # 加载并校验 config.yaml
+ ├─ config.OpenStore(DefaultStorePath)     # 打开/创建 SQLite 配置库 data/config.db
+ ├─ store.LoadConfig() + ValidateConfig()  # 加载配置（空库用内置默认值）并校验
  ├─ utils.InitResourceFiles(cfg)            # 初始化数据文件与目录
  ├─ utils.NewEnhancedLogger(...)            # 日志系统
  └─ recovery.NewRecoveryManager(cfg).Start()

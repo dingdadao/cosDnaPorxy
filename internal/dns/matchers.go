@@ -1,167 +1,19 @@
 package dns
 
 import (
-	"cosDnaPorxy/internal/utils"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 
+	"cosDnaPorxy/internal/utils"
+
 	"gopkg.in/yaml.v3"
 )
 
-// MatchResult 匹配结果
-type MatchResult struct {
-	Matched bool
-	DNS     string
-	Pattern string
-	Type    string // "exact", "wildcard"
-}
-
-// DomainTrieNode 域名前缀树节点
-type DomainTrieNode struct {
-	children     map[string]*DomainTrieNode
-	dnsServer    string
-	pattern      string
-	isWildcard   bool
-	upstreamType string
-	parent       *DomainTrieNode // 添加父节点引用，用于多级通配符匹配
-}
-
-// NewDomainTrieNode 创建新的前缀树节点
-func NewDomainTrieNode() *DomainTrieNode {
-	return &DomainTrieNode{
-		children: make(map[string]*DomainTrieNode),
-	}
-}
-
-// Insert 插入域名模式到前缀树
-func (node *DomainTrieNode) Insert(domain, dnsServer, upstreamType string) {
-	// 按点分割域名并反向存储
-	parts := strings.Split(domain, ".")
-	if len(parts) == 0 {
-		return
-	}
-
-	current := node
-	// 反向遍历域名部分
-	for i := len(parts) - 1; i >= 0; i-- {
-		part := parts[i]
-
-		// 检查是否为通配符
-		isWildcard := part == "*" || strings.HasPrefix(part, "*")
-		if isWildcard {
-			part = "*"
-		}
-
-		// 创建或获取子节点
-		if _, exists := current.children[part]; !exists {
-			current.children[part] = NewDomainTrieNode()
-			current.children[part].parent = current
-		}
-		current = current.children[part]
-
-		// 标记通配符节点
-		current.isWildcard = isWildcard
-	}
-
-	// 设置DNS服务器和模式
-	current.dnsServer = dnsServer
-	current.pattern = domain
-	current.upstreamType = upstreamType
-}
-
-// Search 在前缀树中搜索域名
-func (node *DomainTrieNode) Search(domain string) *MatchResult {
-	parts := strings.Split(domain, ".")
-	if len(parts) == 0 {
-		return &MatchResult{Matched: false}
-	}
-
-	// 反向遍历域名部分
-	reverseParts := make([]string, len(parts))
-	for i, j := 0, len(parts)-1; i < len(parts); i, j = i+1, j-1 {
-		reverseParts[i] = strings.ToLower(parts[j])
-	}
-
-	current := node
-	var lastWildcardMatch *DomainTrieNode
-
-	// 反向遍历域名部分
-	for i, part := range reverseParts {
-		// 检查精确匹配
-		if next := current.children[part]; next != nil {
-			current = next
-			// 记录最后一个通配符匹配
-			if current.isWildcard && current.dnsServer != "" {
-				lastWildcardMatch = current
-			}
-			// 如果是最后一个部分且有精确匹配
-			if i == len(reverseParts)-1 && current.dnsServer != "" && !current.isWildcard {
-				return &MatchResult{
-					Matched: true,
-					DNS:     current.dnsServer,
-					Pattern: current.pattern,
-					Type:    "exact",
-				}
-			}
-		} else {
-			// 没有精确匹配，检查是否有通配符匹配
-			if wildcardNode := current.children["*"]; wildcardNode != nil && wildcardNode.dnsServer != "" {
-				return &MatchResult{
-					Matched: true,
-					DNS:     wildcardNode.dnsServer,
-					Pattern: wildcardNode.pattern,
-					Type:    "wildcard",
-				}
-			}
-			// 检查是否有通配符匹配（支持多级子域名）
-			if lastWildcardMatch != nil {
-				return &MatchResult{
-					Matched: true,
-					DNS:     lastWildcardMatch.dnsServer,
-					Pattern: lastWildcardMatch.pattern,
-					Type:    "wildcard",
-				}
-			}
-			// 对于多级子域名，需要检查所有可能的通配符匹配
-			// 遍历所有父级节点，查找通配符匹配
-			tempCurrent := current
-			for j := i; j < len(reverseParts); j++ {
-				if wildcardNode := tempCurrent.children["*"]; wildcardNode != nil && wildcardNode.dnsServer != "" {
-					return &MatchResult{
-						Matched: true,
-						DNS:     wildcardNode.dnsServer,
-						Pattern: wildcardNode.pattern,
-						Type:    "wildcard",
-					}
-				}
-				// 移动到父节点
-				if tempCurrent.parent != nil {
-					tempCurrent = tempCurrent.parent
-				} else {
-					break
-				}
-			}
-			break
-		}
-	}
-
-	// 如果没有精确匹配，使用最后一个通配符匹配
-	if lastWildcardMatch != nil {
-		return &MatchResult{
-			Matched: true,
-			DNS:     lastWildcardMatch.dnsServer,
-			Pattern: lastWildcardMatch.pattern,
-			Type:    "wildcard",
-		}
-	}
-
-	return &MatchResult{Matched: false}
-}
-
 // YAMLMatcher YAML格式域名匹配器（支持mihomo风格规则）
+// 每个域名分流列表对应一个实例，defaultDNS 即该列表配置的 DNS
 type YAMLMatcher struct {
 	logger *utils.EnhancedLogger
 	mu     sync.RWMutex
@@ -172,7 +24,7 @@ type YAMLMatcher struct {
 	keywords     map[string]string // 关键字匹配：DOMAIN-KEYWORD,baidu,dns
 	domains      map[string]string // 域名匹配：DOMAIN,example.com,dns
 	regexRules   map[string]string // 正则匹配：DOMAIN-REGEX,pattern,dns
-	defaultDNS   string            // 默认DNS
+	defaultDNS   []string          // 本列表命中后使用的DNS服务器列表
 }
 
 // NewYAMLMatcher 创建YAML格式匹配器
@@ -187,11 +39,19 @@ func NewYAMLMatcher(logger *utils.EnhancedLogger) *YAMLMatcher {
 	}
 }
 
-// SetDefaultDNS 设置默认DNS服务器
-func (ym *YAMLMatcher) SetDefaultDNS(defaultDNS string) {
+// SetDefaultDNS 设置本列表命中后使用的DNS服务器列表
+func (ym *YAMLMatcher) SetDefaultDNS(defaultDNS []string) {
 	ym.mu.Lock()
 	ym.defaultDNS = defaultDNS
 	ym.mu.Unlock()
+}
+
+// RuleCount 返回本列表已加载的规则条数（用于取反列表的空清单保护）
+func (ym *YAMLMatcher) RuleCount() int {
+	ym.mu.RLock()
+	defer ym.mu.RUnlock()
+	return len(ym.exactDomains) + len(ym.domains) + len(ym.suffixes) +
+		len(ym.keywords) + len(ym.regexRules)
 }
 
 // LoadYAMLConfig 从YAML配置加载域名规则
@@ -236,8 +96,8 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 			continue
 		}
 
-		// 解析规则
-		dnsServer := ym.defaultDNS // 默认使用默认DNS
+		// 解析规则：空值表示沿用本列表的 DNS，匹配时再解析（保证改 DNS 可热更新）
+		dnsServer := ""
 		originalRulePattern := rule
 
 		// 处理带有DNS指定的规则（格式：'DOMAIN,example.com,DNS' 或 'DOMAIN-SUFFIX,google.com,DNS'）
@@ -245,9 +105,9 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 			parts := strings.Split(rule, ",")
 			if len(parts) >= 3 {
 				dnsServer = strings.TrimSpace(parts[2])
-				// 处理 default_dns 关键字
+				// default_dns 关键字等价于未指定，沿用本列表的 DNS
 				if dnsServer == "default_dns" {
-					dnsServer = ym.defaultDNS
+					dnsServer = ""
 				}
 			}
 		}
@@ -284,6 +144,10 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 			pattern := strings.TrimPrefix(rulePattern, "DOMAIN,")
 			newDomains[pattern] = dnsServer
 			domainCount++
+		case strings.HasPrefix(rule, "+."):
+			// 通配符格式：+.example.com 等同于 DOMAIN-SUFFIX,example.com
+			newSuffixes[strings.TrimPrefix(rule, "+.")] = dnsServer
+			suffixCount++
 		default:
 			// 默认为精确匹配
 			newExactDomains[rulePattern] = dnsServer
@@ -313,43 +177,46 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 	return nil
 }
 
-// LoadDesignatedDomains 加载定向域名配置（兼容接口）
-func (ym *YAMLMatcher) LoadDesignatedDomains(filePath string) error {
-	return ym.LoadYAMLConfig(filePath)
-}
-
-// GetDesignatedDomainOrDefault YAML格式匹配方法
-func (ym *YAMLMatcher) GetDesignatedDomainOrDefault(domain string) (string, bool) {
+// MatchDomain 判断域名是否命中本列表；命中则返回本条列表使用的DNS服务器列表
+func (ym *YAMLMatcher) MatchDomain(domain string) ([]string, bool) {
 	ym.mu.RLock()
 	defer ym.mu.RUnlock()
 
-	if ym.defaultDNS == "" {
-		return "", false
+	if len(ym.defaultDNS) == 0 {
+		return nil, false
 	}
 
 	domainLower := strings.ToLower(domain)
 
+	// 规则未显式指定 DNS 时沿用本列表的 DNS（延迟解析，便于热更新）
+	resolve := func(dns string) []string {
+		if dns == "" {
+			return ym.defaultDNS
+		}
+		return []string{dns}
+	}
+
 	// 1. 精确匹配检查
 	if dns, exists := ym.exactDomains[domainLower]; exists {
-		return dns, true
+		return resolve(dns), true
 	}
 
 	// 2. DOMAIN 匹配检查
 	if dns, exists := ym.domains[domainLower]; exists {
-		return dns, true
+		return resolve(dns), true
 	}
 
 	// 3. 后缀匹配检查
 	for suffix, dns := range ym.suffixes {
 		if strings.HasSuffix(domainLower, "."+strings.ToLower(suffix)) || domainLower == strings.ToLower(suffix) {
-			return dns, true
+			return resolve(dns), true
 		}
 	}
 
 	// 4. 关键字匹配检查
 	for keyword, dns := range ym.keywords {
 		if strings.Contains(domainLower, strings.ToLower(keyword)) {
-			return dns, true
+			return resolve(dns), true
 		}
 	}
 
@@ -367,11 +234,11 @@ func (ym *YAMLMatcher) GetDesignatedDomainOrDefault(domain string) (string, bool
 
 		// 检查是否匹配
 		if regex.MatchString(domainLower) {
-			return dns, true
+			return resolve(dns), true
 		}
 	}
 
-	return "", false
+	return nil, false
 }
 
 // GetStats 获取YAML匹配器的性能统计
@@ -388,192 +255,4 @@ func (ym *YAMLMatcher) GetStats() map[string]interface{} {
 		"matcher_type":  "yaml",
 		"total_count":   len(ym.exactDomains) + len(ym.suffixes) + len(ym.keywords) + len(ym.domains) + len(ym.regexRules),
 	}
-}
-
-// ChinaDomainMatcher 中国域名匹配器
-type ChinaDomainMatcher struct {
-	logger *utils.EnhancedLogger
-	mu     sync.RWMutex
-
-	// 中国域名索引
-	exactDomains map[string]bool           // 精确匹配的中国域名
-	suffixes     map[string]bool           // 后缀匹配的中国域名
-	keywords     map[string]bool           // 关键字匹配的中国域名
-	regexRules   map[string]*regexp.Regexp // 正则表达式匹配的中国域名
-	trie         *DomainTrieNode           // 前缀树用于快速匹配
-}
-
-// NewChinaDomainMatcher 创建中国域名匹配器
-func NewChinaDomainMatcher(logger *utils.EnhancedLogger) *ChinaDomainMatcher {
-	return &ChinaDomainMatcher{
-		logger:       logger,
-		exactDomains: make(map[string]bool),
-		suffixes:     make(map[string]bool),
-		keywords:     make(map[string]bool),
-		regexRules:   make(map[string]*regexp.Regexp),
-		trie:         NewDomainTrieNode(),
-	}
-}
-
-// LoadChinaDomains 从YAML配置加载中国域名
-func (cm *ChinaDomainMatcher) LoadChinaDomains(configPath string) error {
-	timer := cm.logger.StartTimer("load_china_domains")
-	defer timer.End()
-
-	if configPath == "" {
-		cm.logger.Warn("中国域名配置文件路径为空")
-		return nil
-	}
-
-	// 读取YAML文件
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("读取中国域名配置文件失败: %w", err)
-	}
-
-	// 解析YAML
-	var yamlConfig struct {
-		Payload []string `yaml:"payload"`
-	}
-
-	err = yaml.Unmarshal(data, &yamlConfig)
-	if err != nil {
-		return fmt.Errorf("解析中国域名配置失败: %w", err)
-	}
-
-	// 创建新的索引结构
-	newExactDomains := make(map[string]bool)
-	newSuffixes := make(map[string]bool)
-	newKeywords := make(map[string]bool)
-	newRegexRules := make(map[string]*regexp.Regexp)
-	newTrie := NewDomainTrieNode()
-
-	var exactCount, suffixCount, keywordCount, regexCount int
-
-	// 批量解析和分类
-	for _, rule := range yamlConfig.Payload {
-		rule = strings.TrimSpace(rule)
-		if rule == "" || strings.HasPrefix(rule, "#") {
-			continue
-		}
-
-		// 解析规则
-		originalRulePattern := rule
-		rulePattern := rule
-
-		// 处理带有DNS指定的规则（格式：'DOMAIN,example.com,DNS'）
-		if strings.Contains(rule, ",") {
-			parts := strings.Split(rule, ",")
-			if len(parts) >= 2 {
-				rulePattern = strings.TrimSpace(parts[0])
-			}
-		}
-
-		// 根据规则类型分类
-		switch {
-		case strings.HasPrefix(originalRulePattern, "DOMAIN-SUFFIX,"):
-			// DOMAIN-SUFFIX 规则：DOMAIN-SUFFIX,google.com
-			pattern := strings.TrimPrefix(rulePattern, "DOMAIN-SUFFIX,")
-			newSuffixes[pattern] = true
-			suffixCount++
-			// 同时插入到前缀树中
-			newTrie.Insert("*."+pattern, "china_dns", "")
-		case strings.HasPrefix(originalRulePattern, "DOMAIN-KEYWORD,"):
-			// DOMAIN-KEYWORD 规则：DOMAIN-KEYWORD,baidu
-			pattern := strings.TrimPrefix(rulePattern, "DOMAIN-KEYWORD,")
-			newKeywords[pattern] = true
-			keywordCount++
-		case strings.HasPrefix(originalRulePattern, "DOMAIN-REGEX,"):
-			// DOMAIN-REGEX 规则：DOMAIN-REGEX,pattern
-			pattern := strings.TrimPrefix(rulePattern, "DOMAIN-REGEX,")
-			regex, err := regexp.Compile(pattern)
-			if err != nil {
-				cm.logger.Warn("中国域名正则表达式编译失败", map[string]interface{}{
-					"pattern": pattern,
-					"error":   err.Error(),
-				})
-			} else {
-				newRegexRules[pattern] = regex
-				regexCount++
-			}
-		case strings.HasPrefix(originalRulePattern, "DOMAIN,"):
-			// DOMAIN 规则：DOMAIN,example.com
-			pattern := strings.TrimPrefix(rulePattern, "DOMAIN,")
-			newExactDomains[pattern] = true
-			exactCount++
-			// 同时插入到前缀树中
-			newTrie.Insert(pattern, "china_dns", "")
-		case strings.HasPrefix(rulePattern, "+."):
-			// 通配符格式：+.example.com 等同于 DOMAIN-SUFFIX,example.com
-			pattern := strings.TrimPrefix(rulePattern, "+.")
-			newSuffixes[pattern] = true
-			suffixCount++
-			// 同时插入到前缀树中
-			newTrie.Insert("*."+pattern, "china_dns", "")
-		default:
-			// 默认为精确匹配
-			newExactDomains[rulePattern] = true
-			exactCount++
-			// 同时插入到前缀树中
-			newTrie.Insert(rulePattern, "china_dns", "")
-		}
-	}
-
-	// 原子性更新索引结构
-	cm.mu.Lock()
-	cm.exactDomains = newExactDomains
-	cm.suffixes = newSuffixes
-	cm.keywords = newKeywords
-	cm.regexRules = newRegexRules
-	cm.trie = newTrie
-	cm.mu.Unlock()
-
-	cm.logger.Info("🇨🇳 中国域名配置加载完成", map[string]interface{}{
-		"file":          configPath,
-		"total_count":   len(yamlConfig.Payload),
-		"exact_count":   exactCount,
-		"suffix_count":  suffixCount,
-		"keyword_count": keywordCount,
-		"regex_count":   regexCount,
-	})
-
-	return nil
-}
-
-// IsChinaDomain 检查域名是否为中国域名
-func (cm *ChinaDomainMatcher) IsChinaDomain(domain string) bool {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
-	domainLower := strings.ToLower(domain)
-
-	// 1. 精确匹配检查
-	if _, exists := cm.exactDomains[domainLower]; exists {
-		return true
-	}
-
-	// 2. 后缀匹配检查
-	for suffix := range cm.suffixes {
-		if strings.HasSuffix(domainLower, "."+strings.ToLower(suffix)) || domainLower == strings.ToLower(suffix) {
-			return true
-		}
-	}
-
-	// 3. 关键字匹配检查
-	for keyword := range cm.keywords {
-		if strings.Contains(domainLower, strings.ToLower(keyword)) {
-			return true
-		}
-	}
-
-	// 4. 正则表达式匹配检查
-	for _, regex := range cm.regexRules {
-		if regex.MatchString(domainLower) {
-			return true
-		}
-	}
-
-	// 5. 前缀树匹配检查
-	result := cm.trie.Search(domainLower)
-	return result.Matched
 }
