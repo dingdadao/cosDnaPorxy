@@ -20,20 +20,27 @@ import (
 //go:embed admin.html
 var adminFS embed.FS
 
+// RestartOutcome 管理端「重启服务」的处理结果
+type RestartOutcome struct {
+	ProcessRestart bool   // 已下发进程级重启：当前连接会断开，页面需等待服务恢复
+	WebAddrChanged bool   // Web 监听地址已变更
+	WebAddr        string // 变更后的 Web 监听地址（WebAddrChanged 为 true 时有效）
+}
+
 // Server Web 管理端服务器
 type Server struct {
 	store      *config.Store
 	logger     *utils.EnhancedLogger
-	getHandler func() *dns.RefactoredHandler // 获取当前DNS处理器（重启后自动指向新实例）
-	restart    func() (bool, error)          // 重启DNS服务并重载配置，返回 Web 地址是否变更（nil=不支持重启）
-	queryLog   *querylog.Store               // 解析日志库（可为 nil 表示不可用）
+	getHandler func() *dns.RefactoredHandler  // 获取当前DNS处理器（重启后自动指向新实例）
+	restart    func() (RestartOutcome, error) // 按库中配置重启服务（nil=不支持重启）
+	queryLog   *querylog.Store                // 解析日志库（可为 nil 表示不可用）
 
 	srv *http.Server
 	ln  net.Listener
 }
 
 // NewServer 创建 Web 管理端服务器（qlog 为进程级解析日志库，可为 nil）
-func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler func() *dns.RefactoredHandler, restart func() (bool, error), qlog *querylog.Store) *Server {
+func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler func() *dns.RefactoredHandler, restart func() (RestartOutcome, error), qlog *querylog.Store) *Server {
 	s := &Server{
 		store:      store,
 		logger:     logger,
@@ -153,14 +160,14 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRestart 重启DNS服务并加载库中最新配置（Web 管理端按钮触发）
+// handleRestart 按配置库中的最新配置重启服务（Web 管理端按钮触发）
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if s.restart == nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("当前运行模式不支持重启"))
 		return
 	}
 
-	webAddrChanged, err := s.restart()
+	out, err := s.restart()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -168,11 +175,14 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Warn("🔄 [Web管理端已下发重启] ", map[string]interface{}{
 		"rule":             "WEB_RESTART_ACCEPTED",
-		"web_addr_changed": webAddrChanged,
+		"process_restart":  out.ProcessRestart,
+		"web_addr_changed": out.WebAddrChanged,
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":               true,
-		"web_addr_changed": webAddrChanged,
+		"process_restart":  out.ProcessRestart,
+		"web_addr_changed": out.WebAddrChanged,
+		"web_addr":         out.WebAddr,
 	})
 }
 

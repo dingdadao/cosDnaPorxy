@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -96,40 +97,104 @@ func (rm *RecoveryManager) GetDNSHandler() *dns.RefactoredHandler {
 	return rm.dnsHandler
 }
 
-// RequestRestart 管理端触发：从配置库重载配置并重启 DNS 服务
-// 返回 web_addr_changed=true 表示 Web 监听地址自进程启动后已变更，需进程级重启（systemctl restart）才能生效
-func (rm *RecoveryManager) RequestRestart() (bool, error) {
+// processRestartDelay 进程级重启前的等待：先让 HTTP 响应写回客户端，再终止自身
+const processRestartDelay = 800 * time.Millisecond
+
+// RequestRestart 管理端触发：按配置库中的最新配置重启服务。
+// systemd 托管时执行进程级重启，使 Web 监听地址、日志格式等启动期字段一并生效；
+// 非 systemd 运行（如本地直接运行）退回进程内重建 DNS 服务，此时 Web 地址变更不会生效。
+func (rm *RecoveryManager) RequestRestart() (web.RestartOutcome, error) {
 	if rm.store == nil {
-		return false, fmt.Errorf("配置库不可用")
+		return web.RestartOutcome{}, fmt.Errorf("配置库不可用")
 	}
 	if rm.GetDNSHandler() == nil {
-		return false, fmt.Errorf("DNS服务未在运行")
+		return web.RestartOutcome{}, fmt.Errorf("DNS服务未在运行")
 	}
 
 	cfg, err := rm.store.LoadConfig()
 	if err != nil {
-		return false, fmt.Errorf("加载配置失败: %w", err)
+		return web.RestartOutcome{}, fmt.Errorf("加载配置失败: %w", err)
 	}
 	if err := config.ValidateConfig(cfg); err != nil {
-		return false, fmt.Errorf("配置无效: %w", err)
+		return web.RestartOutcome{}, fmt.Errorf("配置无效: %w", err)
 	}
 
 	rm.mu.Lock()
-	rm.config = cfg // 重启时 startDNSService 以该配置重建处理器
+	rm.config = cfg // 退回进程内重启时 startDNSService 以该配置重建处理器
 	webAddrChanged := cfg.WebAddr != rm.startWebAddr
 	rm.mu.Unlock()
 
+	out := web.RestartOutcome{
+		ProcessRestart: systemdUnitName() != "",
+		WebAddrChanged: webAddrChanged,
+	}
+	if webAddrChanged {
+		out.WebAddr = cfg.WebAddr
+	}
+
 	rm.logger.Warn("🔄 [管理端请求重启服务] ", map[string]interface{}{
 		"rule":             "WEB_RESTART_REQUESTED",
+		"process_restart":  out.ProcessRestart,
 		"web_addr_changed": webAddrChanged,
 	})
 
-	select {
-	case rm.restartChan <- true:
-	default:
-		// 已有重启在排队：其执行时读取的是最新配置，无需重复入队
+	// 进程级重启会终止当前进程，故延迟到 HTTP 响应写回后再执行
+	go func() {
+		time.Sleep(processRestartDelay)
+		if out.ProcessRestart && rm.restartProcess() {
+			return
+		}
+		// 非 systemd 托管或重启命令下发失败：退回进程内重建 DNS 服务
+		select {
+		case rm.restartChan <- true:
+		default:
+			// 已有重启在排队：其执行时读取的是最新配置，无需重复入队
+		}
+	}()
+	return out, nil
+}
+
+// restartProcess 向 systemd 下发进程级重启（systemctl --no-block restart <unit>）
+func (rm *RecoveryManager) restartProcess() bool {
+	unit := systemdUnitName()
+	if unit == "" {
+		return false
 	}
-	return webAddrChanged, nil
+	if err := exec.Command("systemctl", "--no-block", "restart", unit).Run(); err != nil {
+		rm.logger.Warn("⚠️ [进程级重启下发失败，退回进程内重启] ", map[string]interface{}{
+			"rule":  "PROCESS_RESTART_FAILED",
+			"unit":  unit,
+			"error": err.Error(),
+		})
+		return false
+	}
+	rm.logger.Warn("🔄 [已下发进程级重启] ", map[string]interface{}{
+		"rule": "PROCESS_RESTART_REQUESTED",
+		"unit": unit,
+	})
+	return true
+}
+
+// systemdUnitName 从 /proc/self/cgroup 解析当前服务所属的 systemd 单元名（如 dnsproxy.service）
+// 返回空字符串表示当前进程不由 systemd 托管（如 macOS/本地直接运行）
+func systemdUnitName() string {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		_, path, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		// cgroup v2 形如 0::/system.slice/dnsproxy.service；v1 形如 1:name=systemd:/system.slice/dnsproxy.service
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			if name := path[i+1:]; strings.HasSuffix(name, ".service") {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 // startQueryLog 打开进程级解析日志库（独立 SQLite，与配置库分离）

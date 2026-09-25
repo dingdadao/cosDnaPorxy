@@ -331,13 +331,13 @@
   <div class="brand">DNS 代理配置中心<span class="dns-addr" id="dns-addr">DNS :--</span></div>
   <div class="spacer"></div>
   <div class="save-state" id="save-state"><span class="dot"></span><span class="label-text" id="save-state-text">所有更改已保存</span></div>
-  <button class="btn btn-ghost" id="btn-restart" title="按数据库中的配置重启 DNS 服务">重启服务</button>
+  <button class="btn btn-ghost" id="btn-restart" title="按数据库中的配置重启服务进程">重启服务</button>
   <button class="btn btn-primary" id="btn-save" hidden>保存并应用</button>
 </header>
 
 <div class="restart-banner" id="restart-banner" hidden>
   <span>⚠️</span>
-  <div><b>以下更改需重启生效：</b><span id="restart-fields"></span>。已写入数据库，点右上角「重启服务」应用（日志格式与 Web 地址需重启进程）。</div>
+  <div><b>以下更改需重启生效：</b><span id="restart-fields"></span>。已写入数据库，点右上角「重启服务」应用（会重启服务进程，解析中断数秒）。</div>
   <button class="close" id="restart-close" aria-label="关闭提示">✕</button>
 </div>
 
@@ -1596,11 +1596,11 @@ $("#btn-save").addEventListener("click", () => {
 });
 $("#restart-close").addEventListener("click", () => { $("#restart-banner").hidden = true; });
 
-/* 重启服务：按数据库中的配置重建 DNS 处理器（未保存的修改不会生效） */
+/* 重启服务：按数据库中的配置重启服务进程（未保存的修改不会生效） */
 $("#btn-restart").addEventListener("click", async () => {
   const ok = await confirmModal({
-    title:"重启 DNS 服务？",
-    bodyHTML:"将按数据库中已保存的配置重建 DNS 服务，期间解析会中断数秒。未保存的修改不会生效。",
+    title:"重启服务？",
+    bodyHTML:"将重启服务进程，按数据库中的配置重新加载（含 Web 监听地址、日志格式）。期间解析会中断数秒。未保存的修改不会生效。",
     confirmText:"立即重启",
   });
   if (!ok) return;
@@ -1608,16 +1608,39 @@ $("#btn-restart").addEventListener("click", async () => {
   btn.disabled = true;
   try {
     const r = await api("POST", "/api/restart");
-    if (r.web_addr_changed) {
-      toast("已下发重启；Web 监听地址变更需重启进程（systemctl restart dnsproxy）", "warn");
-    } else {
-      toast("已下发重启，DNS 服务将在数秒内恢复");
+    if (r.process_restart) {
+      if (r.web_addr_changed) {
+        /* 服务将监听新地址，当前页面无法自动重连，保留横幅并给出新地址 */
+        $("#restart-fields").textContent = "Web 管理端地址已变更为 " + r.web_addr;
+        $("#restart-banner").hidden = false;
+        toast("服务正在重启；请用新地址打开 " + r.web_addr, "warn");
+        return;
+      }
+      toast("服务正在重启，等待恢复后自动重连…", "warn");
+      /* 进程重启期间 Web 短暂不可达，轮询到恢复为止（最长约 40s） */
+      let back = false;
+      for (let i = 0; i < 40 && !back; i++) {
+        await new Promise(r2 => setTimeout(r2, 1000));
+        try {
+          const resp = await fetch(location.pathname || "/", { cache:"no-store" });
+          back = resp.ok;
+        } catch (e) { /* 服务还没起来，继续等 */ }
+      }
+      if (!back) { toast("服务重启后未能自动重连，请手动刷新页面", "err"); return; }
+      const res2 = await api("GET", "/api/config");
+      CFG = humanizeConfig(res2.config);
+      BASELINE = clone(CFG);
+      $("#restart-banner").hidden = true;
+      renderRoute();
+      toast("服务已重启完成");
+      return;
     }
-    /* 重启以库中配置为准，重新拉取基线以清空脏状态 */
+    /* 非 systemd 托管：进程内重建 DNS 服务，Web 不受影响，但 Web 地址等字段不生效 */
+    toast("已下发重启，DNS 服务将在数秒内恢复", "warn");
     const res = await api("GET", "/api/config");
     CFG = humanizeConfig(res.config);
     BASELINE = clone(CFG);
-    $("#restart-banner").hidden = true;
+    $("#restart-banner").hidden = !r.web_addr_changed;
     renderRoute();
   } catch (e) {
     toast("重启失败：" + e.message, "err");

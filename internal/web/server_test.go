@@ -117,16 +117,21 @@ func TestRestartAPI(t *testing.T) {
 		t.Errorf("nil restart应500: code=%d", rec.Code)
 	}
 
-	// 注入重启回调 → 200 并带 web_addr_changed
+	// 注入重启回调 → 200 并带 process_restart / web_addr_changed / web_addr
 	called := false
-	s.restart = func() (bool, error) { called = true; return true, nil }
+	s.restart = func() (RestartOutcome, error) {
+		called = true
+		return RestartOutcome{ProcessRestart: true, WebAddrChanged: true, WebAddr: ":80"}, nil
+	}
 	rec := doJSON(s, "POST", "/api/restart", "")
 	var resp struct {
-		Ok             bool `json:"ok"`
-		WebAddrChanged bool `json:"web_addr_changed"`
+		Ok             bool   `json:"ok"`
+		ProcessRestart bool   `json:"process_restart"`
+		WebAddrChanged bool   `json:"web_addr_changed"`
+		WebAddr        string `json:"web_addr"`
 	}
 	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if rec.Code != http.StatusOK || !called || !resp.Ok || !resp.WebAddrChanged {
+	if rec.Code != http.StatusOK || !called || !resp.Ok || !resp.ProcessRestart || !resp.WebAddrChanged || resp.WebAddr != ":80" {
 		t.Errorf("重启接口错误: code=%d called=%v resp=%s", rec.Code, called, rec.Body.String())
 	}
 }
