@@ -267,3 +267,18 @@ payload:
   - "DOMAIN-SUFFIX,ydycdn.com,default_dns"
   - "DOMAIN-SUFFIX,effirst.com,default_dns"
   - "DOMAIN-SUFFIX,dailygn.com,default_dns"
+
+  # ===========================================
+  # 第四批：生产日志残留慢查询中确认属国内的漏网域名
+  # （均在 China 清单外，被「国外」invert 兜底误判）
+  # ===========================================
+  # 腾讯网络探测域名家族（与 qrstuvwxyzab.com 同类，nibble 编码 IPv6 探测）
+  - "DOMAIN-SUFFIX,qtaeixd.com,default_dns"
+  # 抖音视频 CDN
+  - "DOMAIN-SUFFIX,idouyinvod.com,default_dns"
+  # 国内 CDN / 游戏下载调度
+  - "DOMAIN-SUFFIX,cjjd14.com,default_dns"
+  - "DOMAIN-SUFFIX,tianwenca.com,default_dns"
+  - "DOMAIN-SUFFIX,qiezibenpao.com,default_dns"
+  - "DOMAIN-SUFFIX,gcloudsvcs.com,default_dns"
+  - "DOMAIN-SUFFIX,gcloudgbs.com,default_dns"
