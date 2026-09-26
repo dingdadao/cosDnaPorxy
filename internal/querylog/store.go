@@ -7,8 +7,10 @@ package querylog
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +40,10 @@ const (
 	pruneEvery = 10 * time.Minute
 	pruneLimit = 50000 // 单次清理上限，避免长时间持有写锁
 	maxLimit   = 500   // 单次查询最大条数
+
+	defaultTopDomains = 20  // 统计页 Top 域名默认条数
+	maxTopDomains     = 100 // 统计页 Top 域名条数上限
+	dayLayout         = "2006-01-02"
 )
 
 // 默认保留策略（配置缺省时使用）
@@ -61,6 +67,57 @@ type Entry struct {
 	Rcode     string `json:"rcode"`
 	Answers   string `json:"answers"` // 应答记录摘要
 	ElapsedMS int64  `json:"elapsed_ms"`
+}
+
+// GroupStat 单维度聚合结果（来源 / 类型 / 结果分布）
+type GroupStat struct {
+	Key          string  `json:"key"`
+	Count        int64   `json:"count"`
+	AvgElapsedMS float64 `json:"avg_elapsed_ms"`
+}
+
+// ListStat 分流列表命中情况（Actions 为该列表内的来源构成）
+type ListStat struct {
+	Name         string      `json:"name"`
+	Count        int64       `json:"count"`
+	AvgElapsedMS float64     `json:"avg_elapsed_ms"`
+	Actions      []GroupStat `json:"actions"`
+}
+
+// DomainStat Top 域名条目
+type DomainStat struct {
+	Domain       string  `json:"domain"`
+	Count        int64   `json:"count"`
+	AvgElapsedMS float64 `json:"avg_elapsed_ms"`
+	Action       string  `json:"action"`    // 主导来源
+	ListName     string  `json:"list_name"` // 主要命中的分流列表
+}
+
+// DayStat 本地自然日的查询量
+type DayStat struct {
+	Day   string `json:"day"` // 2006-01-02
+	Count int64  `json:"count"`
+}
+
+// Summary 统计汇总：窗口由 Filter 决定，默认保留期内全部记录（不设条数上限）
+type Summary struct {
+	Total        int64        `json:"total"`
+	FirstTS      int64        `json:"first_ts"`
+	LastTS       int64        `json:"last_ts"`
+	Domains      int64        `json:"domains"`
+	AvgElapsedMS float64      `json:"avg_elapsed_ms"`
+	ByAction     []GroupStat  `json:"by_action"`
+	ByList       []ListStat   `json:"by_list"`
+	ByQType      []GroupStat  `json:"by_qtype"`
+	ByRcode      []GroupStat  `json:"by_rcode"`
+	TopDomains   []DomainStat `json:"top_domains"`
+	ByDay        []DayStat    `json:"by_day"`
+
+	// 超时口径：elapsed_ms >= TimeoutMS 的记录视作超时，不计入任何平均耗时，
+	// 单独汇总为 Timeouts / TimeoutAvgElapsedMS（TimeoutMS 为 0 表示未判定）
+	TimeoutMS           int64   `json:"timeout_ms"`
+	Timeouts            int64   `json:"timeouts"`
+	TimeoutAvgElapsedMS float64 `json:"timeout_avg_elapsed_ms"`
 }
 
 // Options 存储选项（由配置热更新）
@@ -293,6 +350,225 @@ func buildWhere(f Filter) (string, []interface{}) {
 		return "", args
 	}
 	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// Summary 聚合统计（topN 为 Top 域名条数，<=0 用默认值，超过上限按上限截断；
+// timeoutMS 为超时判定阈值（毫秒），elapsed_ms >= 该值的记录不计入任何平均耗时，
+// 单独汇总到 Timeouts；<=0 表示不判定超时）
+func (s *Store) Summary(f Filter, topN int, timeoutMS int64) (*Summary, error) {
+	where, args := buildWhere(f)
+	sum := &Summary{
+		ByAction:   []GroupStat{},
+		ByList:     []ListStat{},
+		ByQType:    []GroupStat{},
+		ByRcode:    []GroupStat{},
+		TopDomains: []DomainStat{},
+		ByDay:      []DayStat{},
+	}
+	// 归一化阈值：不判定时取最大值，使 SQL 中的 </>= 条件自然退化为「全部计入 / 无超时」
+	thr := timeoutMS
+	if thr <= 0 {
+		thr = math.MaxInt64
+	} else {
+		sum.TimeoutMS = timeoutMS
+	}
+	bargs := append([]interface{}{thr, thr, thr}, args...)
+
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(MIN(ts),0), COALESCE(MAX(ts),0),
+		COALESCE(AVG(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0), COUNT(DISTINCT domain),
+		COALESCE(SUM(CASE WHEN elapsed_ms >= ? THEN 1 ELSE 0 END),0),
+		COALESCE(AVG(CASE WHEN elapsed_ms >= ? THEN elapsed_ms END),0) FROM query_logs`+where, bargs...).
+		Scan(&sum.Total, &sum.FirstTS, &sum.LastTS, &sum.AvgElapsedMS, &sum.Domains,
+			&sum.Timeouts, &sum.TimeoutAvgElapsedMS); err != nil {
+		return nil, fmt.Errorf("统计汇总失败: %w", err)
+	}
+	if sum.Total == 0 {
+		return sum, nil
+	}
+
+	var err error
+	if sum.ByAction, err = s.groupStats("action", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByQType, err = s.groupStats("qtype", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByRcode, err = s.groupStats("rcode", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByList, err = s.listStats(where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.TopDomains, err = s.topDomains(where, args, topN, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByDay, err = s.dailyStats(where, args, sum.FirstTS, sum.LastTS); err != nil {
+		return nil, err
+	}
+	return sum, nil
+}
+
+// groupStats 按列聚合次数与平均耗时（col 仅由内部常量传入，不存在注入）
+// 次数为全量，平均耗时剔除超时记录（elapsed_ms >= thr）
+func (s *Store) groupStats(col, where string, args []interface{}, thr int64) ([]GroupStat, error) {
+	rows, err := s.db.Query(`SELECT `+col+`, COUNT(*), COALESCE(AVG(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0)
+		FROM query_logs`+where+` GROUP BY `+col+` ORDER BY COUNT(*) DESC, `+col+` ASC`,
+		append([]interface{}{thr}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("统计 %s 分布失败: %w", col, err)
+	}
+	defer rows.Close()
+
+	out := []GroupStat{}
+	for rows.Next() {
+		var g GroupStat
+		if err := rows.Scan(&g.Key, &g.Count, &g.AvgElapsedMS); err != nil {
+			return nil, fmt.Errorf("读取 %s 分布失败: %w", col, err)
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// listStats 分流列表命中统计：按列表汇总，并保留该列表内的来源构成
+// 命中次数为全量，平均耗时剔除超时记录
+func (s *Store) listStats(where string, args []interface{}, thr int64) ([]ListStat, error) {
+	if where == "" {
+		where = " WHERE list_name <> ''"
+	} else {
+		where += " AND list_name <> ''"
+	}
+	rows, err := s.db.Query(`SELECT list_name, action, COUNT(*),
+		COALESCE(SUM(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0),
+		COALESCE(SUM(CASE WHEN elapsed_ms < ? THEN 1 ELSE 0 END),0)
+		FROM query_logs`+where+` GROUP BY list_name, action`,
+		append([]interface{}{thr, thr}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("统计分流列表命中失败: %w", err)
+	}
+	defer rows.Close()
+
+	byName := map[string]*ListStat{}
+	sumMS := map[string]int64{}
+	okMS := map[string]int64{} // 各列表内参与平均的记录数（已剔除超时）
+	for rows.Next() {
+		var name, action string
+		var count, total, ok int64
+		if err := rows.Scan(&name, &action, &count, &total, &ok); err != nil {
+			return nil, fmt.Errorf("读取分流列表命中失败: %w", err)
+		}
+		ls, okName := byName[name]
+		if !okName {
+			ls = &ListStat{Name: name, Actions: []GroupStat{}}
+			byName[name] = ls
+		}
+		ls.Count += count
+		sumMS[name] += total
+		okMS[name] += ok
+		ls.Actions = append(ls.Actions, GroupStat{Key: action, Count: count, AvgElapsedMS: avgMS(total, ok)})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]ListStat, 0, len(byName))
+	for _, ls := range byName {
+		ls.AvgElapsedMS = avgMS(sumMS[ls.Name], okMS[ls.Name])
+		sort.Slice(ls.Actions, func(i, j int) bool {
+			if ls.Actions[i].Count != ls.Actions[j].Count {
+				return ls.Actions[i].Count > ls.Actions[j].Count
+			}
+			return ls.Actions[i].Key < ls.Actions[j].Key
+		})
+		out = append(out, *ls)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// topDomains 查询量最高的域名，并附带其主导来源与主要命中的分流列表。
+// 两个相关子查询自带分组且不带参数，故不影响 buildWhere 参数与 LIMIT 参数的顺序。
+// 次数为全量，平均耗时剔除超时记录。
+func (s *Store) topDomains(where string, args []interface{}, topN int, thr int64) ([]DomainStat, error) {
+	if topN <= 0 {
+		topN = defaultTopDomains
+	}
+	if topN > maxTopDomains {
+		topN = maxTopDomains
+	}
+	qargs := append(append([]interface{}{thr}, args...), topN)
+
+	rows, err := s.db.Query(`SELECT q.domain, COUNT(*),
+		COALESCE(AVG(CASE WHEN q.elapsed_ms < ? THEN q.elapsed_ms END),0),
+		(SELECT action FROM query_logs x WHERE x.domain = q.domain
+			GROUP BY action ORDER BY COUNT(*) DESC, action ASC LIMIT 1),
+		(SELECT list_name FROM query_logs y WHERE y.domain = q.domain AND list_name <> ''
+			GROUP BY list_name ORDER BY COUNT(*) DESC, list_name ASC LIMIT 1)
+		FROM query_logs q`+where+` GROUP BY q.domain ORDER BY COUNT(*) DESC, q.domain ASC LIMIT ?`, qargs...)
+	if err != nil {
+		return nil, fmt.Errorf("统计 Top 域名失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := []DomainStat{}
+	for rows.Next() {
+		var d DomainStat
+		var action, listName sql.NullString
+		if err := rows.Scan(&d.Domain, &d.Count, &d.AvgElapsedMS, &action, &listName); err != nil {
+			return nil, fmt.Errorf("读取 Top 域名失败: %w", err)
+		}
+		d.Action, d.ListName = action.String, listName.String
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// dailyStats 按本地自然日统计：SQL 只做小时分桶，再由 Go 按本地时区归并并补零，
+// 避免 SQLite 'localtime' 与 Go 侧时区不一致导致日期错位。
+func (s *Store) dailyStats(where string, args []interface{}, firstTS, lastTS int64) ([]DayStat, error) {
+	rows, err := s.db.Query(`SELECT (ts/3600)*3600 AS h, COUNT(*) FROM query_logs`+
+		where+` GROUP BY h ORDER BY h`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("统计按天趋势失败: %w", err)
+	}
+	defer rows.Close()
+
+	byDay := map[string]int64{}
+	for rows.Next() {
+		var hour, count int64
+		if err := rows.Scan(&hour, &count); err != nil {
+			return nil, fmt.Errorf("读取按天趋势失败: %w", err)
+		}
+		byDay[time.Unix(hour, 0).In(time.Local).Format(dayLayout)] += count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	first := time.Unix(firstTS, 0).In(time.Local)
+	last := time.Unix(lastTS, 0).In(time.Local)
+	start := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, time.Local)
+	end := time.Date(last.Year(), last.Month(), last.Day(), 0, 0, 0, 0, time.Local)
+
+	out := []DayStat{}
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		key := d.Format(dayLayout)
+		out = append(out, DayStat{Day: key, Count: byDay[key]})
+	}
+	return out, nil
+}
+
+// avgMS 平均耗时（毫秒），count 为 0 时返回 0
+func avgMS(total, count int64) float64 {
+	if count == 0 {
+		return 0
+	}
+	return float64(total) / float64(count)
 }
 
 // writeLoop 批量落库：攒够 batchSize 或到达 flushEvery 即写入

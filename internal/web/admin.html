@@ -221,6 +221,7 @@
   .src.filtered { color:var(--text-2); background:rgba(154,167,180,.12); border-color:var(--border); }
   .src.refused { color:var(--warning); background:var(--warning-soft); }
   .src.error { color:var(--danger); background:var(--danger-soft); }
+  .src.timeout { color:var(--danger); background:transparent; border-color:var(--danger); border-style:dashed; }
   .mode-badge { display:inline-block; font-family:var(--mono); font-size:10.5px; color:var(--text-3); border:1px solid var(--border); border-radius:9px; padding:0 7px; }
   .log-list-name { color:var(--accent); }
   .log-answers { font-family:var(--mono); font-size:11.5px; color:var(--text-2); margin-top:2px; }
@@ -253,6 +254,24 @@
   .empty { padding:54px 20px; text-align:center; color:var(--text-2); }
   .empty .big { font-size:15px; color:var(--text-1); margin-bottom:6px; }
   .empty .sub { font-size:12.5px; color:var(--text-3); margin-bottom:16px; }
+
+  /* ---------- 统计报表 ---------- */
+  .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
+  .stat-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .stat-card .k { font-size:11.5px; color:var(--text-3); margin-bottom:6px; }
+  .stat-card .v { font-size:19px; font-weight:650; letter-spacing:-.01em; }
+  .stat-card .v.small { font-size:13px; font-weight:600; }
+  .stat-card .sub { font-size:11.5px; color:var(--text-3); margin-top:5px; }
+  .stat-bar { display:block; height:6px; min-width:70px; border-radius:3px; background:rgba(255,255,255,.06); overflow:hidden; }
+  .stat-bar i { display:block; height:100%; border-radius:3px; background:var(--accent); }
+  .stat-actions { display:flex; flex-wrap:wrap; gap:5px; }
+  .day-chart { display:flex; align-items:flex-end; gap:6px; height:158px; padding-top:4px; }
+  .day-col { flex:1; min-width:0; height:100%; display:flex; flex-direction:column;
+    justify-content:flex-end; align-items:center; gap:5px; }
+  .day-col .bar { width:100%; min-height:2px; border-radius:4px 4px 0 0;
+    background:var(--accent-soft); border:1px solid var(--accent); border-bottom:none; }
+  .day-col .n { font-size:10.5px; color:var(--text-2); }
+  .day-col .lbl { font-size:10px; color:var(--text-3); font-family:var(--mono); white-space:nowrap; }
 
   /* ---------- 抽屉 ---------- */
   .overlay-backdrop { position:fixed; inset:0; background:rgba(3,6,10,.55); z-index:60; animation:fade .15s; }
@@ -555,6 +574,7 @@ function currentRoute() {
   let h = location.hash.replace(/^#\/?/, "").replace(/^settings\//, "");
   if (h === "overrides") return { type:"overrides" };
   if (h === "logs") return { type:"logs" };
+  if (h === "stats") return { type:"stats" };
   if (h === "all") return { type:"all" };
   const id = SECTIONS.some(s => s.id === h) ? h : "general";
   return { type:"settings", id };
@@ -572,6 +592,7 @@ function buildSidebar(active) {
     item("overrides","域名篡改") +
     `<div class="nav-group">日志</div>` +
     item("logs","解析日志") +
+    item("stats","统计报表") +
     `<div class="nav-foot"><button class="nav-item" data-nav="all"><span>全部配置（单页视图）</span><span class="nav-dot"></span></button></div>`;
 }
 
@@ -1438,6 +1459,9 @@ document.addEventListener("click", async e => {
     if (a === "log-next") { logState.page += 1; loadLogs(); return; }
   }
 
+  /* 统计报表页工具条 */
+  if (e.target.closest('[data-action="stat-refresh"]')) { loadStats(); return; }
+
   /* 列表编辑器 */
   const listAdd = e.target.closest('[data-action="list-add"]');
   if (listAdd) {
@@ -1913,6 +1937,186 @@ function syncLogInput(el) {
   else loadLogs();
 }
 
+/* ================= 统计报表页 ================= */
+let statState = { resp:null };
+
+function renderStats() {
+  buildSidebar("stats");
+  $("#view").innerHTML = `<div class="view-inner wide">
+    <div class="page-head">
+      <h1>统计报表</h1>
+      <p>按解析日志库当前保留期内的全部记录聚合，<b>日志有多少就统计多少</b>，不设条数上限。统计窗口取决于「常规服务 → 日志」的保留时长与条数上限，超出保留期的日志被清理后即不再计入。平均耗时一律剔除超时记录（耗时 ≥ 查询超时阈值），超时单独计入「超时」。</p>
+    </div>
+    <div class="rules-toolbar">
+      <span class="spacer"></span>
+      <button class="btn btn-ghost small" data-action="stat-refresh">刷新</button>
+    </div>
+    <div id="stat-body"></div>
+  </div>`;
+  updateChrome();
+  loadStats();
+}
+
+async function loadStats() {
+  const box = $("#stat-body");
+  if (!box) return;
+  box.innerHTML = `<div class="table-wrap"><div class="empty">
+    <div class="big">统计中…</div><div class="sub">正在聚合库内全部记录</div></div></div>`;
+  try {
+    statState.resp = await api("GET", "/api/logs/stats");
+    renderStatBody();
+  } catch (e) {
+    box.innerHTML = `<div class="table-wrap"><div class="empty">
+      <div class="big">统计失败</div><div class="sub">${esc(e.message)}</div></div></div>`;
+  }
+}
+
+const statPct = (n, total) => total ? (n / total * 100).toFixed(1) + "%" : "—";
+const statMs = v => !v ? "0 ms" : (v >= 10 ? Math.round(v) + " ms" : v.toFixed(1) + " ms");
+function statDur(sec) {
+  if (!sec || sec < 1) return "不足 1 秒";
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return [d ? d + " 天" : "", h ? h + " 小时" : "", !d && m ? m + " 分" : ""].filter(Boolean).join(" ") || "不足 1 分";
+}
+/* 横向占比条：宽度按该维度的最大值归一，避免小项几乎不可见 */
+function statBar(count, max) {
+  const w = max > 0 ? Math.max(2, Math.round(count / max * 100)) : 0;
+  return `<span class="stat-bar"><i style="width:${w}%"></i></span>`;
+}
+function statCard(k, v, sub, small) {
+  return `<div class="stat-card"><div class="k">${esc(k)}</div>
+    <div class="v${small ? " small" : ""}">${v}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+}
+function statSection(title, desc, body) {
+  return `<section class="card" style="margin-bottom:16px">
+    <div class="card-head"><h2>${esc(title)}</h2>${desc ? `<p class="card-desc">${esc(desc)}</p>` : ""}</div>
+    <div class="card-body">${body}</div></section>`;
+}
+/* 通用聚合表：keyCell 负责渲染首列（徽章/文本），extraRow 为追加在表尾的额外行（可空） */
+function statGroupTable(rows, total, emptyText, keyCell, keyHead, extraRow) {
+  if (!rows.length && !extraRow) return `<div class="empty" style="padding:26px 0"><div class="sub">${esc(emptyText)}</div></div>`;
+  const max = rows.length ? Math.max(...rows.map(r => r.count)) : 0;
+  const tr = rows.map(r => `<tr>
+    <td>${keyCell(r.key)}</td>
+    <td class="mono">${r.count}</td>
+    <td class="mono">${statPct(r.count, total)}</td>
+    <td style="width:26%">${statBar(r.count, max)}</td>
+    <td class="mono">${statMs(r.avg_elapsed_ms)}</td>
+  </tr>`).join("") + (extraRow || "");
+  return `<table class="rules log-table"><thead><tr>
+    <th style="width:16%">${esc(keyHead)}</th><th style="width:11%">次数</th><th style="width:11%">占比</th>
+    <th style="width:26%">分布</th><th style="width:12%">平均耗时</th>
+  </tr></thead><tbody>${tr}</tbody></table>`;
+}
+
+function renderStatBody() {
+  const box = $("#stat-body"), r = statState.resp;
+  if (!box || !r) return;
+  const s = r.summary || {}, st = r.stats || {}, total = s.total || 0;
+
+  if (!total) {
+    box.innerHTML = `<div class="table-wrap"><div class="empty">
+      <div class="big">暂无统计数据</div>
+      <div class="sub">${st.enabled === false ? "解析日志记录已关闭，开启并产生查询后这里会有数据。"
+        : "产生查询后，这里会按来源、分流列表、域名等维度汇总；可在「常规服务 → 日志」调整保留策略。"}</div>
+    </div></div>`;
+    return;
+  }
+
+  /* 1. 概览 */
+  const win = s.first_ts ? `${logFmtTime(s.first_ts)} ~ ${logFmtTime(s.last_ts)}` : "—";
+  const timeoutCard = s.timeout_ms
+    ? statCard("超时", s.timeouts, `耗时 ≥ ${statMs(s.timeout_ms)} · 占 ${statPct(s.timeouts, total)}，不计入耗时平均`)
+    : statCard("超时", "—", "未配置查询超时，无法判定");
+  const overview = `<div class="stat-grid">
+    ${statCard("总查询数", total, `覆盖 ${statDur(s.last_ts - s.first_ts)}`)}
+    ${statCard("独立域名", s.domains, "库内出现过的不重复域名")}
+    ${statCard("平均耗时", statMs(s.avg_elapsed_ms), "已剔除超时记录")}
+    ${timeoutCard}
+    ${statCard("统计窗口", win, "首条 ~ 末条记录（本地时间）", true)}
+  </div>
+  <div class="count-note">库内累计写入 ${st.written ?? 0} 条
+    ${st.dropped ? ` · 队列溢出丢弃 ${st.dropped} 条` : ""}
+    ${st.queued ? ` · 待落库 ${st.queued} 条` : ""}
+    · 保留策略 ${statDur(st.retention_seconds)} / 上限 ${st.max_rows ?? "—"} 条</div>`;
+
+  /* 2. 来源分布（表尾追加「超时」行：跨来源统计，不参与上方各行平均耗时） */
+  const actionRows = s.by_action || [];
+  const timeoutRow = s.timeouts ? `<tr>
+    <td><span class="src timeout">超时</span></td>
+    <td class="mono">${s.timeouts}</td>
+    <td class="mono" title="超时记录跨来源统计，与上表各行重叠，故不显示占比">—</td>
+    <td style="width:26%"></td>
+    <td class="mono">${statMs(s.timeout_avg_elapsed_ms)}</td>
+  </tr>` : "";
+  const actionHTML = statGroupTable(actionRows, total, "无来源数据",
+    k => `<span class="src ${esc(k)}">${esc(LOG_SRC_LABEL[k] || k)}</span>`, "来源", timeoutRow);
+
+  /* 3. 分流列表命中明细 */
+  const lists = s.by_list || [];
+  let listHTML;
+  if (!lists.length) {
+    listHTML = `<div class="empty" style="padding:26px 0"><div class="sub">保留期内没有命中任何分流列表的记录</div></div>`;
+  } else {
+    const max = Math.max(...lists.map(l => l.count));
+    const tr = lists.map(l => `<tr>
+      <td><span class="log-list-name">${esc(l.name)}</span></td>
+      <td class="mono">${l.count}</td>
+      <td class="mono">${statPct(l.count, total)}</td>
+      <td style="width:22%">${statBar(l.count, max)}</td>
+      <td class="mono">${statMs(l.avg_elapsed_ms)}</td>
+      <td><div class="stat-actions">${(l.actions || []).map(a =>
+        `<span class="src ${esc(a.key)}">${esc(LOG_SRC_LABEL[a.key] || a.key)} ${a.count}</span>`).join("")}</div></td>
+    </tr>`).join("");
+    listHTML = `<table class="rules log-table"><thead><tr>
+      <th style="width:14%">分流列表</th><th style="width:11%">命中次数</th><th style="width:11%">占比</th>
+      <th style="width:22%">分布</th><th style="width:12%">平均耗时</th><th>来源构成</th>
+    </tr></thead><tbody>${tr}</tbody></table>`;
+  }
+
+  /* 4. Top 域名 */
+  const tops = s.top_domains || [];
+  const topHTML = !tops.length ? `<div class="empty" style="padding:26px 0"><div class="sub">暂无数据</div></div>`
+    : (() => {
+      const max = Math.max(...tops.map(d => d.count));
+      const tr = tops.map(d => `<tr>
+        <td class="mono">${rv(d.domain)}</td>
+        <td class="mono">${d.count}</td>
+        <td class="mono">${statPct(d.count, total)}</td>
+        <td style="width:22%">${statBar(d.count, max)}</td>
+        <td class="mono">${statMs(d.avg_elapsed_ms)}</td>
+        <td><span class="src ${esc(d.action)}">${esc(LOG_SRC_LABEL[d.action] || d.action || "—")}</span></td>
+        <td>${d.list_name ? `<span class="log-list-name">${esc(d.list_name)}</span>` : '<span style="color:var(--text-3)">—</span>'}</td>
+      </tr>`).join("");
+      return `<table class="rules log-table"><thead><tr>
+        <th style="width:22%">域名</th><th style="width:10%">次数</th><th style="width:10%">占比</th>
+        <th style="width:22%">分布</th><th style="width:11%">平均耗时</th><th style="width:11%">主导来源</th><th>命中列表</th>
+      </tr></thead><tbody>${tr}</tbody></table>`;
+    })();
+
+  /* 5. 按天趋势 */
+  const days = s.by_day || [];
+  const dayMax = Math.max(1, ...days.map(d => d.count));
+  const dayHTML = days.length ? `<div class="day-chart">${days.map(d => `<div class="day-col" title="${esc(d.day)}：${d.count} 条">
+      <span class="n">${d.count}</span>
+      <i class="bar" style="height:${Math.max(2, Math.round(d.count / dayMax * 100))}%"></i>
+      <span class="lbl">${esc(d.day.slice(5))}</span>
+    </div>`).join("")}</div>` : `<div class="empty" style="padding:26px 0"><div class="sub">暂无数据</div></div>`;
+
+  /* 6. 结果与类型分布 */
+  const rcodeHTML = statGroupTable(s.by_rcode || [], total, "无数据",
+    k => `<span class="log-rcode ${logRcodeClass(k)}">${esc(k || "—")}</span>`, "结果");
+  const qtypeHTML = statGroupTable(s.by_qtype || [], total, "无数据",
+    k => `<span class="qtype ${esc(k)}">${esc(k)}</span>`, "类型");
+
+  box.innerHTML = overview
+    + statSection("来源分布", "每次查询最终走的路径。分流=命中域名分流列表；偏好拦截=被 A/AAAA 偏好策略置空。表尾「超时」行跨来源统计（耗时达超时阈值），已从各行平均耗时中剔除。", actionHTML)
+    + statSection("分流列表命中明细", "按分流列表聚合命中次数，来源构成显示该列表内的路径占比；平均耗时已剔除超时记录。", listHTML)
+    + statSection("Top 域名", "保留期内查询量最高的域名及其主导来源、命中的分流列表；平均耗时已剔除超时记录。", topHTML)
+    + statSection("按天趋势", "按本地自然日统计，缺口记 0。", dayHTML)
+    + statSection("结果与类型分布", "rcode 应答码与查询记录类型（qtype）分布；平均耗时已剔除超时记录。", rcodeHTML + `<div style="height:14px"></div>` + qtypeHTML);
+}
+
 /* ================= 路由渲染入口 ================= */
 function renderRoute() {
   const route = currentRoute();
@@ -1922,6 +2126,8 @@ function renderRoute() {
     renderOverrides();
   } else if (route.type === "logs") {
     renderQueryLogs();
+  } else if (route.type === "stats") {
+    renderStats();
   } else if (route.type === "all") {
     buildSidebar("all");
     renderSettings(SECTIONS.map(s=>s.id), true);

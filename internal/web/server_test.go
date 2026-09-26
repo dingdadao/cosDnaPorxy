@@ -286,3 +286,85 @@ func TestQueryLogsAPI(t *testing.T) {
 		t.Errorf("非法时间应400: code=%d", rec.Code)
 	}
 }
+
+func TestQueryLogStatsAPI(t *testing.T) {
+	s := newTestAPIServer(t)
+
+	// 未装配日志库 → 500
+	if rec := doJSON(s, "GET", "/api/logs/stats", ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("日志库不可用应返回500，实际 %d", rec.Code)
+	}
+
+	qlog, err := querylog.Open(filepath.Join(t.TempDir(), "query_log.db"),
+		utils.NewEnhancedLogger("error", "test", false), querylog.Options{Enabled: true})
+	if err != nil {
+		t.Fatalf("打开解析日志库失败: %v", err)
+	}
+	t.Cleanup(func() { qlog.Close() })
+	s.queryLog = qlog
+
+	// 非法时间 → 400（在装配日志库之后校验，否则先被 500 拦截）
+	if rec := doJSON(s, "GET", "/api/logs/stats?start=not-a-time", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法时间应400，实际 %d", rec.Code)
+	}
+
+	qlog.Append(querylog.Entry{Domain: "a.example.com", QType: "A", Action: querylog.ActionSplit,
+		ListName: "国外", Rcode: "NOERROR", ElapsedMS: 10})
+	qlog.Append(querylog.Entry{Domain: "b.example.com", QType: "A", Action: querylog.ActionUpstream,
+		Rcode: "NOERROR", ElapsedMS: 30})
+
+	type statsResp struct {
+		Summary struct {
+			Total    int64 `json:"total"`
+			Domains  int64 `json:"domains"`
+			ByAction []struct {
+				Key   string `json:"key"`
+				Count int64  `json:"count"`
+			} `json:"by_action"`
+			ByList []struct {
+				Name  string `json:"name"`
+				Count int64  `json:"count"`
+			} `json:"by_list"`
+			TopDomains []struct {
+				Domain string `json:"domain"`
+			} `json:"top_domains"`
+		} `json:"summary"`
+		Stats map[string]interface{} `json:"stats"`
+	}
+
+	// 等待后台批量落库
+	var got statsResp
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec := doJSON(s, "GET", "/api/logs/stats", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("统计失败: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		if got.Summary.Total == 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got.Summary.Total != 2 || got.Summary.Domains != 2 {
+		t.Errorf("汇总错误: total=%d domains=%d", got.Summary.Total, got.Summary.Domains)
+	}
+	if len(got.Summary.ByAction) != 2 || len(got.Summary.ByList) != 1 || got.Summary.ByList[0].Name != "国外" {
+		t.Errorf("分布错误: by_action=%+v by_list=%+v", got.Summary.ByAction, got.Summary.ByList)
+	}
+	if len(got.Summary.TopDomains) != 2 {
+		t.Errorf("Top 域名条数错误: %d", len(got.Summary.TopDomains))
+	}
+	if got.Stats["enabled"] != true {
+		t.Errorf("stats 应含 enabled=true，实际 %v", got.Stats)
+	}
+
+	// top 参数限制 Top 域名条数
+	rec := doJSON(s, "GET", "/api/logs/stats?top=1", "")
+	var one statsResp
+	json.Unmarshal(rec.Body.Bytes(), &one)
+	if rec.Code != http.StatusOK || len(one.Summary.TopDomains) != 1 {
+		t.Errorf("top=1 应只返回 1 条: code=%d n=%d", rec.Code, len(one.Summary.TopDomains))
+	}
+}

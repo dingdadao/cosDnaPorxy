@@ -206,3 +206,195 @@ func TestNormalizeOptionsDefaults(t *testing.T) {
 		t.Errorf("缺省值应为 %v/%d，实际 %v/%d", DefaultRetention, DefaultMaxRows, opt.Retention, opt.MaxRows)
 	}
 }
+
+// summaryEntries 跨两个本地自然日的样本：来源、列表、类型、结果均有区分度
+func summaryEntries() ([]Entry, int64, int64, string, string) {
+	today := time.Now()
+	// 取本地正午构造，避免日界与夏令时导致的抖动
+	d0 := time.Date(today.Year(), today.Month(), today.Day(), 12, 0, 0, 0, time.Local).AddDate(0, 0, -1).Unix()
+	d1 := d0 + 86400
+	day0 := time.Unix(d0, 0).In(time.Local).Format("2006-01-02")
+	day1 := time.Unix(d1, 0).In(time.Local).Format("2006-01-02")
+	return []Entry{
+		{Time: d0, Domain: "a.example.com", QType: "A", Action: ActionSplit, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 10},
+		{Time: d0 + 60, Domain: "a.example.com", QType: "A", Action: ActionFiltered, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 20},
+		{Time: d1, Domain: "b.example.com", QType: "AAAA", Action: ActionSplit, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 30},
+		{Time: d1 + 60, Domain: "b.example.com", QType: "A", Action: ActionCache, Rcode: "NOERROR", ElapsedMS: 1},
+		{Time: d1 + 120, Domain: "c.example.com", QType: "A", Action: ActionUpstream, Rcode: "NXDOMAIN", ElapsedMS: 40},
+	}, d0, d1 + 120, day0, day1
+}
+
+func TestSummary(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	entries, firstTS, lastTS, day0, day1 := summaryEntries()
+	for _, e := range entries {
+		s.Append(e)
+	}
+	waitWritten(t, s, int64(len(entries)))
+
+	sum, err := s.Summary(Filter{}, 0, 0)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if sum.Total != 5 || sum.Domains != 3 {
+		t.Fatalf("汇总错误: total=%d domains=%d", sum.Total, sum.Domains)
+	}
+	if sum.FirstTS != firstTS || sum.LastTS != lastTS {
+		t.Errorf("统计窗口错误: %d~%d，期望 %d~%d", sum.FirstTS, sum.LastTS, firstTS, lastTS)
+	}
+	// 平均耗时 (10+20+30+1+40)/5 = 20.2
+	if sum.AvgElapsedMS < 20.1 || sum.AvgElapsedMS > 20.3 {
+		t.Errorf("平均耗时应约 20.2，实际 %v", sum.AvgElapsedMS)
+	}
+
+	// 来源分布：按次数降序
+	if len(sum.ByAction) != 4 || sum.ByAction[0].Key != ActionSplit || sum.ByAction[0].Count != 2 {
+		t.Errorf("来源分布错误: %+v", sum.ByAction)
+	}
+
+	// 分流列表命中：国外 3 次，来源构成 split 2 + filtered 1
+	if len(sum.ByList) != 1 || sum.ByList[0].Name != "国外" || sum.ByList[0].Count != 3 {
+		t.Fatalf("分流列表命中错误: %+v", sum.ByList)
+	}
+	if acts := sum.ByList[0].Actions; len(acts) != 2 ||
+		acts[0].Key != ActionSplit || acts[0].Count != 2 || acts[0].AvgElapsedMS != 20 ||
+		acts[1].Key != ActionFiltered || acts[1].Count != 1 {
+		t.Errorf("列表来源构成错误: %+v", acts)
+	}
+
+	// Top 域名：a/b 各 2 次（并列按域名升序 → a 在前），c 1 次且无列表
+	if len(sum.TopDomains) != 3 {
+		t.Fatalf("Top 域名条数错误: %d", len(sum.TopDomains))
+	}
+	if sum.TopDomains[0].Domain != "a.example.com" || sum.TopDomains[0].Count != 2 || sum.TopDomains[0].ListName != "国外" {
+		t.Errorf("Top 域名首条错误: %+v", sum.TopDomains[0])
+	}
+	if last := sum.TopDomains[2]; last.Domain != "c.example.com" || last.Action != ActionUpstream || last.ListName != "" {
+		t.Errorf("Top 域名末条错误: %+v", last)
+	}
+
+	// 按天：本地自然日两天，缺口补零
+	if len(sum.ByDay) != 2 || sum.ByDay[0].Day != day0 || sum.ByDay[1].Day != day1 ||
+		sum.ByDay[0].Count != 2 || sum.ByDay[1].Count != 3 {
+		t.Errorf("按天趋势错误: %+v", sum.ByDay)
+	}
+
+	// 结果与类型分布
+	if len(sum.ByRcode) != 2 || sum.ByRcode[0].Key != "NOERROR" || sum.ByRcode[0].Count != 4 {
+		t.Errorf("结果分布错误: %+v", sum.ByRcode)
+	}
+	if len(sum.ByQType) != 2 || sum.ByQType[0].Key != "A" || sum.ByQType[0].Count != 4 {
+		t.Errorf("类型分布错误: %+v", sum.ByQType)
+	}
+}
+
+func TestSummaryWithFilterAndTopLimit(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	entries, _, _, _, _ := summaryEntries()
+	for _, e := range entries {
+		s.Append(e)
+	}
+	waitWritten(t, s, int64(len(entries)))
+
+	// 只看域名分流：total/列表命中/来源分布都应收窄
+	sum, err := s.Summary(Filter{Action: ActionSplit}, 0, 0)
+	if err != nil {
+		t.Fatalf("按来源统计失败: %v", err)
+	}
+	if sum.Total != 2 || len(sum.ByAction) != 1 || sum.ByAction[0].Key != ActionSplit {
+		t.Errorf("按来源过滤错误: total=%d by_action=%+v", sum.Total, sum.ByAction)
+	}
+	if len(sum.ByList) != 1 || sum.ByList[0].Count != 2 {
+		t.Errorf("按来源过滤后列表命中错误: %+v", sum.ByList)
+	}
+
+	// Top 域名条数受 topN 限制
+	limited, err := s.Summary(Filter{}, 1, 0)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if len(limited.TopDomains) != 1 {
+		t.Errorf("topN=1 应只返回 1 条，实际 %d", len(limited.TopDomains))
+	}
+}
+
+func TestSummaryEmpty(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	sum, err := s.Summary(Filter{}, 0, 0)
+	if err != nil {
+		t.Fatalf("空库统计不应报错: %v", err)
+	}
+	if sum.Total != 0 || sum.FirstTS != 0 || sum.LastTS != 0 || len(sum.ByDay) != 0 || len(sum.ByList) != 0 {
+		t.Errorf("空库统计应全为空，实际 %+v", sum)
+	}
+}
+
+// TestSummaryExcludesTimeout 超时记录（elapsed_ms >= 阈值）不计入任何平均耗时，单独汇总
+func TestSummaryExcludesTimeout(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	now := time.Now().Unix()
+	entries := []Entry{
+		// 同列表下一条正常、一条超时，用于校验列表平均耗时只取正常那条
+		{Time: now - 90, Domain: "fast.example.com", QType: "A", Action: ActionSplit, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 40},
+		{Time: now - 80, Domain: "fast.example.com", QType: "A", Action: ActionSplit, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 60},
+		{Time: now - 70, Domain: "slow.example.com", QType: "HTTPS", Action: ActionSplit, ListName: "国外", Rcode: "NOERROR", ElapsedMS: 2000},
+		{Time: now - 60, Domain: "slow.example.com", QType: "PTR", Action: ActionError, Rcode: "SERVFAIL", ElapsedMS: 4000},
+	}
+	for _, e := range entries {
+		s.Append(e)
+	}
+	waitWritten(t, s, int64(len(entries)))
+
+	sum, err := s.Summary(Filter{}, 0, 1500)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if sum.TimeoutMS != 1500 {
+		t.Errorf("阈值应为 1500，实际 %d", sum.TimeoutMS)
+	}
+	if sum.Timeouts != 2 || sum.TimeoutAvgElapsedMS != 3000 {
+		t.Errorf("超时应为 2 条、平均 3000ms，实际 n=%d avg=%v", sum.Timeouts, sum.TimeoutAvgElapsedMS)
+	}
+	// 全量平均 (40+60+2000+4000)/4 = 1525 → 剔除超时后 (40+60)/2 = 50
+	if sum.Total != 4 || sum.AvgElapsedMS != 50 {
+		t.Errorf("平均耗时应剔除超时并为 50，实际 total=%d avg=%v", sum.Total, sum.AvgElapsedMS)
+	}
+	// 来源分布：次数仍为全量，平均耗时剔除超时后仅剩 0 条 → 0
+	for _, g := range sum.ByAction {
+		if g.Key == ActionSplit && (g.Count != 3 || g.AvgElapsedMS != 50) {
+			t.Errorf("split 次数应为全量 3、平均应剔超时为 50，实际 %+v", g)
+		}
+		if g.Key == ActionError && (g.Count != 1 || g.AvgElapsedMS != 0) {
+			t.Errorf("error 次数应为全量 1、平均应剔超时后为 0，实际 %+v", g)
+		}
+	}
+	// 分流列表：命中 3 次，平均耗时只取两条正常记录的 50ms
+	if len(sum.ByList) != 1 || sum.ByList[0].Count != 3 || sum.ByList[0].AvgElapsedMS != 50 {
+		t.Errorf("列表命中应为 3 次、平均 50ms，实际 %+v", sum.ByList)
+	}
+	// Top 域名：按次数降序（fast 2 次在前），慢域名只保留其正常记录的耗时
+	for _, d := range sum.TopDomains {
+		if d.Domain == "slow.example.com" && d.Count != 2 {
+			t.Errorf("slow 域名次数应为全量 2，实际 %+v", d)
+		}
+		if d.Domain == "fast.example.com" && d.AvgElapsedMS != 50 {
+			t.Errorf("fast 域名平均应为 50ms，实际 %+v", d)
+		}
+	}
+}
+
+// TestSummaryNoTimeoutThreshold 校验不判定超时时（阈值 0）平均耗时保持全量口径
+func TestSummaryNoTimeoutThreshold(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	s.Append(Entry{Time: time.Now().Unix(), Domain: "x.example.com", QType: "A", Action: ActionUpstream,
+		Rcode: "NOERROR", ElapsedMS: 4000})
+	waitWritten(t, s, 1)
+
+	sum, err := s.Summary(Filter{}, 0, 0)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if sum.TimeoutMS != 0 || sum.Timeouts != 0 || sum.AvgElapsedMS != 4000 {
+		t.Errorf("阈值 0 时不应判定超时且平均取全量，实际 %+v", sum)
+	}
+}

@@ -55,6 +55,7 @@ func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler fun
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	mux.HandleFunc("POST /api/restart", s.handleRestart)
 	mux.HandleFunc("GET /api/logs", s.handleQueryLogs)
+	mux.HandleFunc("GET /api/logs/stats", s.handleQueryLogStats)
 	mux.HandleFunc("GET /api/overrides", s.handleListOverrides)
 	mux.HandleFunc("POST /api/overrides", s.handleAddOverride)
 	mux.HandleFunc("PUT /api/overrides/{id}", s.handleUpdateOverride)
@@ -224,6 +225,54 @@ func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 		"offset": f.Offset,
 		"stats":  s.queryLog.Stats(),
 	})
+}
+
+// handleQueryLogStats 解析日志聚合统计（窗口默认保留期内全部记录，不设条数上限）
+// 参数：start/end（Unix 秒或本地时间）、top（Top 域名条数，默认 20，上限 100）
+func (s *Server) handleQueryLogStats(w http.ResponseWriter, r *http.Request) {
+	if s.queryLog == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("解析日志库不可用"))
+		return
+	}
+
+	q := r.URL.Query()
+	var f querylog.Filter
+	var err error
+	if f.Start, err = parseTimeParam(q.Get("start")); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("start 参数无效: %w", err))
+		return
+	}
+	if f.End, err = parseTimeParam(q.Get("end")); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("end 参数无效: %w", err))
+		return
+	}
+
+	summary, err := s.queryLog.Summary(f, parsePositiveInt(q.Get("top"), 0), s.resolveTimeoutMS())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"summary": summary,
+		"stats":   s.queryLog.Stats(),
+	})
+}
+
+// resolveTimeoutMS 统计页「超时」判定阈值（毫秒）：取配置中较宽松的查询超时
+// （含现代协议），读不到或未配置时返回 0 表示不判定
+func (s *Server) resolveTimeoutMS() int64 {
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		return 0
+	}
+	d := cfg.Timeout
+	if cfg.ModernTimeout > d {
+		d = cfg.ModernTimeout
+	}
+	if d <= 0 {
+		return 0
+	}
+	return d.Milliseconds()
 }
 
 // parseTimeParam 解析时间参数：空串为 0（不限）；支持 Unix 秒与常见时间写法
