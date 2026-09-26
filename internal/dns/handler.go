@@ -235,6 +235,21 @@ func (h *RefactoredHandler) GetOverrideMatcher() *OverrideMatcher {
 	return h.overrideMatcher
 }
 
+// RefreshSplitList 按索引强制下载并重新加载该分流列表的域名文件，返回加载后的规则条数
+// （供 Web 管理端「立即更新」按钮调用；下载或加载失败时保留原有规则）
+func (h *RefactoredHandler) RefreshSplitList(i int) (int, error) {
+	if h.fileLoader == nil {
+		return 0, fmt.Errorf("文件加载器不可用")
+	}
+	if err := h.fileLoader.ForceDownloadAndReloadSplitList(i); err != nil {
+		return 0, err
+	}
+	if m := h.matcherHandler.MatcherFor(i); m != nil {
+		return m.RuleCount(), nil
+	}
+	return 0, nil
+}
+
 // ApplyConfig 热更新配置：立即生效可热切换部分，返回是否需要重启生效
 func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 	old := h.getConfig()

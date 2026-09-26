@@ -130,3 +130,140 @@ payload:
   - "DOMAIN-SUFFIX,877771.xyz,default_dns"
   - "DOMAIN-SUFFIX,meituan.com,default_dns"
   - "DOMAIN-SUFFIX,mzstatic.com,default_dns"
+
+  # ===========================================
+  # 国内 CDN / 调度 / 网络探测（补充）
+  # 说明：blackmatrix7 的 China 清单不含这些 CDN 基础设施域名，
+  # 会被「国外」列表的 invert 命中而误走境外 DNS（8.8.4.4/8.8.8.8），
+  # 导致解析卡顿（实测该链路 42%~58% 的查询耗时 >=2s）。
+  # ===========================================
+
+  # 腾讯：游戏 CDN 调度 / 网络探测（王者荣耀等）
+  - "DOMAIN-SUFFIX,qrstuvwxyzab.com,default_dns"
+  - "DOMAIN-SUFFIX,dcloudstc.com,default_dns"
+  - "DOMAIN-SUFFIX,tencent-cloud.net,default_dns"
+  - "DOMAIN-SUFFIX,qcloudimg.com,default_dns"
+
+  # 七牛 CDN
+  - "DOMAIN-SUFFIX,qnqcdn.net,default_dns"
+  - "DOMAIN-SUFFIX,qnqcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,qiniucdn.com,default_dns"
+  - "DOMAIN-SUFFIX,qiniu.com,default_dns"
+  - "DOMAIN-SUFFIX,queniukw.com,default_dns"
+  - "DOMAIN-SUFFIX,queniurc.com,default_dns"
+  - "DOMAIN-SUFFIX,qbox.me,default_dns"
+
+  # 字节跳动 / 抖音 CDN
+  - "DOMAIN-SUFFIX,huoshanlive.com,default_dns"
+  - "DOMAIN-SUFFIX,z1cdn.com,default_dns"
+  - "DOMAIN-SUFFIX,ndcpp.com,default_dns"
+  - "DOMAIN-SUFFIX,volccdn.com,default_dns"
+  - "DOMAIN-SUFFIX,zjcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,ibytedtos.com,default_dns"
+  - "DOMAIN-SUFFIX,pstatp.com,default_dns"
+  - "DOMAIN-SUFFIX,snssdk.com,default_dns"
+  - "DOMAIN-SUFFIX,bytednsdoc.com,default_dns"
+  - "DOMAIN-SUFFIX,bytedance.com,default_dns"
+
+  # 阿里 CDN
+  - "DOMAIN-SUFFIX,alicdn.com,default_dns"
+  - "DOMAIN-SUFFIX,myalicdn.com,default_dns"
+  - "DOMAIN-SUFFIX,alikunlun.com,default_dns"
+  - "DOMAIN-SUFFIX,aliyuncs.com,default_dns"
+  - "DOMAIN-SUFFIX,tbcache.com,default_dns"
+
+  # 百度 CDN
+  - "DOMAIN-SUFFIX,bdstatic.com,default_dns"
+  - "DOMAIN-SUFFIX,baidustatic.com,default_dns"
+  - "DOMAIN-SUFFIX,bcebos.com,default_dns"
+
+  # 网易 / B站
+  - "DOMAIN-SUFFIX,126.net,default_dns"
+  - "DOMAIN-SUFFIX,127.net,default_dns"
+  - "DOMAIN-SUFFIX,hdslb.com,default_dns"
+  - "DOMAIN-SUFFIX,bilivideo.com,default_dns"
+  - "DOMAIN-SUFFIX,acgvideo.com,default_dns"
+
+  # 快手
+  - "DOMAIN-SUFFIX,kwimgs.com,default_dns"
+  - "DOMAIN-SUFFIX,yximgs.com,default_dns"
+  - "DOMAIN-SUFFIX,ksapisrv.com,default_dns"
+  - "DOMAIN-SUFFIX,kwaicdn.com,default_dns"
+
+  # 金山云 / 网宿
+  - "DOMAIN-SUFFIX,ksyun.com,default_dns"
+  - "DOMAIN-SUFFIX,ksyuncs.com,default_dns"
+  - "DOMAIN-SUFFIX,wscdns.com,default_dns"
+
+  # 京东 / 美团 / 小米
+  - "DOMAIN-SUFFIX,jdcdn.com,default_dns"
+  - "DOMAIN-SUFFIX,360buyimg.com,default_dns"
+  - "DOMAIN-SUFFIX,sankuai.com,default_dns"
+  - "DOMAIN-SUFFIX,meituan.net,default_dns"
+  - "DOMAIN-SUFFIX,miui.com,default_dns"
+  - "DOMAIN-SUFFIX,mifile.cn,default_dns"
+
+  # 华为云
+  - "DOMAIN-SUFFIX,huaweicloud.com,default_dns"
+  - "DOMAIN-SUFFIX,hwcdn.net,default_dns"
+
+  # 优酷 / 爱奇艺
+  - "DOMAIN-SUFFIX,youku.com,default_dns"
+  - "DOMAIN-SUFFIX,qiyi.com,default_dns"
+  - "DOMAIN-SUFFIX,pps.tv,default_dns"
+
+  # ===========================================
+  # 国内常用软件 / 家电 IoT（第二批）
+  # 依据：近 24h 生产日志中「走国外列表 + 耗时 >=1.5s + 未被 China 清单收录」
+  # ===========================================
+
+  # 美的 IoT（本批慢查询量最大：midea.com 1747 次、smartmidea.net 1401 次）
+  - "DOMAIN-SUFFIX,midea.com,default_dns"
+  - "DOMAIN-SUFFIX,smartmidea.net,default_dns"
+
+  # 字节系补充（China 清单只收了 feishu.net，cn 域缺失）
+  - "DOMAIN-SUFFIX,doubao.com,default_dns"
+  - "DOMAIN-SUFFIX,feishu.cn,default_dns"
+  - "DOMAIN-SUFFIX,ecombdimg.com,default_dns"
+  - "DOMAIN-SUFFIX,bytedns3.com,default_dns"
+  - "DOMAIN-SUFFIX,cdnbuild.net,default_dns"
+  - "DOMAIN-SUFFIX,zzcdnx.com,default_dns"
+  - "DOMAIN-SUFFIX,volcfcdndvs1.com,default_dns"
+  - "DOMAIN-SUFFIX,volcgtm.com,default_dns"
+
+  # 七牛 CDN（同一批遗漏的兄弟域名）
+  - "DOMAIN-SUFFIX,queniubg.com,default_dns"
+  - "DOMAIN-SUFFIX,queniubh.com,default_dns"
+  - "DOMAIN-SUFFIX,queniuck.com,default_dns"
+  - "DOMAIN-SUFFIX,queniuuf.com,default_dns"
+  - "DOMAIN-SUFFIX,queniuum.com,default_dns"
+  - "DOMAIN-SUFFIX,queniuso.com,default_dns"
+  - "DOMAIN-SUFFIX,queniusy.com,default_dns"
+  - "DOMAIN-SUFFIX,queniuyk.com,default_dns"
+
+  # 快手 / 火山直播
+  - "DOMAIN-SUFFIX,ks-live.com,default_dns"
+  - "DOMAIN-SUFFIX,ihuoshanlive.com,default_dns"
+
+  # 云厂商 CDN / GSLB
+  - "DOMAIN-SUFFIX,cdnhwc1.com,default_dns"
+  - "DOMAIN-SUFFIX,dayugslb.com,default_dns"
+  - "DOMAIN-SUFFIX,bsgslb.com,default_dns"
+  - "DOMAIN-SUFFIX,wswebcdn.com,default_dns"
+
+  # 其他国内
+  - "DOMAIN-SUFFIX,pow7.com,default_dns"
+  - "DOMAIN-SUFFIX,msn.cn,default_dns"
+  - "DOMAIN-SUFFIX,wghaos.com,default_dns"
+  - "DOMAIN-SUFFIX,znds.com,default_dns"
+
+  # ===========================================
+  # 归属待定，按用户要求一并走定向（第三批）
+  # ===========================================
+  - "DOMAIN-SUFFIX,tlivesdk.com,default_dns"
+  - "DOMAIN-SUFFIX,tlivesource.com,default_dns"
+  - "DOMAIN-SUFFIX,doubleclick-cn.net,default_dns"
+  - "DOMAIN-SUFFIX,atianqi.com,default_dns"
+  - "DOMAIN-SUFFIX,ydycdn.com,default_dns"
+  - "DOMAIN-SUFFIX,effirst.com,default_dns"
+  - "DOMAIN-SUFFIX,dailygn.com,default_dns"

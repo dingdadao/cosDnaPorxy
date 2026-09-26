@@ -136,6 +136,40 @@ func TestRestartAPI(t *testing.T) {
 	}
 }
 
+func TestRefreshSplitListAPI(t *testing.T) {
+	s := newTestAPIServer(t)
+
+	// 非法序号 → 400
+	if rec := doJSON(s, "POST", "/api/lists/abc/refresh", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("非法序号应400: code=%d", rec.Code)
+	}
+	// 越界序号 → 400
+	if rec := doJSON(s, "POST", "/api/lists/99/refresh", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("越界序号应400: code=%d", rec.Code)
+	}
+
+	// 默认配置第 0 条列表已配置 URL，但 nil handler → 500
+	if rec := doJSON(s, "POST", "/api/lists/0/refresh", ""); rec.Code != http.StatusInternalServerError {
+		t.Errorf("nil handler应500: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 清空 URL 后 → 400（URL 校验先于 handler 调用）
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if len(cfg.SplitLists) == 0 {
+		t.Fatal("默认配置应含分流列表")
+	}
+	cfg.SplitLists[0].DomainURL = ""
+	if err := s.store.SaveConfig(cfg); err != nil {
+		t.Fatalf("保存配置失败: %v", err)
+	}
+	if rec := doJSON(s, "POST", "/api/lists/0/refresh", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("未配置URL应400: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestOverridesAPI(t *testing.T) {
 	s := newTestAPIServer(t)
 

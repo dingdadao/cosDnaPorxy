@@ -54,6 +54,7 @@ func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler fun
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	mux.HandleFunc("POST /api/restart", s.handleRestart)
+	mux.HandleFunc("POST /api/lists/{index}/refresh", s.handleRefreshSplitList)
 	mux.HandleFunc("GET /api/logs", s.handleQueryLogs)
 	mux.HandleFunc("GET /api/logs/stats", s.handleQueryLogStats)
 	mux.HandleFunc("GET /api/overrides", s.handleListOverrides)
@@ -184,6 +185,56 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		"process_restart":  out.ProcessRestart,
 		"web_addr_changed": out.WebAddrChanged,
 		"web_addr":         out.WebAddr,
+	})
+}
+
+// handleRefreshSplitList 手动更新单条分流列表：按已保存的 domain_url 重新下载并热加载规则
+// 路径参数 index 为分流列表序号（与 Web 端数组顺序一致）
+func (s *Server) handleRefreshSplitList(w http.ResponseWriter, r *http.Request) {
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || idx < 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("分流列表序号无效"))
+		return
+	}
+
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if idx >= len(cfg.SplitLists) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("分流列表不存在: index=%d", idx))
+		return
+	}
+	list := cfg.SplitLists[idx]
+	if list.DomainURL == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("列表 %q 未配置域名列表 URL，无法手动更新", list.Name))
+		return
+	}
+
+	h := s.getHandler()
+	if h == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("DNS 处理器不可用"))
+		return
+	}
+
+	count, err := h.RefreshSplitList(idx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.logger.Info("🔄 [Web管理端手动更新分流列表] ", map[string]interface{}{
+		"rule":  "WEB_SPLIT_LIST_REFRESHED",
+		"list":  list.Name,
+		"url":   list.DomainURL,
+		"rules": count,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":    true,
+		"list":  list.Name,
+		"url":   list.DomainURL,
+		"rules": count,
 	})
 }
 

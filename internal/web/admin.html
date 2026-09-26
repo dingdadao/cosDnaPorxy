@@ -784,6 +784,16 @@ function splitListEditorHTML(items) {
       </div>
       <div class="sl-opt">
         <div class="txt">
+          <span>立即更新域名列表</span>
+          <small>${!l.domain_url ? "未配置域名列表 URL，无法手动更新"
+            : dirty ? "有未保存的修改，请先保存配置再更新"
+            : "按上面的 URL 重新下载并热加载规则，失败时保留现有规则"}</small>
+        </div>
+        <button type="button" class="btn btn-ghost small" data-action="sl-refresh" data-sl-idx="${i}"
+          ${(!l.domain_url || dirty) ? "disabled" : ""} aria-label="立即更新该列表的域名数据">立即更新</button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
           <span>取反匹配（排除清单）</span>
           <small>开启后，域名「不在」上面文件/URL 的清单里时才命中本列表；清单为空时本列表不参与匹配</small>
         </div>
@@ -1380,6 +1390,21 @@ function syncSplitListInput(el) {
   }
   updateChrome();
 }
+/* 手动更新单条分流列表：按已保存的 URL 重新下载并热加载规则，失败时保留现有规则 */
+async function refreshSplitList(i, btn) {
+  const name = String((CFG.split_lists?.[i] || {}).name || "").trim() || ("#" + (i + 1));
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "更新中…"; }
+  try {
+    const r = await api("POST", `/api/lists/${i}/refresh`);
+    toast(`「${r.list || name}」已更新，共 ${r.rules ?? 0} 条规则`, "ok");
+  } catch (err) {
+    toast(`「${name}」更新失败：${err.message}`, "err");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
+}
+
 /* 分流列表脏标记：与基线中同身份（名称/文件/URL）的那条比对，调整顺序不误报 */
 function splitListDirty(l) {
   const o = (BASELINE.split_lists || []).find(b =>
@@ -1480,6 +1505,11 @@ document.addEventListener("click", async e => {
   }
 
   /* 分流列表编辑器 */
+  const slRefresh = e.target.closest('[data-action="sl-refresh"]');
+  if (slRefresh) {
+    refreshSplitList(Number(slRefresh.dataset.slIdx), slRefresh);
+    return;
+  }
   const slDnsAdd = e.target.closest('[data-action="sldns-add"]');
   if (slDnsAdd) {
     const item = CFG.split_lists[Number(slDnsAdd.dataset.sldnsList)];
