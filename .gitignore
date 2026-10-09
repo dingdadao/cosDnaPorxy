@@ -97,3 +97,9 @@ fullchain.pem
 privkey.pem
 build/dnsproxy
 /scripts/shell/updatecartv2.1.sh
+
+# 编译产物（go build 默认输出名，勿入库）
+/main
+
+# AI 编辑器工作目录（本地设计文档，勿入库）
+.trae/
