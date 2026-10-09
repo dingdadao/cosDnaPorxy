@@ -81,7 +81,7 @@ func TestFilterAAAA(t *testing.T) {
 			req.RecursionDesired = true
 			w := &captureWriter{}
 
-			if got := h.filterAAAA(w, req, c.domain, c.qtype); got != c.wantFilter {
+			if got := h.filterAAAA(w, req, c.domain, c.qtype, "-"); got != c.wantFilter {
 				t.Fatalf("filterAAAA = %v，期望 %v", got, c.wantFilter)
 			}
 			if !c.wantFilter {
@@ -117,7 +117,7 @@ func TestFilterAAAAPreferAPassesThroughWhenNoA(t *testing.T) {
 
 	req := aaaaQuery("a.test.example.com")
 	w := &captureWriter{}
-	if h.filterAAAA(w, req, "a.test.example.com", dns.TypeAAAA) {
+	if h.filterAAAA(w, req, "a.test.example.com", dns.TypeAAAA, "-") {
 		t.Fatal("无 A 记录时不应置空 AAAA")
 	}
 	if w.msg != nil {
@@ -132,7 +132,7 @@ func TestFilterAAAAPreferAQueriesUpstreamA(t *testing.T) {
 	setSplitIPPrefer(h, config.IPPreferA, "")
 
 	req := aaaaQuery("a.test.example.com")
-	if !h.filterAAAA(&captureWriter{}, req, "a.test.example.com", dns.TypeAAAA) {
+	if !h.filterAAAA(&captureWriter{}, req, "a.test.example.com", dns.TypeAAAA, "-") {
 		t.Fatal("上游返回 A 记录时应置空 AAAA")
 	}
 	if got := up.lastRequest(t); got.Question[0].Qtype != dns.TypeA {

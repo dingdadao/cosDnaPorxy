@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"runtime/debug"
 	"slices"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/querylog"
+	"cosDnaPorxy/internal/source"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
@@ -78,14 +80,20 @@ type RefactoredHandler struct {
 	cloudProcessor  *CloudProcessor
 	overrideMatcher *OverrideMatcher // 本地域名篡改匹配器（最高优先级）
 
+	// 入站加密与客户端维度分流
+	certStore          *CertStore
+	clientGroupMatcher *ClientGroupMatcher
+	sourceAutoStop     func() // 运营商库定时更新停止函数；nil 表示未启用
+
 	// 解析日志（进程级，独立于处理器生命周期，可为 nil 表示不记录）
 	queryLog *querylog.Store
 
 	// 连接池
-	dotConnPool *DoTConnPool
-	dohConnPool *DoHConnPool
-	udpConnPool *UDPConnPool
-	tcpConnPool *TCPConnPool
+	dotConnPool  *DoTConnPool
+	dohConnPool  *DoHConnPool
+	doh3ConnPool *DoH3ConnPool
+	udpConnPool  *UDPConnPool
+	tcpConnPool  *TCPConnPool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -104,6 +112,7 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 	// 创建连接池
 	dotConnPool := NewDoTConnPool()
 	dohConnPool := NewDoHConnPool()
+	doh3ConnPool := NewDoH3ConnPool()
 	udpConnPool := NewUDPConnPool()
 	tcpConnPool := NewTCPConnPool()
 
@@ -118,6 +127,7 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 		cloudDetector: cloudDetector,
 		dotConnPool:   dotConnPool,
 		dohConnPool:   dohConnPool,
+		doh3ConnPool:  doh3ConnPool,
 		udpConnPool:   udpConnPool,
 		tcpConnPool:   tcpConnPool,
 		queryLog:      qlog,
@@ -135,6 +145,7 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 		modernOptimizer.tcpQueryFunc = handler.getTCPQueryFunc()
 		modernOptimizer.doHQueryFunc = handler.getDoHQueryFunc()
 		modernOptimizer.doTQueryFunc = handler.getDoTQueryFunc()
+		modernOptimizer.doH3QueryFunc = handler.getDoH3QueryFunc()
 		queryOptimizer = modernOptimizer
 		logger.Info("🚀 [使用现代DNS查询优化器] ", map[string]interface{}{
 			"rule":           "MODERN_OPTIMIZER_SELECTED",
@@ -196,6 +207,46 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 
 	// 初始化本地域名篡改匹配器（最高优先级）
 	handler.overrideMatcher = NewOverrideMatcher(logger)
+
+	// 初始化客户端分组匹配器
+	handler.clientGroupMatcher = NewClientGroupMatcher(cfg.ClientGroups)
+
+	// 可选：加载运营商来源库，为 isp: 匹配项提供支持
+	if cfg.SourceEnabled && cfg.SourceDBDir != "" {
+		var ispDB *source.DB
+		if db, err := source.LoadFromDir(cfg.SourceDBDir); err != nil {
+			logger.Warn("⚠️ [运营商来源库加载失败，isp: 匹配暂不可用] ", map[string]interface{}{
+				"rule":  "SOURCE_DB_LOAD_FAILED",
+				"dir":   cfg.SourceDBDir,
+				"error": err.Error(),
+			})
+		} else {
+			ispDB = db
+			handler.clientGroupMatcher.SetISPLookup(ispDB)
+			logger.Info("🚀 [运营商来源库已加载] ", map[string]interface{}{
+				"rule": "SOURCE_DB_LOADED",
+				"dir":  cfg.SourceDBDir,
+			})
+		}
+		// 定时刷新：仅当配置了更新间隔时才启用，避免启动即触发网络请求
+		if ispDB != nil && cfg.SourceUpdateHours > 0 {
+			handler.sourceAutoStop = source.AutoUpdate(
+				ispDB, cfg.SourceBaseURL, cfg.SourceDBDir,
+				time.Duration(cfg.SourceUpdateHours)*time.Hour,
+				func(err error) {
+					logger.Warn("⚠️ [运营商来源库自动更新失败] ", map[string]interface{}{
+						"rule":  "SOURCE_DB_UPDATE_FAILED",
+						"error": err.Error(),
+					})
+				},
+			)
+			logger.Info("🔄 [运营商来源库自动更新已启用] ", map[string]interface{}{
+				"rule":  "SOURCE_DB_AUTO_UPDATE",
+				"base":  cfg.SourceBaseURL,
+				"hours": cfg.SourceUpdateHours,
+			})
+		}
+	}
 
 	// 设置缓存回调
 	handler.cacheManager.SetRefreshCallback(handler.refreshDNSRecord)
@@ -266,6 +317,7 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 	h.cnameProcessor.UpdateConfig(cfg)
 	h.cloudDetector.SetReplaceDomains(cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
 	h.matcherHandler.UpdateConfig(cfg)
+	h.clientGroupMatcher.UpdateGroups(cfg.ClientGroups)
 	h.Logger.SetLevel(cfg.LogLevel)
 	if h.queryLog != nil {
 		h.queryLog.UpdateOptions(querylog.Options{
@@ -282,8 +334,10 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 
 	// 分流路由（顺序/取反/DNS/ECS/A-AAAA偏好）变更后，缓存里仍是按旧路由取回的结果，必须清空避免串味
 	// 替换接口地址/条数变更后同理：缓存里还是旧接口给出的替换 IP
+	// 客户端分组变更同理：不同分组可能得到不同上游，旧缓存会串味
 	if splitListsRoutingChanged(old.SplitLists, cfg.SplitLists) || old.IPPrefer != cfg.IPPrefer ||
-		old.ReplaceCFAPI != cfg.ReplaceCFAPI || old.ReplaceAPICount != cfg.ReplaceAPICount {
+		old.ReplaceCFAPI != cfg.ReplaceCFAPI || old.ReplaceAPICount != cfg.ReplaceAPICount ||
+		clientGroupsRoutingChanged(old.ClientGroups, cfg.ClientGroups) {
 		h.cacheManager.Clear()
 		h.Logger.Info("🧹 [分流路由变更，已清空缓存] ", map[string]interface{}{
 			"rule":           "SPLIT_ROUTING_CHANGED_CACHE_CLEARED",
@@ -306,7 +360,39 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 		old.CloudflareNetFile != cfg.CloudflareNetFile ||
 		old.CloudflareNetFile6 != cfg.CloudflareNetFile6 ||
 		old.AWSNetFile != cfg.AWSNetFile ||
-		old.NetworkRefreshInterval != cfg.NetworkRefreshInterval
+		old.NetworkRefreshInterval != cfg.NetworkRefreshInterval ||
+		old.EnableDoT != cfg.EnableDoT ||
+		old.EnableDoH != cfg.EnableDoH ||
+		old.EnableDoH3 != cfg.EnableDoH3 ||
+		old.DoTAddr != cfg.DoTAddr ||
+		old.DoHAddr != cfg.DoHAddr ||
+		old.DoH3Addr != cfg.DoH3Addr ||
+		old.DoHPath != cfg.DoHPath ||
+		old.DoHAltSvc != cfg.DoHAltSvc ||
+		old.CertStoreDir != cfg.CertStoreDir ||
+		old.CertDefault != cfg.CertDefault ||
+		old.WebTLS != cfg.WebTLS ||
+		old.WebTLSAddr != cfg.WebTLSAddr
+}
+
+// clientGroupsRoutingChanged 判断客户端分组路由是否变化（影响缓存命中率与正确性）
+func clientGroupsRoutingChanged(old, cur []config.ClientGroup) bool {
+	if len(old) != len(cur) {
+		return true
+	}
+	for i := range old {
+		a, b := old[i], cur[i]
+		if a.Name != b.Name || a.Enabled != b.Enabled || a.Priority != b.Priority ||
+			a.Invert != b.Invert || a.DNSMode != b.DNSMode ||
+			a.IPPrefer != b.IPPrefer || a.EnableCloudCheck != b.EnableCloudCheck ||
+			a.AllowDomainSplit != b.AllowDomainSplit ||
+			!slices.Equal(a.Match, b.Match) ||
+			!slices.Equal(a.DNS, b.DNS) ||
+			a.ECS != b.ECS {
+			return true
+		}
+	}
+	return false
 }
 
 // splitListsNeedRestart 判断分流列表是否发生需重启才生效的结构性变更
@@ -475,9 +561,12 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	// 解析客户端 IP 并确定缓存 scope
+	_, scope := h.resolveClientAndScope(w)
+
 	// 协议守卫：RD=0的非递归请求仅用缓存回答，缓存未命中回REFUSED
 	if !req.RecursionDesired {
-		resp, hit, _, _ := h.cacheManager.Get(domain, q.Qtype)
+		resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, q.Qtype)
 		if !hit {
 			h.sendErrorResponse(w, req, dns.RcodeRefused)
 			h.recordQuery(querylog.Entry{
@@ -498,7 +587,7 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	// A/AAAA 偏好档位：本地篡改优先级最高（已在上面处理），此处先于缓存判定，
 	// 使「只A/优先A」能压过缓存里的 AAAA；RD=0 的「缓存或REFUSED」约束保持在前，不被本策略改写
-	if h.filterAAAA(w, req, domain, q.Qtype) {
+	if h.filterAAAA(w, req, domain, q.Qtype, scope) {
 		return
 	}
 
@@ -506,19 +595,21 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// 其他记录类型（如NS、MX等）也会被处理，但不经过云服务检测优化
 	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
 		// 对于非A/AAAA记录，仍然进行查询，但跳过云服务检测和替换逻辑
-		h.processNonIPQuery(w, req, domain, q.Qtype)
+		h.processNonIPQuery(w, req, domain, q.Qtype, scope)
 		return
 	}
 
-	h.processQuery(w, req, domain, q.Qtype)
+	h.processQuery(w, req, domain, q.Qtype, scope)
 }
 
 // processNonIPQuery 处理非IP记录类型的DNS查询（如NS、MX、TXT等）
-func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
+func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, scope string) {
 	start := time.Now()
 
+	clientDecision := h.clientDecisionFromScope(scope)
+
 	// 1. 检查缓存（命中返回递减TTL后的副本）
-	resp, hit, _, _ := h.cacheManager.Get(domain, qtype)
+	resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, qtype)
 	if hit {
 		h.writeResponse(w, req, resp)
 		h.Logger.Debug("✅ [DNS查询完成-非IP记录-缓存命中] ", map[string]interface{}{
@@ -535,9 +626,16 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 		return
 	}
 
-	// 2. 分流决策 + 确定上游服务器（与 A/AAAA 路径共用同一套路由与解析模式）
-	decision := h.matcherHandler.MatchDomain(domain)
-	upstreams := h.upstreamsFor(domain, decision)
+	// 2. 分流决策：先客户端分组，再域名分流（若 AllowDomainSplit 未关闭）
+	var decision SplitDecision
+	var upstreams []string
+	if clientDecision.Matched && !clientDecision.AllowDomainSplit {
+		decision = SplitDecision{Matched: true, DNS: clientDecision.DNS, DNSMode: clientDecision.DNSMode, ListName: clientDecision.GroupName}
+		upstreams = clientDecision.DNS
+	} else {
+		decision = h.matcherHandler.MatchDomain(domain)
+		upstreams = h.upstreamsFor(domain, decision)
+	}
 
 	// 3. 执行查询（不经过云服务检测和替换逻辑）
 	resp, server, err := h.queryWithFallback(req, upstreams, decision.DNSMode)
@@ -575,7 +673,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	}
 
 	// 5. 缓存并原样返回上游响应（不重建owner、不裁剪RRset）
-	h.cacheManager.Set(domain, qtype, resp, false)
+	h.cacheManager.SetScoped(scope, domain, qtype, resp, false)
 	h.writeResponse(w, req, resp)
 
 	h.Logger.Debug("✅ [DNS查询完成-非IP记录] ", map[string]interface{}{
@@ -597,18 +695,20 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 }
 
 // processQuery 处理单个DNS查询
-func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16) {
+func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, scope string) {
 	// 开始计时整个处理过程
 	totalTimer := h.Logger.StartTimer("total_dns_request")
 	defer totalTimer.End()
 
+	clientDecision := h.clientDecisionFromScope(scope)
+
 	// 1. 缓存检查（使用单飞行模式避免重复查询）
-	resp, hit, _, _ := h.cacheManager.GetWithFlight(domain, qtype)
+	resp, hit, _, _ := h.cacheManager.GetWithFlightScoped(scope, domain, qtype)
 	if hit {
 		// 检查域名级别的云服务状态，确保A/AAAA记录处理一致性
-		if h.cacheManager.IsDomainCloud(domain) {
+		if h.cacheManager.IsDomainCloudScoped(scope, domain) {
 			// 云域名：返回云替换响应缓存
-			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponse(domain, qtype); cloudHit {
+			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponseScoped(scope, domain, qtype); cloudHit {
 				h.writeResponse(w, req, cloudResp)
 				totalTime := totalTimer.End()
 				h.Logger.Debug("✅ [DNS查询完成-缓存命中-云域名] ", map[string]interface{}{
@@ -645,17 +745,29 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		}
 	}
 
-	// 分流决策：一次匹配同时得出上游 DNS、云检测开关与 ECS 策略
+	// 2. 分流决策：客户端分组优先，域名分流次之
 	decision := h.matcherHandler.MatchDomain(domain)
 	upstreams := h.upstreamsFor(domain, decision)
 	ecs := ecsSummary(req, decision)
 
+	if clientDecision.Matched {
+		// 若分组关闭域名分流，直接采用分组 DNS
+		if !clientDecision.AllowDomainSplit {
+			decision = SplitDecision{Matched: true, DNS: clientDecision.DNS, DNSMode: clientDecision.DNSMode, ListName: clientDecision.GroupName}
+			upstreams = clientDecision.DNS
+		}
+		// 分组的 ECS 与 IPPrefer 覆盖域名分流的同名语义
+		if clientDecision.ECS.Enabled {
+			ecs = ecsSummary(req, decision) // 保持 req 引用；后续 applySplitECS 会处理
+		}
+	}
+
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query")
 
-	// 2. 代理查询上游DNS服务器（按列表解析模式：竞速 / 串行故障转移；全部失败回退 BackupDNS）
+	// 3. 代理查询上游DNS服务器（按列表解析模式：竞速 / 串行故障转移；全部失败回退 BackupDNS）
 	//    命中分流列表时按列表 ECS 策略处理请求副本（剥离客户端 ECS / 注入本地 ECS）
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision), upstreams, domain, qtype, decision.DNSMode)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision), upstreams, domain, qtype, decision.DNSMode, scope)
 	upstreamTime := upstreamTimer.End()
 
 	if err != nil || resp == nil {
@@ -677,7 +789,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		return
 	}
 
-	// 3. 云服务检测：沿CNAME链收集IP仅用于内部检测，不改写客户端响应
+	// 4. 云服务检测：沿CNAME链收集IP仅用于内部检测，不改写客户端响应
 	var detection *CloudDetectionResult
 	isCloud := false
 
@@ -733,11 +845,11 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		return
 	}
 
-	// 4. 非云域名：原样返回上游响应（owner、RRset完整保留）
+	// 5. 非云域名：原样返回上游响应（owner、RRset完整保留）
 	h.writeResponse(w, req, resp)
 
 	// 检查域名是否命中分流列表
-	isDomainCloud := h.cacheManager.IsDomainCloud(domain)
+	isDomainCloud := h.cacheManager.IsDomainCloudScoped(scope, domain)
 
 	var logSource string
 	if isDomainCloud {
@@ -830,9 +942,58 @@ func (h *RefactoredHandler) GetCacheManager() *CacheManager {
 	return h.cacheManager
 }
 
+// resolveClientAndScope 解析客户端 IP、匹配客户端分组，返回 scope
+// scope 用于缓存隔离：未命中分组为 "-"，命中为分组名
+func (h *RefactoredHandler) resolveClientAndScope(w dns.ResponseWriter) (clientIP netip.Addr, scope string) {
+	ip, source := h.ResolveClientIP(w)
+	if !ip.IsValid() {
+		return ip, "-"
+	}
+
+	decision := h.clientGroupMatcher.Match(ip)
+	if !decision.Matched {
+		return ip, "-"
+	}
+
+	h.Logger.Debug("🎯 [客户端分组命中] ", map[string]interface{}{
+		"rule":      "CLIENT_GROUP_HIT",
+		"group":     decision.GroupName,
+		"client_ip": ip.String(),
+		"ip_source": source,
+	})
+	return ip, decision.GroupName
+}
+
+// clientDecisionFromScope 根据 scope（分组名）反查客户端分组决策
+func (h *RefactoredHandler) clientDecisionFromScope(scope string) ClientDecision {
+	if scope == "" || scope == "-" {
+		return ClientDecision{Matched: false, AllowDomainSplit: true}
+	}
+	for _, g := range h.getConfig().ClientGroups {
+		if g.Name == scope {
+			return ClientDecision{
+				Matched:          true,
+				GroupName:        g.Name,
+				DNS:              g.DNS,
+				DNSMode:          normDNSMode(g.DNSMode),
+				EnableCloudCheck: g.EnableCloudCheck,
+				ECS:              g.ECS,
+				IPPrefer:         g.IPPrefer,
+				AllowDomainSplit: g.AllowDomainSplit,
+			}
+		}
+	}
+	return ClientDecision{Matched: false, AllowDomainSplit: true}
+}
+
 // Close 关闭处理器
 func (h *RefactoredHandler) Close() {
 	h.cancel()
+
+	if h.sourceAutoStop != nil {
+		h.sourceAutoStop()
+		h.sourceAutoStop = nil
+	}
 
 	if h.cacheManager != nil {
 		h.cacheManager.Close()
@@ -853,6 +1014,9 @@ func (h *RefactoredHandler) Close() {
 	}
 	if h.dohConnPool != nil {
 		h.dohConnPool.Close()
+	}
+	if h.doh3ConnPool != nil {
+		h.doh3ConnPool.Close()
 	}
 	if h.udpConnPool != nil {
 		h.udpConnPool.Close()
@@ -921,4 +1085,9 @@ func (h *RefactoredHandler) getDoHQueryFunc() func(*dns.Msg, string) (*dns.Msg, 
 // getDoTQueryFunc 返回DoT查询函数
 func (h *RefactoredHandler) getDoTQueryFunc() func(*dns.Msg, string) (*dns.Msg, error) {
 	return h.queryDoT
+}
+
+// getDoH3QueryFunc 返回DoH3查询函数
+func (h *RefactoredHandler) getDoH3QueryFunc() func(*dns.Msg, string) (*dns.Msg, error) {
+	return h.queryDoH3
 }

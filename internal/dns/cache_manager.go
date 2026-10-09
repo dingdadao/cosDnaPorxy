@@ -106,15 +106,21 @@ func (cm *CacheManager) UpdateConfig(cfg *config.Config) {
 	cm.cache.SetDefaultTTL(cfg.Cache.TTL)
 }
 
-// Get 获取缓存
+// Get 获取缓存（默认 scope "-"）
 func (cm *CacheManager) Get(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
+	return cm.GetScoped("-", domain, qtype)
+}
+
+// GetScoped 获取指定 scope 的缓存
+func (cm *CacheManager) GetScoped(scope, domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
 	timer := cm.logger.StartTimer("cache_get", map[string]interface{}{
 		"domain": domain,
 		"qtype":  dns.TypeToString[qtype],
+		"scope":  scope,
 	})
 	defer timer.End()
 
-	resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype)
+	resp, hit, isCloud, cloudType := cm.cache.Get(scope, domain, qtype)
 
 	if hit {
 		cm.logger.Debug("💾 缓存命中详细信息", map[string]interface{}{
@@ -139,15 +145,20 @@ func (cm *CacheManager) Get(domain string, qtype uint16) (*dns.Msg, bool, bool, 
 	return resp, hit, isCloud, cloudType
 }
 
-// GetCloudResponse 获取云域名的替换响应缓存
+// GetCloudResponse 获取云域名的替换响应缓存（默认 scope "-"）
 func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg, bool, int) {
+	return cm.GetCloudResponseScoped("-", domain, qtype)
+}
+
+// GetCloudResponseScoped 获取指定 scope 的云响应缓存
+func (cm *CacheManager) GetCloudResponseScoped(scope, domain string, qtype uint16) (*dns.Msg, bool, int) {
 	timer := cm.logger.StartTimer("cache_get_cloud", map[string]interface{}{
 		"domain": domain,
 		"qtype":  dns.TypeToString[qtype],
 	})
 	defer timer.End()
 
-	resp, hit, cloudType := cm.cache.GetCloudResponse(domain, qtype)
+	resp, hit, cloudType := cm.cache.GetCloudResponse(scope, domain, qtype)
 
 	if hit {
 		cm.logger.Debug("☁️ 云响应缓存命中详细信息", map[string]interface{}{
@@ -172,11 +183,16 @@ func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg,
 	return resp, hit, cloudType
 }
 
-// GetWithFlight 获取缓存响应（使用单飞行模式避免重复查询）
+// GetWithFlight 获取缓存响应（使用单飞行模式避免重复查询，默认 scope "-"）
 func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
+	return cm.GetWithFlightScoped("-", domain, qtype)
+}
+
+// GetWithFlightScoped 获取指定 scope 的缓存响应（使用单飞行模式）
+func (cm *CacheManager) GetWithFlightScoped(scope, domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
 	// 使用单飞行模式来避免对同一域名的重复查询
-	v, err, _ := cm.flightGroup.Do(domain+"|"+dns.TypeToString[qtype], func() (interface{}, error) {
-		resp, hit, isCloud, cloudType := cm.cache.Get(domain, qtype) // 恢复原始逻辑
+	v, err, _ := cm.flightGroup.Do(scope+"|"+domain+"|"+dns.TypeToString[qtype], func() (interface{}, error) {
+		resp, hit, isCloud, cloudType := cm.cache.Get(scope, domain, qtype)
 		return struct {
 			Resp      *dns.Msg
 			Hit       bool
@@ -189,6 +205,7 @@ func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bo
 		cm.logger.Error("单飞行查询错误", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
+			"scope":  scope,
 			"error":  err,
 		})
 		return nil, false, false, 0
@@ -205,6 +222,7 @@ func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bo
 		cm.logger.Debug("💾 单飞行缓存命中", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
+			"scope":  scope,
 		})
 
 		// 检查是否需要按需刷新（缓存已过期但仍有条目）
@@ -215,14 +233,20 @@ func (cm *CacheManager) GetWithFlight(domain string, qtype uint16) (*dns.Msg, bo
 		cm.logger.Debug("🔍 单飞行缓存未命中", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
+			"scope":  scope,
 		})
 	}
 
 	return result.Resp, result.Hit, result.IsCloud, result.CloudType
 }
 
-// SetCloudResponse 设置云域名的替换响应缓存
+// SetCloudResponse 设置云域名的替换响应缓存（默认 scope "-"）
 func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *dns.Msg, cloudType int, customTTL ...time.Duration) {
+	cm.SetCloudResponseScoped("-", domain, qtype, response, cloudType, customTTL...)
+}
+
+// SetCloudResponseScoped 设置指定 scope 的云域名的替换响应缓存
+func (cm *CacheManager) SetCloudResponseScoped(scope, domain string, qtype uint16, response *dns.Msg, cloudType int, customTTL ...time.Duration) {
 	timer := cm.logger.StartTimer("cache_set_cloud", map[string]interface{}{
 		"domain":     domain,
 		"qtype":      dns.TypeToString[qtype],
@@ -244,7 +268,7 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 		ttl = customTTL[0]
 	}
 
-	cm.cache.SetCloudResponse(domain, qtype, response, cloudType, ttl)
+	cm.cache.SetCloudResponse(scope, domain, qtype, response, cloudType, ttl)
 
 	cm.logger.Info("📋 [缓存设置-云响应] ", map[string]interface{}{
 		"domain":     domain,
@@ -269,41 +293,56 @@ func (cm *CacheManager) SetCloudResponse(domain string, qtype uint16, response *
 
 // IsCloud 检查域名是否为云服务域名
 func (cm *CacheManager) IsCloud(domain string, qtype uint16) bool {
-	return cm.cache.IsCloud(domain, qtype)
+	return cm.cache.IsCloud("-", domain, qtype)
 }
 
-// IsDomainCloud 检查域名是否为云服务域名（跨所有查询类型）
+// IsDomainCloud 检查域名是否为云服务域名（默认 scope "-"）
 func (cm *CacheManager) IsDomainCloud(domain string) bool {
+	return cm.IsDomainCloudScoped("-", domain)
+}
+
+// IsDomainCloudScoped 检查指定 scope 的域名是否为云服务域名（跨所有查询类型）
+func (cm *CacheManager) IsDomainCloudScoped(scope, domain string) bool {
 	// 检查任何类型的查询是否标记为云服务域名
 	// 检查常见的DNS查询类型
 	commonTypes := []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT}
 	for _, qtype := range commonTypes {
-		if cm.cache.IsCloud(domain, qtype) {
+		if cm.cache.IsCloud(scope, domain, qtype) {
 			return true
 		}
 	}
 	return false
 }
 
-// MarkDomainAsCloud 将整个域名标记为云服务域名（跨所有查询类型）
+// MarkDomainAsCloud 将整个域名标记为云服务域名（默认 scope "-"）
 func (cm *CacheManager) MarkDomainAsCloud(domain string, qtype uint16, cloudType int) {
+	cm.MarkDomainAsCloudScoped("-", domain, qtype, cloudType)
+}
+
+// MarkDomainAsCloudScoped 将指定 scope 的整个域名标记为云服务域名（跨所有查询类型）
+func (cm *CacheManager) MarkDomainAsCloudScoped(scope, domain string, qtype uint16, cloudType int) {
 	// 首先标记当前查询类型
-	cm.cache.Set(domain, qtype, nil, true, cloudType)
+	cm.cache.Set(scope, domain, qtype, nil, true, cloudType)
 
 	// 然后标记常见查询类型，以确保一致性
 	commonTypes := []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT}
 	for _, qt := range commonTypes {
 		if qt != qtype {
 			// 对于其他类型，只设置云标记，不覆盖已有的响应
-			if !cm.cache.IsCloud(domain, qt) {
-				cm.cache.Set(domain, qt, nil, true, cloudType)
+			if !cm.cache.IsCloud(scope, domain, qt) {
+				cm.cache.Set(scope, domain, qt, nil, true, cloudType)
 			}
 		}
 	}
 }
 
-// Set 设置缓存（只缓存成功的响应）
+// Set 设置缓存（只缓存成功的响应，默认 scope "-"）
 func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCloud bool, cloudType ...int) {
+	cm.SetScoped("-", domain, qtype, response, isCloud, cloudType...)
+}
+
+// SetScoped 设置指定 scope 的缓存（只缓存成功的响应）
+func (cm *CacheManager) SetScoped(scope, domain string, qtype uint16, response *dns.Msg, isCloud bool, cloudType ...int) {
 	timer := cm.logger.StartTimer("cache_set", map[string]interface{}{
 		"domain":   domain,
 		"qtype":    dns.TypeToString[qtype],
@@ -313,7 +352,7 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 
 	// 云服务域名特殊处理
 	if isCloud {
-		cm.cache.Set(domain, qtype, nil, true, cloudType...)
+		cm.cache.Set(scope, domain, qtype, nil, true, cloudType...)
 		cm.logger.Info("📋 [缓存设置-云标记] ", map[string]interface{}{
 			"domain": domain,
 			"rule":   "CACHE_SET_CLOUD_MARK",
@@ -336,7 +375,7 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
 	if response.Rcode != dns.RcodeSuccess {
 		negTTL := soaNegativeTTL(response, 5*time.Second)
-		cm.cache.SetWithTTL(domain, qtype, response, isCloud, negTTL, cloudType...)
+		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, negTTL, cloudType...)
 		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
@@ -345,7 +384,7 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 		})
 	} else {
 		// 缓存普通成功响应
-		cm.cache.Set(domain, qtype, response, isCloud, cloudType...)
+		cm.cache.Set(scope, domain, qtype, response, isCloud, cloudType...)
 		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
@@ -354,8 +393,13 @@ func (cm *CacheManager) Set(domain string, qtype uint16, response *dns.Msg, isCl
 	}
 }
 
-// SetWithTTL 设置缓存（使用自定义TTL）
+// SetWithTTL 设置缓存（使用自定义TTL，默认 scope "-"）
 func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Msg, isCloud bool, customTTL time.Duration, cloudType ...int) {
+	cm.SetWithTTLScoped("-", domain, qtype, response, isCloud, customTTL, cloudType...)
+}
+
+// SetWithTTLScoped 设置指定 scope 的缓存（使用自定义TTL）
+func (cm *CacheManager) SetWithTTLScoped(scope, domain string, qtype uint16, response *dns.Msg, isCloud bool, customTTL time.Duration, cloudType ...int) {
 	timer := cm.logger.StartTimer("cache_set", map[string]interface{}{
 		"domain":   domain,
 		"qtype":    dns.TypeToString[qtype],
@@ -365,7 +409,7 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 
 	// 云服务域名特殊处理
 	if isCloud {
-		cm.cache.Set(domain, qtype, nil, true, cloudType...)
+		cm.cache.Set(scope, domain, qtype, nil, true, cloudType...)
 		cm.logger.Info("📋 [缓存设置-云标记] ", map[string]interface{}{
 			"domain": domain,
 			"rule":   "CACHE_SET_CLOUD_MARK",
@@ -388,7 +432,7 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
 	if response.Rcode != dns.RcodeSuccess {
 		negTTL := soaNegativeTTL(response, 5*time.Second)
-		cm.cache.SetWithTTL(domain, qtype, response, isCloud, negTTL, cloudType...)
+		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, negTTL, cloudType...)
 		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
@@ -397,7 +441,7 @@ func (cm *CacheManager) SetWithTTL(domain string, qtype uint16, response *dns.Ms
 		})
 	} else {
 		// 使用自定义TTL缓存响应
-		cm.cache.SetWithTTL(domain, qtype, response, isCloud, customTTL, cloudType...)
+		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, customTTL, cloudType...)
 		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
@@ -493,7 +537,7 @@ func (cm *CacheManager) isInvalidIP(ip string) bool {
 // shouldRefresh 检查是否应该刷新缓存
 func (cm *CacheManager) shouldRefresh(domain string, qtype uint16) bool {
 	// 使用配置中的刷新阈值检查是否需要刷新
-	shouldRefresh := cm.cache.ShouldRefreshWithThreshold(domain, qtype, 30*time.Second) // 使用默认30秒阈值
+	shouldRefresh := cm.cache.ShouldRefreshWithThreshold("-", domain, qtype, 30*time.Second) // 使用默认30秒阈值
 
 	// 添加调试日志
 	cm.logger.Debug("🔍 shouldRefresh检查", map[string]interface{}{
@@ -510,17 +554,17 @@ func (cm *CacheManager) shouldRefresh(domain string, qtype uint16) bool {
 // shouldRefreshOnDemand 检查是否应该按需刷新（缓存已过期）
 func (cm *CacheManager) shouldRefreshOnDemand(domain string, qtype uint16) bool {
 	// 检查缓存是否已过期
-	_, hit, _, _ := cm.cache.Get(domain, qtype)
+	_, hit, _, _ := cm.cache.Get("-", domain, qtype)
 
 	// 只有当缓存命中且已过期时才需要按需刷新
 	shouldRefresh := false
 	if hit {
 		// 检查缓存项是否已过期（使用微小的正数作为阈值，以捕获已过期或即将过期的条目）
 		// 当remainingTTL <= 0时，ShouldRefreshWithThreshold返回false，所以我们需要特殊处理
-		_, exists, _, _ := cm.cache.Get(domain, qtype)
+		_, exists, _, _ := cm.cache.Get("-", domain, qtype)
 		if exists {
 			// 直接检查是否已过期
-			remainingTTL := time.Until(cm.cache.GetExpireTime(domain, qtype))
+			remainingTTL := time.Until(cm.cache.GetExpireTime("-", domain, qtype))
 			shouldRefresh = remainingTTL <= 0
 		}
 	}
@@ -868,7 +912,7 @@ func (cm *CacheManager) processAsyncTask(task *AsyncRefreshTask, workerID int) {
 			})
 
 			// 刷新失败时，删除过期缓存条目
-			cm.cache.Delete(task.Domain, task.QType)
+			cm.cache.Delete("-", task.Domain, task.QType)
 			cm.logger.Debug("🗑️ 缓存条目已删除", map[string]interface{}{
 				"domain": task.Domain,
 				"qtype":  dns.TypeToString[task.QType],
@@ -934,7 +978,7 @@ func (cm *CacheManager) GetHotEntries(limit int) []HotEntry {
 
 // ExtendTTL 延长缓存条目的过期时间
 func (cm *CacheManager) ExtendTTL(domain string, qtype uint16, duration time.Duration) {
-	cm.cache.ExtendTTL(domain, qtype, duration)
+	cm.cache.ExtendTTL("-", domain, qtype, duration)
 	cm.logger.Debug("🕒 缓存TTL已延长", map[string]interface{}{
 		"domain":   domain,
 		"qtype":    dns.TypeToString[qtype],

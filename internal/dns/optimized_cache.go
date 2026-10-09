@@ -114,9 +114,12 @@ func (c *OptimizedDNSCache) SetDefaultTTL(ttl time.Duration) {
 	c.defaultTTL.Store(int64(ttl))
 }
 
-// key 生成缓存键
-func (c *OptimizedDNSCache) key(domain string, qType uint16) string {
-	return domain + "|" + dns.TypeToString[qType]
+// key 生成缓存键，scope 用于客户端分组隔离（未命中分组为 "-"）
+func (c *OptimizedDNSCache) key(scope, domain string, qType uint16) string {
+	if scope == "" {
+		scope = "-"
+	}
+	return scope + "|" + domain + "|" + dns.TypeToString[qType]
 }
 
 // getShard 根据键获取对应的缓存分片
@@ -161,8 +164,8 @@ func decrementTTLs(msg *dns.Msg, elapsed time.Duration) {
 }
 
 // GetCloudResponse 获取云域名的替换响应缓存
-func (c *OptimizedDNSCache) GetCloudResponse(domain string, qType uint16) (*dns.Msg, bool, int) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) GetCloudResponse(scope, domain string, qType uint16) (*dns.Msg, bool, int) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -199,8 +202,8 @@ func (c *OptimizedDNSCache) GetCloudResponse(domain string, qType uint16) (*dns.
 }
 
 // SetCloudResponse 设置云域名的替换响应缓存
-func (c *OptimizedDNSCache) SetCloudResponse(domain string, qType uint16, response *dns.Msg, cloudType int, customTTL ...time.Duration) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) SetCloudResponse(scope, domain string, qType uint16, response *dns.Msg, cloudType int, customTTL ...time.Duration) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	// 使用自定义TTL或默认TTL
@@ -236,8 +239,8 @@ func (c *OptimizedDNSCache) SetCloudResponse(domain string, qType uint16, respon
 }
 
 // Get 获取缓存响应
-func (c *OptimizedDNSCache) Get(domain string, qType uint16) (*dns.Msg, bool, bool, int) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) Get(scope, domain string, qType uint16) (*dns.Msg, bool, bool, int) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -340,8 +343,8 @@ type HotEntry struct {
 }
 
 // GetWithFlight 获取缓存响应，使用单飞行模式避免重复查询
-func (c *OptimizedDNSCache) GetWithFlight(domain string, qType uint16) (*dns.Msg, bool, bool, int) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) GetWithFlight(scope, domain string, qType uint16) (*dns.Msg, bool, bool, int) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -434,8 +437,8 @@ func (c *OptimizedDNSCache) adjustExpiredResponseTTL(resp *dns.Msg, newTTL time.
 }
 
 // GetExpireTime 获取缓存条目的过期时间
-func (c *OptimizedDNSCache) GetExpireTime(domain string, qType uint16) time.Time {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) GetExpireTime(scope, domain string, qType uint16) time.Time {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -450,8 +453,8 @@ func (c *OptimizedDNSCache) GetExpireTime(domain string, qType uint16) time.Time
 }
 
 // IsCloud 检查域名是否为云服务域名（即使缓存已过期）
-func (c *OptimizedDNSCache) IsCloud(domain string, qType uint16) bool {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) IsCloud(scope, domain string, qType uint16) bool {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -467,8 +470,8 @@ func (c *OptimizedDNSCache) IsCloud(domain string, qType uint16) bool {
 
 // Set 设置缓存响应
 // 注意：云服务的查询结果只缓存标记，不缓存响应内容
-func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, isCloud bool, cloudType ...int) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dns.Msg, isCloud bool, cloudType ...int) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	// 如果是云服务域名，只缓存标记，不缓存响应内容
@@ -565,8 +568,8 @@ func (c *OptimizedDNSCache) Set(domain string, qType uint16, response *dns.Msg, 
 }
 
 // SetWithTTL 设置缓存响应（使用自定义TTL）
-func (c *OptimizedDNSCache) SetWithTTL(domain string, qType uint16, response *dns.Msg, isCloud bool, customTTL time.Duration, cloudType ...int) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, response *dns.Msg, isCloud bool, customTTL time.Duration, cloudType ...int) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	// 如果是云服务域名，只缓存标记，不缓存响应内容
@@ -647,8 +650,8 @@ func (c *OptimizedDNSCache) SetWithTTL(domain string, qType uint16, response *dn
 }
 
 // ShouldRefreshWithThreshold 检查是否应该刷新缓存（使用指定的刷新阈值）
-func (c *OptimizedDNSCache) ShouldRefreshWithThreshold(domain string, qType uint16, refreshThreshold time.Duration) bool {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) ShouldRefreshWithThreshold(scope, domain string, qType uint16, refreshThreshold time.Duration) bool {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -674,8 +677,8 @@ func (c *OptimizedDNSCache) ShouldRefreshWithThreshold(domain string, qType uint
 }
 
 // ShouldRefresh 检查是否应该刷新缓存（TTL剩余时间低于刷新阈值）
-func (c *OptimizedDNSCache) ShouldRefresh(domain string, qType uint16) bool {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) ShouldRefresh(scope, domain string, qType uint16) bool {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.RLock()
@@ -800,8 +803,8 @@ func (c *OptimizedDNSCache) Clear() {
 }
 
 // Delete 删除指定的缓存条目
-func (c *OptimizedDNSCache) Delete(domain string, qType uint16) {
-	key := c.key(domain, qType)
+func (c *OptimizedDNSCache) Delete(scope, domain string, qType uint16) {
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.Lock()
@@ -827,11 +830,11 @@ func (c *OptimizedDNSCache) GetExpiringSoonEntries(refreshThreshold time.Duratio
 
 			// 如果剩余TTL小于或等于刷新阈值，则添加到列表
 			if remainingTTL > 0 && remainingTTL <= refreshThreshold {
-				// 解析缓存键获取domain和qtype
+				// 解析缓存键获取domain和qtype（新格式 scope|domain|qtype）
 				parts := strings.Split(key, "|")
-				if len(parts) == 2 {
-					domain := parts[0]
-					qtypeStr := parts[1]
+				if len(parts) == 3 {
+					domain := parts[1]
+					qtypeStr := parts[2]
 
 					// 将qtype字符串转换为uint16
 					for qtype, qtypeString := range dns.TypeToString {
@@ -854,13 +857,13 @@ func (c *OptimizedDNSCache) GetExpiringSoonEntries(refreshThreshold time.Duratio
 }
 
 // ExtendTTL 延长缓存条目的过期时间
-func (c *OptimizedDNSCache) ExtendTTL(domain string, qType uint16, duration time.Duration) {
+func (c *OptimizedDNSCache) ExtendTTL(scope, domain string, qType uint16, duration time.Duration) {
 	// 添加空指针检查
 	if c == nil {
 		return
 	}
 
-	key := c.key(domain, qType)
+	key := c.key(scope, domain, qType)
 	shard := c.getShard(key)
 
 	shard.mu.Lock()
@@ -924,13 +927,13 @@ func (c *OptimizedDNSCache) GetStats(includeEntries bool) *CacheStats {
 				validEntries++
 			}
 
-			// 解析域名和查询类型
+			// 解析域名和查询类型（scope|domain|qtype）
 			parts := strings.Split(key, "|")
 			domain := "unknown"
 			qtype := "unknown"
-			if len(parts) >= 2 {
-				domain = parts[0]
-				qtype = parts[1]
+			if len(parts) >= 3 {
+				domain = parts[1]
+				qtype = parts[2]
 			}
 
 			answerCount := 0
@@ -1005,9 +1008,9 @@ func (c *OptimizedDNSCache) GetHotEntries(limit int) []HotEntry {
 		parts := strings.Split(item.Key, "|")
 		domain := "unknown"
 		qtype := "unknown"
-		if len(parts) >= 2 {
-			domain = parts[0]
-			qtype = parts[1]
+		if len(parts) >= 3 {
+			domain = parts[1]
+			qtype = parts[2]
 		}
 
 		hotEntries = append(hotEntries, HotEntry{

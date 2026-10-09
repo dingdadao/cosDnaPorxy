@@ -7,9 +7,10 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
+
+	"cosDnaPorxy/internal/config"
 
 	"github.com/miekg/dns"
 )
@@ -90,7 +91,8 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 	}
 
 	// 创建新连接
-	serverAddr := strings.TrimPrefix(server, "tls://")
+	// 归一化为 host:port：tls://dns.google → dns.google:853（缺端口时 dial 会报 missing port）
+	serverAddr := config.UpstreamDialAddr(server)
 
 	// 创建TCP连接
 	log.Printf("[DoT连接池] 开始连接TCP: %s", serverAddr)
@@ -109,8 +111,13 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 	}
 
 	// 创建TLS连接
+	// ServerName 必须取纯主机名：strings.Split(addr, ":")[0] 对 IPv6 字面量（[::1]:853）会取到 "["
+	serverName := serverAddr
+	if host, _, err := net.SplitHostPort(serverAddr); err == nil {
+		serverName = host
+	}
 	tlsConfig := &tls.Config{
-		ServerName:         strings.Split(serverAddr, ":")[0],
+		ServerName:         serverName,
 		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
 	}

@@ -97,7 +97,7 @@ func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode
 // proxyQueryWithCaching 代理查询并缓存原始上游响应
 // 云检测统一在processQuery中执行（仅一次），此处只做查询+缓存，不再处理CNAME或检测云
 // 第二个返回值是实际给出应答的上游服务器（用于解析日志）
-func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode string) (*dns.Msg, string, error) {
+func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string) (*dns.Msg, string, error) {
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
 
@@ -114,7 +114,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 	// 有成功结果：缓存原始响应（负缓存TTL由cacheManager.Set按RFC 2308处理）并返回
 	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response != nil {
 		resp := result.SuccessResult.Response
-		h.cacheManager.Set(domain, qtype, resp, false)
+		h.cacheManager.SetScoped(scope, domain, qtype, resp, false)
 		h.Logger.Debug("✅ 上游查询成功并缓存原始响应", map[string]interface{}{
 			"domain":         domain,
 			"qtype":          dns.TypeToString[qtype],
@@ -129,7 +129,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 	// 上游（含分流列表 DNS）全部失败时回退 BackupDNS，与非IP记录路径保持一致
 	if resp, ok := h.queryBackupDNS(req); ok {
 		if resp.Rcode == dns.RcodeSuccess {
-			h.cacheManager.Set(domain, qtype, resp, false)
+			h.cacheManager.SetScoped(scope, domain, qtype, resp, false)
 		}
 		h.Logger.Debug("✅ 已回退备份DNS", map[string]interface{}{
 			"domain": domain,
@@ -297,8 +297,10 @@ func (h *RefactoredHandler) querySingleServer(req *dns.Msg, server string) *Quer
 
 // queryUDP 执行UDP DNS查询
 func (h *RefactoredHandler) queryUDP(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 移除udp://前缀
-	addr := strings.TrimPrefix(server, "udp://")
+	// 归一化为 host:port（udp://1.1.1.1 → 1.1.1.1:53）
+	// 不补默认端口时 dns.Client 会直接报 "missing port in address"，且该函数通过
+	// udpQueryFunc 注入给现代优化器，会完全绕开其他地方带 :53 兜底的实现
+	addr := config.UpstreamDialAddr(server)
 
 	// 使用连接池获取客户端
 	client := h.udpConnPool.GetClient(addr, h.getConfig().Timeout)
@@ -314,8 +316,8 @@ func (h *RefactoredHandler) queryUDP(req *dns.Msg, server string) (*dns.Msg, err
 
 // queryTCP 执行TCP DNS查询
 func (h *RefactoredHandler) queryTCP(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 移除tcp://前缀
-	addr := strings.TrimPrefix(server, "tcp://")
+	// 归一化为 host:port（tcp://1.1.1.1 → 1.1.1.1:53）
+	addr := config.UpstreamDialAddr(server)
 
 	// 使用连接池获取客户端
 	client := h.tcpConnPool.GetClient(addr, h.getConfig().Timeout)
@@ -433,14 +435,55 @@ func (h *RefactoredHandler) queryDoT(req *dns.Msg, server string) (*dns.Msg, err
 	return resp, nil
 }
 
-// queryDoH3 执行DoH3 DNS查询
+// queryDoH3 执行 DoH3 DNS 查询（真实 HTTP/3 over QUIC）
 func (h *RefactoredHandler) queryDoH3(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 使用SimpleModernOptimizer的方法
-	optimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer)
-	if !ok {
-		return nil, fmt.Errorf("not a SimpleModernOptimizer")
+	client := h.doh3ConnPool.GetClient(server)
+
+	// 解析 URL：h3://host/path → https://host/path（http3.RoundTripper 内部走 QUIC）
+	u, err := url.Parse(server)
+	if err != nil {
+		return nil, fmt.Errorf("invalid DoH3 URL: %w", err)
 	}
-	return optimizer.queryDoH3(req, server)
+	u.Scheme = "https"
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/dns-query"
+	}
+
+	wireData, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack DNS message: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.getConfig().ModernTimeout)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(wireData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP/3 request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/dns-message")
+	httpReq.Header.Set("Accept", "application/dns-message")
+
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("DoH3 request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH3 request failed with status: %d", httpResp.StatusCode)
+	}
+
+	respData, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DoH3 response: %w", err)
+	}
+
+	resp := new(dns.Msg)
+	if err := resp.Unpack(respData); err != nil {
+		return nil, fmt.Errorf("failed to unpack DoH3 response: %w", err)
+	}
+	return resp, nil
 }
 
 // queryTraditional 执行传统DNS查询

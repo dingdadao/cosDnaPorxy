@@ -7,12 +7,12 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
+	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
@@ -38,10 +38,11 @@ type SimpleModernOptimizer struct {
 	cacheMu   sync.RWMutex
 
 	// Handler提供的方法（用于各种协议的连接池查询）
-	udpQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
-	tcpQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
-	doHQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
-	doTQueryFunc func(*dns.Msg, string) (*dns.Msg, error)
+	udpQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
+	tcpQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
+	doHQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
+	doTQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
+	doH3QueryFunc func(*dns.Msg, string) (*dns.Msg, error)
 }
 
 // NewSimpleModernOptimizer 创建简化的现代DNS查询优化器
@@ -673,7 +674,12 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 	} else if strings.HasPrefix(server, "h3://") {
 		protocol = "DoH3"
 		timeout = qo.getModernTimeout() // 现代协议使用更短超时
-		resp, err = qo.queryDoH3(req, server)
+		// 使用外部提供的 DoH3 查询函数（如果已设置）
+		if qo.doH3QueryFunc != nil {
+			resp, err = qo.doH3QueryFunc(req, server)
+		} else {
+			resp, err = qo.queryDoH3(req, server)
+		}
 	} else {
 		// 兼容旧格式：传统UDP/TCP
 		protocol = "UDP/TCP"
@@ -711,17 +717,9 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 
 // queryUDP 纯UDP查询
 func (qo *SimpleModernOptimizer) queryUDP(req *dns.Msg, serverURL string) (*dns.Msg, error) {
-	// 解析URL (udp://1.1.1.1:53)
-	u, err := url.Parse(serverURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid UDP URL: %w", err)
-	}
-
-	// 构建地址
-	address := u.Host
-	if !strings.Contains(address, ":") {
-		address += ":53" // 默认DNS端口
-	}
+	// 归一化为 host:port（udp://1.1.1.1 → 1.1.1.1:53；IPv6 补成 [::1]:53）
+	// 不能用 strings.Contains(address, ":") 判断，否则 ::1 这类 IPv6 字面量会被误判为「已含端口」
+	address := config.UpstreamDialAddr(serverURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
@@ -737,17 +735,8 @@ func (qo *SimpleModernOptimizer) queryUDP(req *dns.Msg, serverURL string) (*dns.
 
 // queryTCP 纯TCP查询
 func (qo *SimpleModernOptimizer) queryTCP(req *dns.Msg, serverURL string) (*dns.Msg, error) {
-	// 解析URL (tcp://1.1.1.1:53)
-	u, err := url.Parse(serverURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid TCP URL: %w", err)
-	}
-
-	// 构建地址
-	address := u.Host
-	if !strings.Contains(address, ":") {
-		address += ":53" // 默认DNS端口
-	}
+	// 归一化为 host:port（tcp://1.1.1.1 → 1.1.1.1:53；IPv6 补成 [::1]:53）
+	address := config.UpstreamDialAddr(serverURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
@@ -766,18 +755,21 @@ func (qo *SimpleModernOptimizer) queryTraditional(req *dns.Msg, server string) (
 	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
 
+	// 旧格式可能仍带 scheme，统一归一化为 host:port 再 dial
+	address := config.UpstreamDialAddr(server)
+
 	// 优先尝试UDP
 	client := &dns.Client{
 		Net:     "udp",
 		Timeout: qo.getTimeout(),
 	}
 
-	resp, _, err := client.ExchangeContext(ctx, req, server)
+	resp, _, err := client.ExchangeContext(ctx, req, address)
 
 	// UDP失败时尝试TCP（可能是响应太大）
 	if err != nil && qo.enableFallback {
 		client.Net = "tcp"
-		resp, _, err = client.ExchangeContext(ctx, req, server)
+		resp, _, err = client.ExchangeContext(ctx, req, address)
 	}
 
 	return resp, err
@@ -793,18 +785,11 @@ func (qo *SimpleModernOptimizer) queryDoT(req *dns.Msg, serverURL string) (*dns.
 	return nil, fmt.Errorf("queryDoT should be handled by RefactoredHandler, not SimpleModernOptimizer directly")
 }
 
-// queryDoH3 DNS over HTTP/3查询（简化版本，如果不支持HTTP/3则降级到HTTPS）
+// queryDoH3 DNS over HTTP/3查询 - 实现已上移到 RefactoredHandler.queryDoH3（经 doH3QueryFunc 注入）。
+// 此保留方法的目的是：当外部未注入 doH3QueryFunc 时，明确报错而不是静默降级为 DoH，
+// 避免「配置了 h3:// 却实际走 HTTPS/2」的误导。
 func (qo *SimpleModernOptimizer) queryDoH3(req *dns.Msg, serverURL string) (*dns.Msg, error) {
-	// 将h3://转换为https://，因为大多数Go HTTP客户端会自动协商HTTP/3
-	httpsURL := strings.Replace(serverURL, "h3://", "https://", 1)
-
-	qo.logger.Debug("🔄 DoH3降级为DoH", map[string]interface{}{
-		"original": serverURL,
-		"fallback": httpsURL,
-	})
-
-	// 使用DoH查询（HTTP客户端会自动尝试HTTP/3如果支持的话）
-	return qo.queryDoH(req, httpsURL)
+	return nil, fmt.Errorf("queryDoH3 should be handled by RefactoredHandler (h3:// requires QUIC), not SimpleModernOptimizer directly")
 }
 
 // Close 关闭查询优化器

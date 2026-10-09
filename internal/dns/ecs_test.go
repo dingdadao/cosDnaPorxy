@@ -298,7 +298,7 @@ func TestProcessQueryInjectsSplitListECS(t *testing.T) {
 	})
 
 	req := ecsQuery(4096, true, clientECS("203.0.113.0", 24))
-	h.processQuery(nopWriter{}, req, "a.test.example.com", dns.TypeA)
+	h.processQuery(nopWriter{}, req, "a.test.example.com", dns.TypeA, "-")
 
 	got := up.lastRequest(t)
 	subnet := findECS(got)
@@ -319,7 +319,7 @@ func TestProcessQueryStripsClientECSWhenDisabled(t *testing.T) {
 	h, _ := newSplitListTestHandler(t, up.addr, config.ECSPolicy{})
 
 	req := ecsQuery(1232, false, clientECS("203.0.113.0", 24))
-	h.processQuery(nopWriter{}, req, "a.test.example.com", dns.TypeA)
+	h.processQuery(nopWriter{}, req, "a.test.example.com", dns.TypeA, "-")
 
 	if findECS(up.lastRequest(t)) != nil {
 		t.Error("ECS 未开启时上游报文不应带 ECS")

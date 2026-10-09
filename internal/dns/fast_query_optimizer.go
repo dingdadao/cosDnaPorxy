@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"cosDnaPorxy/internal/config"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
@@ -216,6 +217,10 @@ func (qo *FastQueryOptimizer) concurrentQuery(req *dns.Msg, upstreams []string) 
 func (qo *FastQueryOptimizer) queryServer(req *dns.Msg, server string) *QueryResult {
 	start := time.Now()
 
+	// 归一化为 host:port：本函数把地址直接交给 dns.Client，缺端口会报 "missing port in address"
+	// （旧格式上游可能写成 udp://1.1.1.1 或裸 1.1.1.1）
+	addr := config.UpstreamDialAddr(server)
+
 	// 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
 	defer cancel()
@@ -226,12 +231,12 @@ func (qo *FastQueryOptimizer) queryServer(req *dns.Msg, server string) *QueryRes
 		Timeout: qo.getTimeout(),
 	}
 
-	resp, rtt, err := client.ExchangeContext(ctx, req, server)
+	resp, rtt, err := client.ExchangeContext(ctx, req, addr)
 
 	// UDP失败时尝试TCP（可能是响应太大）
 	if err != nil && qo.enableFallback {
 		client.Net = "tcp"
-		resp, rtt, err = client.ExchangeContext(ctx, req, server)
+		resp, rtt, err = client.ExchangeContext(ctx, req, addr)
 	}
 
 	result := &QueryResult{

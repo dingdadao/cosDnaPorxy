@@ -345,7 +345,7 @@ func TestProcessQueryFallsBackToBackupDNS(t *testing.T) {
 		t.Fatalf("加载分流规则失败: %v", err)
 	}
 
-	h.processQuery(nopWriter{}, ecsQuery(1232, false), "a.example.com", dns.TypeA)
+	h.processQuery(nopWriter{}, ecsQuery(1232, false), "a.example.com", dns.TypeA, "-")
 
 	got := backup.lastRequest(t)
 	if got == nil || len(got.Question) == 0 || got.Question[0].Name != "a.example.com." {
@@ -532,7 +532,7 @@ func TestProcessQueryNXDOMAINDoesNotFallbackToBackup(t *testing.T) {
 	}
 
 	w := &capWriter{}
-	h.processQuery(w, ecsQuery(1232, false), "a.example.com", dns.TypeA)
+	h.processQuery(w, ecsQuery(1232, false), "a.example.com", dns.TypeA, "-")
 
 	got := w.get()
 	if got == nil {
