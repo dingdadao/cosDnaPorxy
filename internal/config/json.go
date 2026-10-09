@@ -11,6 +11,7 @@ import (
 type ConfigJSON struct {
 	ListenPort            int             `json:"listen_port"`
 	WebAddr               string          `json:"web_addr"`
+	WebTLSAddr            string          `json:"web_tls_addr"`
 	Upstream              []string        `json:"upstream"`
 	Timeout               string          `json:"timeout"`
 	ModernTimeout         string          `json:"modern_timeout"`
@@ -34,6 +35,32 @@ type ConfigJSON struct {
 	QueryLog              QueryLogJSON    `json:"query_log"`
 	EnableCloudflareCheck bool            `json:"enable_cloudflare_check"`
 	EnableAWSCheck        bool            `json:"enable_aws_check"`
+
+	EnableDot         bool              `json:"enable_dot"`
+	DotAddr           string            `json:"dot_addr"`
+	EnableDoh         bool              `json:"enable_doh"`
+	DohAddr           string            `json:"doh_addr"`
+	DohPath           string            `json:"doh_path"`
+	EnableDoh3        bool              `json:"enable_doh3"`
+	Doh3Addr          string            `json:"doh3_addr"`
+	DohAltSvc         string            `json:"doh_alt_svc"`
+	Doh3QuicMaxIdle   string            `json:"doh3_quic_max_idle"`
+	Doh3QuicKeepalive string            `json:"doh3_quic_keepalive"`
+	Doh3Allow0Rtt     bool              `json:"doh3_allow_0rtt"`
+	CertStoreDir      string            `json:"cert_store_dir"`
+	CertDefault       string            `json:"cert_default"`
+	WebTLS            bool              `json:"web_tls"`
+	WebhookToken      string            `json:"webhook_token"`
+	TrustedProxies    stringOrList      `json:"trusted_proxies"`
+	ClientIPSources   stringOrList      `json:"client_ip_sources"`
+	ClientIPHeaders   stringOrList      `json:"client_ip_headers"`
+	ClientIPStatic    map[string]string `json:"client_ip_static,omitempty"`
+	ClientGroups      []ClientGroupJSON `json:"client_groups"`
+	AllowACLs         stringOrList      `json:"allow_acls"`
+	SourceEnabled     bool              `json:"source_enabled"`
+	SourceDBDir       string            `json:"source_db_dir"`
+	SourceBaseURL     string            `json:"source_base_url"`
+	SourceUpdateHours int               `json:"source_update_hours"`
 
 	// 以下为旧版（两组硬编码分流列表）字段，仅用于导入兼容。
 	// 读取时若 split_lists 为空则据此合成迁移；写入时不再输出。
@@ -88,6 +115,21 @@ type SplitListJSON struct {
 	IPPrefer         string        `json:"ip_prefer"`
 }
 
+// ClientGroupJSON 客户端分组的 JSON 表示
+type ClientGroupJSON struct {
+	Name             string        `json:"name"`
+	Enabled          bool          `json:"enabled"`
+	Priority         int           `json:"priority"`
+	Match            stringOrList  `json:"match"`
+	Invert           bool          `json:"invert"`
+	DNS              stringOrList  `json:"dns"`
+	DNSMode          string        `json:"dns_mode"`
+	ECS              ECSPolicyJSON `json:"ecs"`
+	EnableCloudCheck bool          `json:"enable_cloud_check"`
+	IPPrefer         string        `json:"ip_prefer"`
+	AllowDomainSplit bool          `json:"allow_domain_split"`
+}
+
 // ECSPolicyJSON ECS 策略的 JSON 表示（缺字段时为零值＝关闭，老配置不受影响）
 type ECSPolicyJSON struct {
 	Enabled bool   `json:"enabled"`
@@ -132,9 +174,31 @@ func (c *Config) ToJSON() *ConfigJSON {
 		})
 	}
 
+	groups := make([]ClientGroupJSON, 0, len(c.ClientGroups))
+	for _, g := range c.ClientGroups {
+		groups = append(groups, ClientGroupJSON{
+			Name:     g.Name,
+			Enabled:  g.Enabled,
+			Priority: g.Priority,
+			Match:    stringOrList(g.Match),
+			Invert:   g.Invert,
+			DNS:      stringOrList(g.DNS),
+			DNSMode:  g.DNSMode,
+			ECS: ECSPolicyJSON{
+				Enabled: g.ECS.Enabled,
+				ISPType: g.ECS.ISPType,
+				Subnet:  g.ECS.Subnet,
+			},
+			EnableCloudCheck: g.EnableCloudCheck,
+			IPPrefer:         g.IPPrefer,
+			AllowDomainSplit: g.AllowDomainSplit,
+		})
+	}
+
 	return &ConfigJSON{
 		ListenPort:          c.ListenPort,
 		WebAddr:             c.WebAddr,
+		WebTLSAddr:          c.WebTLSAddr,
 		Upstream:            c.Upstream,
 		Timeout:             c.Timeout.String(),
 		ModernTimeout:       c.ModernTimeout.String(),
@@ -166,6 +230,32 @@ func (c *Config) ToJSON() *ConfigJSON {
 		},
 		EnableCloudflareCheck: c.EnableCloudflareCheck,
 		EnableAWSCheck:        c.EnableAWSCheck,
+
+		EnableDot:         c.EnableDoT,
+		DotAddr:           c.DoTAddr,
+		EnableDoh:         c.EnableDoH,
+		DohAddr:           c.DoHAddr,
+		DohPath:           c.DoHPath,
+		EnableDoh3:        c.EnableDoH3,
+		Doh3Addr:          c.DoH3Addr,
+		DohAltSvc:         c.DoHAltSvc,
+		Doh3QuicMaxIdle:   c.DoH3QUICMaxIdle.String(),
+		Doh3QuicKeepalive: c.DoH3QUICKeepAlive.String(),
+		Doh3Allow0Rtt:     c.DoH3Allow0RTT,
+		CertStoreDir:      c.CertStoreDir,
+		CertDefault:       c.CertDefault,
+		WebTLS:            c.WebTLS,
+		WebhookToken:      c.WebhookToken,
+		TrustedProxies:    stringOrList(c.TrustedProxies),
+		ClientIPSources:   stringOrList(c.ClientIPSources),
+		ClientIPHeaders:   stringOrList(c.ClientIPHeaders),
+		ClientIPStatic:    c.ClientIPStatic,
+		ClientGroups:      groups,
+		AllowACLs:         stringOrList(c.AllowACLs),
+		SourceEnabled:     c.SourceEnabled,
+		SourceDBDir:       c.SourceDBDir,
+		SourceBaseURL:     c.SourceBaseURL,
+		SourceUpdateHours: c.SourceUpdateHours,
 	}
 }
 
@@ -264,6 +354,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	cfg := &Config{
 		ListenPort:          j.ListenPort,
 		WebAddr:             j.WebAddr,
+		WebTLSAddr:          j.WebTLSAddr,
 		Upstream:            j.Upstream,
 		MaxIPRecords:        j.MaxIPRecords,
 		CNAMERecursionDepth: j.CNAMERecursionDepth,
@@ -288,6 +379,54 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		EnableAWSCheck:        j.EnableAWSCheck,
 	}
 
+	clientGroups := make([]ClientGroup, 0, len(j.ClientGroups))
+	for i, g := range j.ClientGroups {
+		if !ValidIPPrefer(g.IPPrefer) {
+			return nil, fmt.Errorf("client_groups[%d].ip_prefer: 非法取值 %q", i, g.IPPrefer)
+		}
+		clientGroups = append(clientGroups, ClientGroup{
+			Name:     g.Name,
+			Enabled:  g.Enabled,
+			Priority: g.Priority,
+			Match:    []string(g.Match),
+			Invert:   g.Invert,
+			DNS:      []string(g.DNS),
+			DNSMode:  g.DNSMode,
+			ECS: ECSPolicy{
+				Enabled: g.ECS.Enabled,
+				ISPType: g.ECS.ISPType,
+				Subnet:  g.ECS.Subnet,
+			},
+			EnableCloudCheck: g.EnableCloudCheck,
+			IPPrefer:         g.IPPrefer,
+			AllowDomainSplit: g.AllowDomainSplit,
+		})
+	}
+	cfg.ClientGroups = clientGroups
+	cfg.SourceEnabled = j.SourceEnabled
+	cfg.SourceDBDir = j.SourceDBDir
+	cfg.SourceBaseURL = j.SourceBaseURL
+	cfg.SourceUpdateHours = j.SourceUpdateHours
+	cfg.TrustedProxies = []string(j.TrustedProxies)
+	cfg.ClientIPSources = []string(j.ClientIPSources)
+	cfg.ClientIPHeaders = []string(j.ClientIPHeaders)
+	cfg.ClientIPStatic = j.ClientIPStatic
+	cfg.AllowACLs = []string(j.AllowACLs)
+
+	cfg.EnableDoT = j.EnableDot
+	cfg.DoTAddr = j.DotAddr
+	cfg.EnableDoH = j.EnableDoh
+	cfg.DoHAddr = j.DohAddr
+	cfg.DoHPath = j.DohPath
+	cfg.EnableDoH3 = j.EnableDoh3
+	cfg.DoH3Addr = j.Doh3Addr
+	cfg.DoHAltSvc = j.DohAltSvc
+	cfg.DoH3Allow0RTT = j.Doh3Allow0Rtt
+	cfg.CertStoreDir = j.CertStoreDir
+	cfg.CertDefault = j.CertDefault
+	cfg.WebTLS = j.WebTLS
+	cfg.WebhookToken = j.WebhookToken
+
 	var err error
 	if cfg.Timeout, err = parseDuration(j.Timeout, def.Timeout); err != nil {
 		return nil, fmt.Errorf("timeout: %w", err)
@@ -306,6 +445,12 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	}
 	if cfg.QueryLog.Retention, err = parseDuration(j.QueryLog.Retention, queryLog.Retention); err != nil {
 		return nil, fmt.Errorf("query_log.retention: %w", err)
+	}
+	if cfg.DoH3QUICMaxIdle, err = parseDuration(j.Doh3QuicMaxIdle, def.DoH3QUICMaxIdle); err != nil {
+		return nil, fmt.Errorf("doh3_quic_max_idle: %w", err)
+	}
+	if cfg.DoH3QUICKeepAlive, err = parseDuration(j.Doh3QuicKeepalive, def.DoH3QUICKeepAlive); err != nil {
+		return nil, fmt.Errorf("doh3_quic_keepalive: %w", err)
 	}
 
 	return cfg, nil

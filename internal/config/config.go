@@ -11,7 +11,8 @@ import (
 const (
 	DefaultStorePath    = "./data/config.db"    // SQLite 配置库存储路径
 	DefaultQueryLogPath = "./data/query_log.db" // 解析日志库存储路径（独立于配置库）
-	DefaultWebAddr      = ":5380"               // Web 管理端默认监听地址
+	DefaultWebAddr      = ":8880"               // Web 管理端默认 HTTP 监听地址
+	DefaultWebTLSAddr   = ":8843"               // Web 管理端默认 HTTPS 监听地址
 	DefaultLogLevel     = "info"
 )
 
@@ -131,10 +132,26 @@ type QueryLogConfig struct {
 	MaxRows   int           // 最大保留条数，超出后删除最旧记录
 }
 
+// ClientGroup 客户端分组：按来源 IP 决定上游、ECS、云检测与 A/AAAA 偏好
+type ClientGroup struct {
+	Name             string    // 分组名称
+	Enabled          bool      // 是否启用
+	Priority         int       // 优先级，大者优先
+	Match            []string  // IP / CIDR / 国家或运营商 code
+	Invert           bool      // 取反匹配
+	DNS              []string  // 命中后使用的上游列表
+	DNSMode          string    // race / failover
+	ECS              ECSPolicy // 复用现有 ECS 结构
+	EnableCloudCheck bool
+	IPPrefer         string
+	AllowDomainSplit bool // 是否继续进入域名分流阶段
+}
+
 // Config 配置结构体（内存表示，时长为 time.Duration）
 type Config struct {
 	ListenPort             int
-	WebAddr                string         // Web 管理端监听地址
+	WebAddr                string         // Web 管理端 HTTP 监听地址
+	WebTLSAddr             string         // Web 管理端 HTTPS 监听地址
 	Upstream               []string       // 上游DNS服务器（统一URL scheme）
 	Timeout                time.Duration  // 传统协议(UDP/TCP)查询超时
 	ModernTimeout          time.Duration  // 现代协议(DoH/DoT/DoH3)查询超时
@@ -158,6 +175,41 @@ type Config struct {
 	QueryLog               QueryLogConfig // 解析日志配置
 	EnableCloudflareCheck  bool           // Cloudflare IP 检测与替换开关
 	EnableAWSCheck         bool           // AWS IP 检测与替换开关
+
+	// 入站加密服务
+	EnableDoT  bool
+	DoTAddr    string
+	EnableDoH  bool
+	DoHAddr    string
+	DoHPath    string
+	EnableDoH3 bool
+	DoH3Addr   string
+
+	// DoH/DoH3 调优
+	DoHAltSvc         string
+	DoH3QUICMaxIdle   time.Duration
+	DoH3QUICKeepAlive time.Duration
+	DoH3Allow0RTT     bool
+
+	// 证书托管
+	CertStoreDir string
+	CertDefault  string
+	WebTLS       bool
+
+	// Webhook 与客户端 IP
+	WebhookToken    string
+	TrustedProxies  []string
+	ClientIPSources []string
+	ClientIPHeaders []string
+	ClientIPStatic  map[string]string // 连接 IP -> 客户端 IP 静态映射
+	ClientGroups    []ClientGroup
+	AllowACLs       []string
+
+	// 客户端来源识别（运营商 IP 段库）
+	SourceEnabled     bool   // 是否启用运营商识别
+	SourceDBDir       string // 运营商段库目录（内含 <isp>.txt，逐行 CIDR）
+	SourceBaseURL     string // 运营商段下载源目录（如 https://ispip.clang.cn）
+	SourceUpdateHours int    // 自动更新间隔（小时）；0 表示不自动更新
 }
 
 // DefaultConfig 返回内置默认配置（首次启动且数据库中无配置时使用）
@@ -216,6 +268,34 @@ func DefaultConfig() *Config {
 		},
 		EnableCloudflareCheck: true,
 		EnableAWSCheck:        false,
+
+		EnableDoT:  false,
+		DoTAddr:    ":853",
+		EnableDoH:  false,
+		DoHAddr:    ":443",
+		DoHPath:    "/dns-query",
+		EnableDoH3: false,
+		DoH3Addr:   "",
+
+		DoHAltSvc:         "h3=\":443\"; ma=86400",
+		DoH3QUICMaxIdle:   3 * time.Minute,
+		DoH3QUICKeepAlive: 30 * time.Second,
+		DoH3Allow0RTT:     false,
+
+		CertStoreDir: "./data/certs",
+		CertDefault:  "",
+		WebTLS:       true,
+		WebTLSAddr:   DefaultWebTLSAddr,
+
+		TrustedProxies:    []string{"127.0.0.1/32", "::1/128"},
+		ClientIPSources:   []string{"static", "header", "socket"},
+		ClientIPHeaders:   []string{"cf-connecting-ip", "x-forwarded-for", "x-real-ip"},
+		ClientGroups:      []ClientGroup{},
+		AllowACLs:         []string{},
+		SourceEnabled:     false,
+		SourceDBDir:       "",
+		SourceBaseURL:     "https://ispip.clang.cn",
+		SourceUpdateHours: 0,
 	}
 }
 
@@ -227,8 +307,33 @@ func ValidateConfig(cfg *Config) error {
 	if len(cfg.Upstream) == 0 {
 		return fmt.Errorf("no upstream servers configured")
 	}
+
+	// 上游地址归一化：缺端口按协议补默认端口（udp/tcp→53、tls→853），非法值直接拒绝
+	// 不补端口会让 dial 报 "missing port in address"，且旧配置里的 udp://1.1.1.1 写法会静默失效
+	if err := normalizeUpstreamList("upstream", cfg.Upstream); err != nil {
+		return err
+	}
+	if norm, err := normalizeUpstreamField("backup_dns", cfg.BackupDNS); err != nil {
+		return err
+	} else {
+		cfg.BackupDNS = norm
+	}
+	for i := range cfg.SplitLists {
+		if err := normalizeUpstreamList(fmt.Sprintf("split_lists[%d].dns", i), cfg.SplitLists[i].DNS); err != nil {
+			return err
+		}
+	}
+	for i := range cfg.ClientGroups {
+		if err := normalizeUpstreamList(fmt.Sprintf("client_groups[%d].dns", i), cfg.ClientGroups[i].DNS); err != nil {
+			return err
+		}
+	}
+
 	if cfg.WebAddr == "" {
 		cfg.WebAddr = DefaultWebAddr
+	}
+	if cfg.WebTLSAddr == "" {
+		cfg.WebTLSAddr = DefaultWebTLSAddr
 	}
 	if cfg.Cache.MaxItems <= 0 {
 		cfg.Cache.MaxItems = 5000
@@ -251,5 +356,96 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.ReplaceAPICount <= 0 {
 		cfg.ReplaceAPICount = 1
 	}
+
+	// 入站服务默认端口
+	if cfg.DoTAddr == "" {
+		cfg.DoTAddr = ":853"
+	}
+	if cfg.DoHAddr == "" {
+		cfg.DoHAddr = ":443"
+	}
+	if cfg.DoHPath == "" {
+		cfg.DoHPath = "/dns-query"
+	}
+	if !strings.HasPrefix(cfg.DoHPath, "/") {
+		cfg.DoHPath = "/" + cfg.DoHPath
+	}
+	if cfg.DoH3Addr == "" {
+		cfg.DoH3Addr = cfg.DoHAddr
+	}
+	if cfg.DoHAltSvc == "" {
+		cfg.DoHAltSvc = "h3=\":443\"; ma=86400"
+	}
+	if cfg.DoH3QUICMaxIdle <= 0 {
+		cfg.DoH3QUICMaxIdle = 3 * time.Minute
+	}
+	if cfg.DoH3QUICKeepAlive <= 0 {
+		cfg.DoH3QUICKeepAlive = 30 * time.Second
+	}
+	if cfg.CertStoreDir == "" {
+		cfg.CertStoreDir = "./data/certs"
+	}
+	if len(cfg.ClientIPSources) == 0 {
+		cfg.ClientIPSources = []string{"static", "header", "socket"}
+	}
+	if len(cfg.ClientIPHeaders) == 0 {
+		cfg.ClientIPHeaders = []string{"cf-connecting-ip", "x-forwarded-for", "x-real-ip"}
+	}
+
+	// 校验客户端 IP 取值来源：非法值会让该优先级静默失效
+	for _, src := range cfg.ClientIPSources {
+		switch strings.TrimSpace(src) {
+		case "", "static", "header", "socket":
+		default:
+			return fmt.Errorf("client_ip_sources: 非法取值 %q（可选 static/header/socket）", src)
+		}
+	}
+
+	// 校验可信代理：非法网段会导致请求头永不采信
+	for _, p := range cfg.TrustedProxies {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !ValidIPOrCIDR(p) {
+			return fmt.Errorf("trusted_proxies: 非法 IP/CIDR %q", p)
+		}
+	}
+
+	// 校验客户端分组
+	for i, g := range cfg.ClientGroups {
+		if g.Name == "" {
+			return fmt.Errorf("client_groups[%d]: name 不能为空", i)
+		}
+		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover {
+			return fmt.Errorf("client_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
+		}
+		if g.IPPrefer != "" && !ValidIPPrefer(g.IPPrefer) {
+			return fmt.Errorf("client_groups[%d].ip_prefer: 非法取值 %q", i, g.IPPrefer)
+		}
+		// 匹配项：支持 裸 IP、CIDR、isp:<name>；非法项会被匹配器静默跳过，故此处直接拒绝
+		for _, m := range g.Match {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			if strings.HasPrefix(m, "isp:") {
+				continue // 运营商匹配：非空即可，非法名在匹配期忽略
+			}
+			if !ValidIPOrCIDR(m) {
+				return fmt.Errorf("client_groups[%d].match: 非法 IP/CIDR %q", i, m)
+			}
+		}
+	}
+
 	return nil
+}
+
+// ValidIPOrCIDR 判断字符串是否为合法的裸 IP（v4/v6）或 CIDR 网段
+func ValidIPOrCIDR(s string) bool {
+	if _, err := netip.ParseAddr(s); err == nil {
+		return true
+	}
+	_, err := netip.ParsePrefix(s)
+	return err == nil
 }

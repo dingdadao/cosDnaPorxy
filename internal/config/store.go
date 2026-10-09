@@ -68,6 +68,20 @@ CREATE TABLE IF NOT EXISTS overrides (
 	updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_overrides_domain ON overrides(domain);
+
+CREATE TABLE IF NOT EXISTS certs (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	name        TEXT NOT NULL UNIQUE,
+	domains     TEXT NOT NULL,
+	cert_path   TEXT NOT NULL,
+	key_path    TEXT NOT NULL,
+	fingerprint TEXT NOT NULL,
+	not_before  INTEGER NOT NULL,
+	not_after   INTEGER NOT NULL,
+	source      TEXT NOT NULL,
+	updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_certs_fingerprint ON certs(fingerprint);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化配置库表结构失败: %w", err)
@@ -186,4 +200,143 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// CertRecord 证书元数据（数据库层）
+type CertRecord struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Domains     []string  `json:"domains"`
+	CertPath    string    `json:"cert_path"`
+	KeyPath     string    `json:"key_path"`
+	Fingerprint string    `json:"fingerprint"`
+	NotBefore   time.Time `json:"not_before"`
+	NotAfter    time.Time `json:"not_after"`
+	Source      string    `json:"source"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// marshalDomains 将域名数组序列化为 JSON
+func marshalDomains(domains []string) string {
+	b, _ := json.Marshal(domains)
+	return string(b)
+}
+
+// unmarshalDomains 从 JSON 反序列化域名数组
+func unmarshalDomains(s string) ([]string, error) {
+	var domains []string
+	if err := json.Unmarshal([]byte(s), &domains); err != nil {
+		return nil, err
+	}
+	return domains, nil
+}
+
+// ListCerts 查询所有证书元数据
+func (s *Store) ListCerts() ([]CertRecord, error) {
+	rows, err := s.db.Query(`SELECT id, name, domains, cert_path, key_path, fingerprint, not_before, not_after, source, updated_at FROM certs ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("查询证书失败: %w", err)
+	}
+	defer rows.Close()
+
+	var list []CertRecord
+	for rows.Next() {
+		var r CertRecord
+		var domainsJSON string
+		var notBefore, notAfter, updatedAt int64
+		if err := rows.Scan(&r.ID, &r.Name, &domainsJSON, &r.CertPath, &r.KeyPath, &r.Fingerprint, &notBefore, &notAfter, &r.Source, &updatedAt); err != nil {
+			return nil, fmt.Errorf("读取证书失败: %w", err)
+		}
+		domains, err := unmarshalDomains(domainsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("解析证书域名失败: %w", err)
+		}
+		r.Domains = domains
+		r.NotBefore = time.Unix(notBefore, 0)
+		r.NotAfter = time.Unix(notAfter, 0)
+		r.UpdatedAt = time.Unix(updatedAt, 0)
+		list = append(list, r)
+	}
+	return list, rows.Err()
+}
+
+// GetCertByName 按名称查询证书
+func (s *Store) GetCertByName(name string) (*CertRecord, error) {
+	row := s.db.QueryRow(`SELECT id, name, domains, cert_path, key_path, fingerprint, not_before, not_after, source, updated_at FROM certs WHERE name = ?`, name)
+	var r CertRecord
+	var domainsJSON string
+	var notBefore, notAfter, updatedAt int64
+	if err := row.Scan(&r.ID, &r.Name, &domainsJSON, &r.CertPath, &r.KeyPath, &r.Fingerprint, &notBefore, &notAfter, &r.Source, &updatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取证书失败: %w", err)
+	}
+	domains, err := unmarshalDomains(domainsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("解析证书域名失败: %w", err)
+	}
+	r.Domains = domains
+	r.NotBefore = time.Unix(notBefore, 0)
+	r.NotAfter = time.Unix(notAfter, 0)
+	r.UpdatedAt = time.Unix(updatedAt, 0)
+	return &r, nil
+}
+
+// GetCertByFingerprint 按指纹查询证书
+func (s *Store) GetCertByFingerprint(fp string) (*CertRecord, error) {
+	row := s.db.QueryRow(`SELECT id, name, domains, cert_path, key_path, fingerprint, not_before, not_after, source, updated_at FROM certs WHERE fingerprint = ?`, fp)
+	var r CertRecord
+	var domainsJSON string
+	var notBefore, notAfter, updatedAt int64
+	if err := row.Scan(&r.ID, &r.Name, &domainsJSON, &r.CertPath, &r.KeyPath, &r.Fingerprint, &notBefore, &notAfter, &r.Source, &updatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取证书失败: %w", err)
+	}
+	domains, err := unmarshalDomains(domainsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("解析证书域名失败: %w", err)
+	}
+	r.Domains = domains
+	r.NotBefore = time.Unix(notBefore, 0)
+	r.NotAfter = time.Unix(notAfter, 0)
+	r.UpdatedAt = time.Unix(updatedAt, 0)
+	return &r, nil
+}
+
+// AddOrReplaceCert 添加或替换证书（同 name 覆盖）
+func (s *Store) AddOrReplaceCert(r *CertRecord) error {
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`INSERT INTO certs(name, domains, cert_path, key_path, fingerprint, not_before, not_after, source, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			domains = excluded.domains,
+			cert_path = excluded.cert_path,
+			key_path = excluded.key_path,
+			fingerprint = excluded.fingerprint,
+			not_before = excluded.not_before,
+			not_after = excluded.not_after,
+			source = excluded.source,
+			updated_at = excluded.updated_at`,
+		r.Name, marshalDomains(r.Domains), r.CertPath, r.KeyPath, r.Fingerprint,
+		r.NotBefore.Unix(), r.NotAfter.Unix(), r.Source, now)
+	if err != nil {
+		return fmt.Errorf("保存证书失败: %w", err)
+	}
+	return nil
+}
+
+// DeleteCert 删除证书
+func (s *Store) DeleteCert(name string) error {
+	res, err := s.db.Exec(`DELETE FROM certs WHERE name = ?`, name)
+	if err != nil {
+		return fmt.Errorf("删除证书失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("证书不存在: %s", name)
+	}
+	return nil
 }
