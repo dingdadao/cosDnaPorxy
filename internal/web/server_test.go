@@ -32,7 +32,7 @@ func newTestAPIServer(t *testing.T) *Server {
 	t.Cleanup(func() { store.Close() })
 
 	logger := utils.NewEnhancedLogger("error", "test", false)
-	return NewServer(store, logger, func() *dns.RefactoredHandler { return nil }, nil, nil)
+	return NewServer(store, logger, func() *dns.RefactoredHandler { return nil }, func() *dns.CertStore { return nil }, nil, nil)
 }
 
 // doJSON 执行请求并返回记录器

@@ -189,6 +189,19 @@
   .icon-btn:disabled { opacity:.28; cursor:not-allowed; color:var(--text-3); background:none; }
   .list-add { align-self:flex-start; margin-top:2px; }
 
+  /* 客户端分组：优先级输入 */
+  .cg-prio { display:inline-flex; align-items:center; }
+  .cg-prio-input { width:56px; text-align:center; font-family:var(--mono); font-size:12px; padding:5px 6px; }
+  .cg-prio::before { content:"P"; font-size:10px; color:var(--text-3); margin-right:3px; }
+
+  /* 证书状态徽标 */
+  .badge-restart.cert-ok { color:var(--success); border-color:rgba(63,185,80,.45); }
+  .badge-restart.cert-warn { color:var(--warning); border-color:rgba(224,165,60,.45); }
+  .badge-restart.cert-bad { color:var(--danger); border-color:rgba(248,81,73,.45); }
+
+  /* 卡片标题行（标题 + 右侧操作） */
+  .card-head.split { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+
   .form-actions { display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-top:2px; }
 
   /* ---------- 规则页 ---------- */
@@ -383,6 +396,8 @@ const setPath = (o,p,v) => { const ks=p.split("."), last=ks.pop(); const t=ks.re
 const RESTART_KEYS = new Set([
   "listen_port","web_addr","log_format","cache.max_items","cache.max_async_workers",
   "cloudflare_net_file","cloudflare_net_file6","aws_net_file","network_refresh",
+  "enable_dot","dot_addr","enable_doh","doh_addr","doh_path","enable_doh3","doh3_addr",
+  "doh_alt_svc","doh3_allow_0rtt","cert_store_dir","cert_default","web_tls","web_tls_addr",
 ]);
 const FIELD_LABELS = {}; // 渲染时填充，用于重启横幅显示中文名
 
@@ -408,22 +423,70 @@ const SECTIONS = [
     ]},
     { kind:"advanced", title:"监听与服务（修改需重启进程）", body:[
       { id:"listen_port", label:"DNS 监听端口", type:"number", restart:true, help:"1–65535，DNS 服务实际监听端口" },
-      { id:"web_addr", label:"Web 管理端地址", type:"text", mono:true, restart:true, help:"如 :5380 或 127.0.0.1:5380" },
+      { id:"web_addr", label:"HTTP 管理端地址", type:"text", mono:true, restart:true, help:"如 :8880 或 127.0.0.1:8880，默认 8880" },
+      { id:"web_tls_addr", label:"HTTPS 管理端地址", type:"text", mono:true, restart:true, help:"如 :8843 或 127.0.0.1:8843，默认 8843；需开启「Web 管理端 HTTPS」" },
       { id:"log_format", label:"日志格式", type:"select", options:["text","json"], restart:true },
     ]},
   ]},
   { id:"upstream", title:"上游与域名分流", desc:"上游 DNS、查询超时，以及按域名列表定向到不同 DNS 解析。", cards:[
     { title:"上游 DNS 与超时", body:[
       { id:"upstream", label:"上游 DNS 服务器", type:"list", span2:true,
-        help:"按顺序查询；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://(DoH3)，至少保留一个" },
+        help:"按顺序查询；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://(DoH3)，至少保留一个。未写端口时按协议自动补默认端口（udp/tcp→53、tls→853、https/h3→443），保存后即按补全结果落库" },
       { id:"timeout", label:"传统协议超时（UDP/TCP）", type:"duration", placeholder:"1.5s" },
       { id:"modern_timeout", label:"现代协议超时（DoH/DoT/DoH3）", type:"duration", placeholder:"1s" },
       { id:"backup_dns", label:"备用 DNS", type:"text", mono:true, span2:true,
-        help:"所有上游均失败后的兜底解析器" },
+        help:"所有上游均失败后的兜底解析器；未写端口按 udp 默认补 :53" },
     ]},
     { title:"域名分流列表", body:[
       { id:"split_lists", label:"分流列表", type:"splitlist", span2:true,
         help:"自上而下即匹配优先级：命中第一条启用的列表即按其 DNS 处理，后面的不再参与。每条列表：命中后使用的 DNS（可多条，按「解析模式」并发竞速或串行故障转移）+ 域名列表文件（本地 YAML，mihomo 风格 payload）+ 可选下载 URL 与刷新间隔；开启「取反匹配」则该列表变为排除清单（域名不在清单里才命中）。列表增删、文件路径、刷新间隔、启用状态变更需重启；调整顺序、DNS、解析模式、取反、ECS、A/AAAA 偏好均可热更新。" },
+    ]},
+  ]},
+  { id:"inbound", title:"入站加密服务", desc:"对外提供 DoT / DoH / DoH3 加密解析；证书在「证书托管」页管理。", cards:[
+    { kind:"toggle", key:"enable_dot", title:"DoT（DNS over TLS）",
+      desc:"TCP 上的 DNS over TLS（RFC 7858），默认 :853。", body:[
+      { id:"dot_addr", label:"DoT 监听地址", type:"text", mono:true, span2:true, restart:true, placeholder:":853" },
+    ]},
+    { kind:"toggle", key:"enable_doh", title:"DoH（DNS over HTTPS / HTTP2）",
+      desc:"TCP 上的 RFC 8484 DoH，可自动向客户端通告 DoH3（Alt-Svc）。", body:[
+      { id:"doh_addr", label:"DoH 监听地址", type:"text", mono:true, restart:true, placeholder:":443" },
+      { id:"doh_path", label:"DoH 查询路径", type:"text", mono:true, restart:true, placeholder:"/dns-query" },
+      { id:"doh_alt_svc", label:"Alt-Svc 通告", type:"text", mono:true, span2:true, restart:true, placeholder:'h3=":443"; ma=86400',
+        help:"告诉客户端可改用 HTTP/3（DoH3）。客户端需先看到此响应头才会自动切换；留空则不通告。" },
+    ]},
+    { kind:"toggle", key:"enable_doh3", title:"DoH3（DNS over HTTP/3 / QUIC）",
+      desc:"UDP 上的 HTTP/3 DoH（RFC 9114）。请确保防火墙放通 UDP 端口，否则会静默失败。", body:[
+      { id:"doh3_addr", label:"DoH3 监听地址（UDP）", type:"text", mono:true, span2:true, restart:true,
+        placeholder:"留空 = 复用 DoH 地址的端口（UDP）" },
+      { id:"doh3_quic_max_idle", label:"QUIC 空闲超时", type:"duration", restart:true, placeholder:"3m",
+        help:"过短会导致客户端频繁重握手，反而更慢；建议 3–5 分钟。" },
+      { id:"doh3_quic_keepalive", label:"QUIC 保活间隔", type:"duration", restart:true, placeholder:"30s",
+        help:"维持 NAT 映射，避免中间设备静默回收连接；建议 30–60 秒。" },
+      { id:"doh3_allow_0rtt", label:"允许 0-RTT", type:"bool", restart:true,
+        help:"0-RTT 可降低重连延迟，但缺乏前向保密且有重放风险，默认关闭。" },
+    ]},
+    { kind:"toggle", key:"web_tls", title:"Web 管理端 HTTPS",
+      desc:"用「证书托管」中的证书为管理页面启用 HTTPS（端口见常规服务的「HTTPS 管理端地址」，默认 8843）；需重启服务生效。证书存储为空或不可用时不监听 HTTPS 端口，不影响 HTTP。", body:[] },
+    { kind:"advanced", title:"证书与 Webhook（证书目录/默认证书改动需重启）", body:[
+      { id:"cert_store_dir", label:"证书存储目录", type:"text", mono:true, span2:true, restart:true, placeholder:"./data/certs",
+        help:"私钥以 0600 落盘且仅存于该目录；手动 SSH 更新只需把 <name>.crt / <name>.key 成对放入。" },
+      { id:"cert_default", label:"默认证书名", type:"text", mono:true, restart:true, placeholder:"SNI 未命中时使用的证书名" },
+      { id:"webhook_token", label:"Webhook Token", type:"text", mono:true, span2:true,
+        help:"certd 等平台推送证书的鉴权令牌，以 URL 查询参数 ?token=xxx 传入（只认 query，不认请求头）；改动即时生效、无需重启。留空则 webhook 端点一律返回 403（关闭推送）。令牌明文存于配置库，且会随 /api/config 与「证书托管」页的地址回显，请勿把管理端口暴露到公网，也不要把带 token 的地址发到公开渠道。" },
+    ]},
+  ]},
+  { id:"clients", title:"客户端 IP 分流", desc:"按来源公网 IP 决定上游、ECS 与 A/AAAA 偏好；与域名分流正交（先定人、再定域名）。", cards:[
+    { title:"客户端 IP 解析", body:[
+      { id:"client_ip_sources", label:"取值优先级", type:"iplist", span2:true,
+        help:"依次尝试：static=静态映射（最高），header=请求头（仅连接 IP 命中可信代理时采信），socket=连接对端地址（兜底）。可拖动顺序调整优先级。" },
+      { id:"client_ip_headers", label:"请求头名称（顺序即优先级）", type:"iplist", span2:true,
+        help:"如 cf-connecting-ip / x-forwarded-for / x-real-ip。XFF 从右向左取第一个不在可信代理内的地址。" },
+      { id:"trusted_proxies", label:"可信代理（CIDR）", type:"iplist", span2:true,
+        help:"仅当连接对端命中这些网段时才采信上面的请求头，否则忽略以防伪造。如 127.0.0.1/32、::1/128。" },
+    ]},
+    { title:"客户端分组", body:[
+      { id:"client_groups", label:"分组规则", type:"clientgroups", span2:true,
+        help:"按 Priority 从大到小匹配，同值按自上而下顺序；命中即采用该组的上游 / ECS / 云检测 / A·AAAA 偏好。关闭「继续域名分流」时命中组后不再进入域名匹配。分组会按 scope 隔离缓存，粒度建议取粗以免降低命中率。" },
     ]},
   ]},
   { id:"cloud", title:"云 IP 检测与替换", desc:"识别 Cloudflare / AWS 地址并替换为优选 IP。", cards:[
@@ -527,6 +590,20 @@ function humanizeConfig(c) {
     /* ip_prefer 空值＝跟随全局默认 */
     l.ip_prefer = String(l.ip_prefer || "").trim();
   });
+  /* 客户端分组：归一化数组字段与默认值 */
+  if (!Array.isArray(c.client_groups)) c.client_groups = [];
+  c.client_groups.forEach(g => {
+    if (!Array.isArray(g.match)) g.match = (g.match == null || g.match === "") ? [] : [g.match];
+    if (!Array.isArray(g.dns)) g.dns = (g.dns == null || g.dns === "") ? [] : [g.dns];
+    g.dns_mode = String(g.dns_mode || "").trim() || "race";
+    g.ip_prefer = String(g.ip_prefer || "").trim();
+    g.priority = Number(g.priority) || 0;
+    if (!g.ecs) g.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
+  });
+  /* 客户端 IP 取值链 / 请求头 / 可信代理：兼容单字符串写法 */
+  ["client_ip_sources","client_ip_headers","trusted_proxies"].forEach(k => {
+    if (!Array.isArray(c[k])) c[k] = (c[k] == null || c[k] === "") ? [] : [c[k]];
+  });
   return c;
 }
 
@@ -575,6 +652,7 @@ function currentRoute() {
   if (h === "overrides") return { type:"overrides" };
   if (h === "logs") return { type:"logs" };
   if (h === "stats") return { type:"stats" };
+  if (h === "certs") return { type:"certs" };
   if (h === "all") return { type:"all" };
   const id = SECTIONS.some(s => s.id === h) ? h : "general";
   return { type:"settings", id };
@@ -590,6 +668,8 @@ function buildSidebar(active) {
     SECTIONS.map(s => item("settings/"+s.id, s.title)).join("") +
     `<div class="nav-group">规则</div>` +
     item("overrides","域名篡改") +
+    `<div class="nav-group">证书</div>` +
+    item("certs","证书托管") +
     `<div class="nav-group">日志</div>` +
     item("logs","解析日志") +
     item("stats","统计报表") +
@@ -638,6 +718,9 @@ function updateChrome() {
 
 function walkFields(cards, cb) {
   cards.forEach(card => {
+    /* 开关卡片：其 key（如 enable_dot/enable_doh/enable_doh3）本身也是配置字段，
+       必须纳入脏检查与重启字段统计，否则拨动开关不会启用保存按钮 */
+    if (card.kind === "toggle") { FIELD_LABELS[card.key] = card.title; cb({ id: card.key, label: card.title }); }
     (card.body || []).forEach(node => {
       if (node.kind === "advanced" || node.kind === "toggle") walkFields([node], cb);
       else if (node.id) { FIELD_LABELS[node.id] = node.label; cb(node); }
@@ -685,8 +768,12 @@ function fieldHTML(f) {
       class="switch" data-bool-bind="${f.id}" aria-label="${esc(f.label)}"></button></div>`;
   } else if (f.type === "list") {
     control = listEditorHTML(f.id, val || []);
+  } else if (f.type === "iplist") {
+    control = ipListEditorHTML(f.id, val || []);
   } else if (f.type === "splitlist") {
     control = splitListEditorHTML(val || []);
+  } else if (f.type === "clientgroups") {
+    control = clientGroupEditorHTML(val || []);
   } else {
     const cls = f.mono ? "mono" : "";
     const ph = f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : "";
@@ -708,6 +795,28 @@ function listEditorHTML(id, items) {
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button></div>`;
   }).join("");
+  return `<div class="list-editor" data-list-group="${id}">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="list-add" data-id="${id}">+ 添加一条</button></div>`;
+}
+
+/* 按字段 ID 给出语义正确的输入占位提示 */
+function listPlaceholder(id) {
+  switch (id) {
+    case "client_ip_sources": return "static / header / socket";
+    case "client_ip_headers": return "x-forwarded-for";
+    case "trusted_proxies":   return "127.0.0.1/32";
+    default:                  return "127.0.0.1/32";
+  }
+}
+
+/* 纯字符串列表（IP/CIDR/请求头名等）：复用 data-list 与 list-add/list-del 的输入同步 */
+function ipListEditorHTML(id, items) {
+  const rows = items.map((v,i) => `<div class="list-row">
+      <span class="sl-idx">${i+1}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-list="${id}" data-idx="${i}" placeholder="${esc(listPlaceholder(id))}">
+      <button type="button" class="icon-btn" data-action="list-del" data-id="${id}" data-idx="${i}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`).join("");
   return `<div class="list-editor" data-list-group="${id}">${rows}
     <button type="button" class="btn btn-ghost small list-add" data-action="list-add" data-id="${id}">+ 添加一条</button></div>`;
 }
@@ -767,7 +876,7 @@ function splitListEditorHTML(items) {
       <div class="err" data-sl-err="${i}.name"></div>
       <div class="grid">
         ${field("dns", "命中时使用的 DNS", { span2:true, ph:"https://223.6.6.6/dns-query", list:true,
-          help:"可添加多个，按下面「解析模式」处理（互为备份）；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://" })}
+          help:"可添加多个，按下面「解析模式」处理（互为备份）；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://；未写端口按协议补默认端口（udp/tcp→53、tls→853）" })}
         ${field("dns_mode", "多 DNS 解析模式", { span2:true, def:"race", select:[
           { v:"race", label:"并发竞速：同时查询全部 DNS，取最快成功的结果（默认）" },
           { v:"failover", label:"串行故障转移：按上面顺序依次查询，前一个失败/超时才用下一个" },
@@ -836,6 +945,141 @@ function splitListEditorHTML(items) {
   }).join("");
   return `<div class="sl-editor" data-sl-group="split_lists">${rows}
     <button type="button" class="btn btn-ghost small list-add" data-action="sl-add">+ 添加一条分流列表</button></div>`;
+}
+
+/* 客户端分组编辑器：Priority 大者优先，同值按数组顺序 */
+function cgMatchHTML(i, list) {
+  const rows = (list || []).map((v, j) => `<div class="list-row">
+      <span class="sl-idx">${j+1}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-cg-match="${i}" data-cg-match-idx="${j}" placeholder="1.2.3.0/24 或 2001:db8::/32">
+      <button type="button" class="icon-btn" data-action="cg-match-del" data-cg-idx="${i}" data-cg-match-idx="${j}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`).join("");
+  return `<div class="list-editor">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="cg-match-add" data-cg-idx="${i}">+ 添加一条匹配</button></div>`;
+}
+function cgDNSHTML(i, servers) {
+  const rows = (servers || []).map((v, j) => {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(v||"") || [,""])[1];
+    const proto = scheme ? ["udp","tcp","https","tls","h3"].includes(scheme) ? scheme : "?" : "";
+    return `<div class="list-row">
+      <span class="proto ${scheme==="" ? "" : proto==="?"?"bad":"ok"}">${proto || "scheme"}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-cg-dns="${i}" data-cg-dns-idx="${j}" placeholder="https://223.6.6.6/dns-query">
+      <button type="button" class="icon-btn" data-action="cg-dns-del" data-cg-idx="${i}" data-cg-dns-idx="${j}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`;
+  }).join("");
+  return `<div class="list-editor">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="cg-dns-add" data-cg-idx="${i}">+ 添加一条 DNS</button></div>`;
+}
+function clientGroupEditorHTML(items) {
+  const rows = items.map((g, i) => {
+    const gdirty = cgDirty(g);
+    const field = (key, label, opts = {}) => `
+      <div class="field ${opts.span2?"span-2":""}">
+        <label for="cg_${i}_${key}"><span class="dirty-dot"></span>${esc(label)}</label>
+        ${opts.list ? cgDNSHTML(i, g.dns)
+          : opts.match ? cgMatchHTML(i, g.match)
+          : opts.select ? `<select id="cg_${i}_${key}" data-cg-idx="${i}" data-cg-field="${key}">
+          ${opts.select.map(o => {
+            const cur = String(g[key] ?? "").trim() || opts.def || opts.select[0].v;
+            return `<option value="${esc(o.v)}"${cur === o.v ? " selected" : ""}>${esc(o.label)}</option>`;
+          }).join("")}
+        </select>`
+          : `<input type="text" id="cg_${i}_${key}" class="mono" value="${esc(g[key] ?? "")}"
+          data-cg-idx="${i}" data-cg-field="${key}" placeholder="${esc(opts.ph || "")}">`}
+        ${opts.help ? `<div class="help">${esc(opts.help)}</div>` : ""}
+        <div class="err" data-cg-err="cg${i}.${key}"></div>
+      </div>`;
+    return `<div class="sl-item ${gdirty?"is-dirty":""}">
+      <div class="sl-head">
+        <span class="sl-idx">${i+1}</span>
+        <input type="text" class="sl-name" value="${esc(g.name ?? "")}" data-cg-idx="${i}"
+          data-cg-field="name" placeholder="分组名称（如 华东专线）" aria-label="分组名称">
+        <span class="cg-prio" title="优先级：数值大者先匹配">
+          <input type="number" class="cg-prio-input" value="${Number(g.priority)||0}" data-cg-idx="${i}" data-cg-field="priority" aria-label="优先级">
+        </span>
+        <button type="button" role="switch" aria-checked="${!!g.enabled}" class="switch"
+          data-cg-switch="${i}" aria-label="启用该分组"></button>
+        <button type="button" class="icon-btn move" data-action="cg-up" data-cg-idx="${i}" ${i===0?"disabled":""} aria-label="上移">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 12.5V3.5M4.5 7L8 3.5l3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn move" data-action="cg-down" data-cg-idx="${i}" ${i===items.length-1?"disabled":""} aria-label="下移">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 3.5v9M4.5 9l3.5 3.5L11.5 9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn" data-action="cg-del" data-cg-idx="${i}" aria-label="删除该分组">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div class="err" data-cg-err="cg${i}.name"></div>
+      <div class="grid">
+        ${field("match", "匹配来源 IP / CIDR", { span2:true, match:true,
+          help:"命中这些网段（或取反后不在其中）即启用本分组；支持 IPv4/IPv6 与 CIDR" })}
+        ${field("dns", "命中时使用的 DNS", { span2:true, list:true,
+          help:"支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://；填写后覆盖域名分流的候选上游；未写端口按协议补默认端口（udp/tcp→53、tls→853）" })}
+        ${field("dns_mode", "多 DNS 解析模式", { span2:true, def:"race", select:[
+          { v:"race", label:"并发竞速：同时查询全部 DNS，取最快成功的结果（默认）" },
+          { v:"failover", label:"串行故障转移：按顺序依次查询，前一个失败/超时才用下一个" },
+        ] })}
+        ${field("ip_prefer", "A/AAAA 解析偏好", { span2:true, select:[
+          { v:"", label:"跟随全局默认（在「常规服务」里配置）" },
+          { v:"prefer_a", label:"优先A" },
+          { v:"prefer_aaaa", label:"优先AAAA" },
+          { v:"only_a", label:"只能A" },
+        ] })}
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>取反匹配</span>
+          <small>开启后，来源 IP「不在」上面清单里时才命中本分组</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!g.invert}" class="switch"
+          data-cg-invert="${i}" aria-label="取反匹配"></button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>继续进入域名分流</span>
+          <small>开启时，命中本分组后仍按域名分流列表细化上游；关闭则直接使用本分组 DNS</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!g.allow_domain_split}" class="switch"
+          data-cg-ads="${i}" aria-label="继续进入域名分流"></button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>命中后做 CF/AWS 云检测</span>
+          <small>关闭时，本分组不启用云 IP 替换</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!g.enable_cloud_check}" class="switch"
+          data-cg-cloudcheck="${i}" aria-label="命中后做云检测"></button>
+      </div>
+      <div class="sl-opt">
+        <div class="txt">
+          <span>EDNS 客户端子网（按线路解析）</span>
+          <small>开启后向上游注入下面填的公网 IP；「自动」模式留空即用客户端真实 IP 派生</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!(g.ecs||{}).enabled}" class="switch"
+          data-cg-ecs="${i}" aria-label="向上游注入 EDNS 客户端子网"></button>
+      </div>
+      ${(g.ecs||{}).enabled ? `<div class="grid">
+        <div class="field">
+          <label for="cg_${i}_ecs_isp"><span class="dirty-dot"></span>线路类型</label>
+          <select id="cg_${i}_ecs_isp" data-cg-idx="${i}" data-cg-field="ecs.isp_type">
+            ${ECS_TYPES.map(t => `<option value="${t.v}"${((g.ecs||{}).isp_type||"telecom")===t.v?" selected":""}>${esc(t.label)}</option>`).join("")}
+          </select>
+          <div class="err" data-cg-err="cg${i}.ecs.isp_type"></div>
+        </div>
+        <div class="field">
+          <label for="cg_${i}_ecs_subnet"><span class="dirty-dot"></span>本地公网 IP / CIDR</label>
+          <input type="text" id="cg_${i}_ecs_subnet" class="mono" value="${esc((g.ecs||{}).subnet ?? "")}"
+            data-cg-idx="${i}" data-cg-field="ecs.subnet" placeholder="留空 = 用客户端真实 IP">
+          <div class="help">留空表示按客户端真实 IP 自动派生（IPv4 /24、IPv6 /56）；也可填固定网段</div>
+          <div class="err" data-cg-err="cg${i}.ecs.subnet"></div>
+        </div>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="sl-editor" data-cg-group="client_groups">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="cg-add">+ 添加一个客户端分组</button></div>`;
 }
 
 function cardHTML(card) {
@@ -943,12 +1187,25 @@ function showErrors(errors) {
   });
   $$("[data-sldns-list]").forEach(inp =>
     inp.classList.toggle("invalid", !!errors[inp.dataset.sldnsList + ".dns"]));
+  $$("[data-cg-err]").forEach(el => {
+    const msg = errors[el.dataset.cgErr];
+    el.textContent = msg || "";
+    el.classList.toggle("show", !!msg);
+  });
+  $$("[data-cg-field]").forEach(inp =>
+    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgIdx + "." + inp.dataset.cgField]));
+  $$("[data-cg-match]").forEach(inp =>
+    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgMatch + ".match"]));
+  $$("[data-cg-dns]").forEach(inp =>
+    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgDns + ".dns"]));
   const first = Object.keys(errors)[0];
   if (first) {
-    const el = $(`[data-bind="${first}"]`) || $(`[data-list-group="${first}"]`) || $(`[data-sl-err="${first}"]`);
+    const el = $(`[data-bind="${first}"]`) || $(`[data-list-group="${first}"]`) ||
+      $(`[data-sl-err="${first}"]`) || $(`[data-cg-err="${first}"]`);
     if (el) el.scrollIntoView({ behavior:"smooth", block:"center" });
     const inp = $(`[data-bind="${first}"]`) ||
-      $(`[data-sl-err="${first}"]`)?.parentElement.querySelector("[data-sl-field], [data-sldns-list]");
+      $(`[data-sl-err="${first}"]`)?.parentElement.querySelector("[data-sl-field], [data-sldns-list]") ||
+      $(`[data-cg-err="${first}"]`)?.parentElement.querySelector("[data-cg-field], [data-cg-match], [data-cg-dns]");
     if (inp) setTimeout(()=>inp.focus(), 250);
   }
 }
@@ -977,6 +1234,34 @@ function validateSplitLists(errors) {
       else if (!ecsSubnetValid(subnet)) errors[`${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
     }
   });
+}
+
+/* 校验客户端分组：名称必填；启用时需有匹配条件与上游；ECS 填了就必须合法 */
+function validateClientGroups(errors) {
+  (CFG.client_groups || []).forEach((g, i) => {
+    if (!String(g.name || "").trim()) errors[`cg${i}.name`] = "请填写分组名称";
+    const match = (g.match || []).map(s => String(s || "").trim()).filter(Boolean);
+    const servers = cgDNS(g);
+    if (g.enabled && !match.length) errors[`cg${i}.match`] = "启用分组需至少一条匹配条件";
+    else if (match.some(m => !cgMatchValid(m))) errors[`cg${i}.match`] = "匹配项须为合法 IP 或 CIDR，如 1.2.3.0/24、2001:db8::/32";
+    if (g.enabled && !servers.length) errors[`cg${i}.dns`] = "启用分组需至少一个上游 DNS";
+    if (servers.some(s => !DNS_RE.test(s))) errors[`cg${i}.dns`] = "DNS 地址须以 udp:// tcp:// https:// tls:// h3:// 开头";
+    const ecs = g.ecs || {};
+    if (ecs.enabled && ecs.subnet) {
+      if (!ECS_TYPES.some(t => t.v === ecs.isp_type)) errors[`cg${i}.ecs.isp_type`] = "请选择线路类型";
+      if (!ecsSubnetValid(String(ecs.subnet).trim())) errors[`cg${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24（留空=自动）";
+    }
+  });
+}
+
+/* 归一化一个客户端分组的 DNS：去空格去空项，始终数组 */
+function cgDNS(g) {
+  const raw = Array.isArray(g.dns) ? g.dns : (g.dns == null || g.dns === "" ? [] : [g.dns]);
+  return raw.map(s => String(s || "").trim()).filter(Boolean);
+}
+function cgMatch(g) {
+  const raw = Array.isArray(g.match) ? g.match : (g.match == null || g.match === "" ? [] : [g.match]);
+  return raw.map(s => String(s || "").trim()).filter(Boolean);
 }
 
 /* 分流列表中需重启才生效的变更（DNS/顺序/取反/ECS 均可热更新）
@@ -1025,8 +1310,29 @@ async function saveSections(secs) {
       subnet: String((l.ecs || {}).subnet || "").trim(),
     },
   }));
+  CFG.client_groups = (CFG.client_groups || []).map(g => ({
+    name: String(g.name || "").trim(),
+    enabled: !!g.enabled,
+    priority: Number(g.priority) || 0,
+    match: cgMatch(g),
+    invert: !!g.invert,
+    dns: cgDNS(g),
+    dns_mode: (String(g.dns_mode || "").trim() || "race"),
+    enable_cloud_check: !!g.enable_cloud_check,
+    ip_prefer: String(g.ip_prefer || "").trim(),
+    allow_domain_split: !!g.allow_domain_split,
+    ecs: {
+      enabled: !!(g.ecs || {}).enabled,
+      isp_type: String((g.ecs || {}).isp_type || "").trim(),
+      subnet: String((g.ecs || {}).subnet || "").trim(),
+    },
+  }));
+  ["client_ip_sources","client_ip_headers","trusted_proxies"].forEach(k => {
+    CFG[k] = (CFG[k] || []).map(s => String(s || "").trim()).filter(Boolean);
+  });
   const errors = validateSections(secs);
   validateSplitLists(errors);
+  validateClientGroups(errors);
   showErrors(errors);
   if (Object.keys(errors).length) {
     toast("请修正标红的字段后再保存", "err");
@@ -1058,6 +1364,22 @@ function isIPv4(s) {
   return !!m && m.slice(1).every(n => +n >= 0 && +n <= 255);
 }
 function isIPv6(s) { return s.includes(":") && /^[0-9a-fA-F:]+$/.test(s) && !s.includes("."); }
+
+/* 客户端分组匹配项：裸 IP 或 IP/CIDR（与服务端 ValidIPOrCIDR 对齐） */
+function cgMatchValid(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  const parts = t.split("/");
+  if (parts.length > 2) return false;
+  const addr = parts[0].trim();
+  const v4 = isIPv4(addr), v6 = isIPv6(addr);
+  if (!v4 && !v6) return false;
+  if (parts.length === 1) return true;
+  const plen = parts[1].trim();
+  if (!/^\d{1,3}$/.test(plen)) return false;
+  const n = Number(plen);
+  return v4 ? (n >= 0 && n <= 32) : (n >= 0 && n <= 128);
+}
 
 function renderOverrides() {
   const q = ovFilter.q.trim().toLowerCase();
@@ -1413,6 +1735,12 @@ function splitListDirty(l) {
   return !o || JSON.stringify(l) !== JSON.stringify(o);
 }
 
+/* 客户端分组脏标记：与基线中同名分组比对，调整顺序不误报 */
+function cgDirty(g) {
+  const o = (BASELINE.client_groups || []).find(b => (b.name || "") === (g.name || ""));
+  return !o || JSON.stringify(g) !== JSON.stringify(o);
+}
+
 /* 分流列表内嵌 DNS 列表的输入同步 */
 function syncSplitDNSInput(el) {
   if (el.dataset.sldnsList === undefined) return;
@@ -1434,10 +1762,59 @@ function syncSplitDNSInput(el) {
   }
   updateChrome();
 }
-document.addEventListener("input", e => { syncBoundInput(e.target); syncListInput(e.target); syncSplitListInput(e.target); syncSplitDNSInput(e.target); syncLogInput(e.target); });
+/* 客户端分组文本/下拉输入同步 */
+function syncClientGroupInput(el) {
+  const key = el.dataset.cgField;
+  if (!key) return;
+  const i = Number(el.dataset.cgIdx);
+  const item = (CFG.client_groups || [])[i];
+  if (!item) return;
+  if (key === "ecs.isp_type" || key === "ecs.subnet") {
+    if (!item.ecs) item.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
+  }
+  let v = el.value;
+  if (key === "priority") v = Number(v) || 0;
+  setPath(item, key, v);
+  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
+  const errEl = $(`[data-cg-err="cg${i}.${key}"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+function syncCGMatchInput(el) {
+  if (el.dataset.cgMatch === undefined) return;
+  const i = Number(el.dataset.cgMatch);
+  const item = (CFG.client_groups || [])[i];
+  if (!item) return;
+  if (!Array.isArray(item.match)) item.match = item.match == null || item.match === "" ? [] : [item.match];
+  item.match[Number(el.dataset.cgMatchIdx)] = el.value;
+  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
+  const errEl = $(`[data-cg-err="cg${i}.match"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+function syncCGDNSInput(el) {
+  if (el.dataset.cgDns === undefined) return;
+  const i = Number(el.dataset.cgDns);
+  const item = (CFG.client_groups || [])[i];
+  if (!item) return;
+  if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns];
+  item.dns[Number(el.dataset.cgDnsIdx)] = el.value;
+  const protoEl = el.parentElement.querySelector(".proto");
+  if (protoEl) {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(el.value||"") || [,""])[1];
+    protoEl.textContent = scheme || "scheme";
+    protoEl.className = "proto " + (scheme === "" ? "" : (["udp","tcp","https","tls","h3"].includes(scheme) ? "ok" : "bad"));
+  }
+  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
+  const errEl = $(`[data-cg-err="cg${i}.dns"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+document.addEventListener("input", e => { syncBoundInput(e.target); syncListInput(e.target); syncSplitListInput(e.target); syncSplitDNSInput(e.target); syncClientGroupInput(e.target); syncCGMatchInput(e.target); syncCGDNSInput(e.target); syncLogInput(e.target); syncCertInput(e.target); });
 document.addEventListener("change", e => {
   if (e.target.dataset.bind) { syncBoundInput(e.target); return; }
   if (e.target.dataset.slField) { syncSplitListInput(e.target); return; }
+  if (e.target.dataset.cgField) { syncClientGroupInput(e.target); return; }
   if (e.target.id === "ov-search") { ovFilter.q = e.target.value; renderOverrides(); $("#ov-search").focus(); }
   if (e.target.id === "ov-type-filter") { ovFilter.type = e.target.value; renderOverrides(); }
   if (e.target.id === "ov-en-filter") { ovFilter.enabled = e.target.value; renderOverrides(); }
@@ -1604,6 +1981,87 @@ document.addEventListener("click", async e => {
     return;
   }
 
+  /* 客户端分组编辑器 */
+  const cgAdd = e.target.closest('[data-action="cg-add"]');
+  if (cgAdd) {
+    CFG.client_groups = CFG.client_groups || [];
+    CFG.client_groups.push({ name:"", enabled:true, priority:0, match:[""], invert:false, dns:[""], dns_mode:"race",
+      enable_cloud_check:false, ip_prefer:"", allow_domain_split:true, ecs:{ enabled:false, isp_type:"telecom", subnet:"" } });
+    renderRoute();
+    const names = $$('[data-cg-field="name"]');
+    if (names.length) names[names.length-1].focus();
+    return;
+  }
+  const cgDel = e.target.closest('[data-action="cg-del"]');
+  if (cgDel) {
+    CFG.client_groups.splice(Number(cgDel.dataset.cgIdx), 1);
+    renderRoute();
+    return;
+  }
+  const cgMove = e.target.closest('[data-action="cg-up"],[data-action="cg-down"]');
+  if (cgMove) {
+    const up = cgMove.dataset.action === "cg-up";
+    const i = Number(cgMove.dataset.cgIdx);
+    const j = up ? i - 1 : i + 1;
+    const L = CFG.client_groups || [];
+    if (i >= 0 && j >= 0 && i < L.length && j < L.length) {
+      [L[i], L[j]] = [L[j], L[i]];
+      renderRoute();
+      $(`.sl-name[data-cg-idx="${j}"]`)?.focus();
+    }
+    return;
+  }
+  const cgMatchAdd = e.target.closest('[data-action="cg-match-add"]');
+  if (cgMatchAdd) {
+    const item = CFG.client_groups[Number(cgMatchAdd.dataset.cgIdx)];
+    if (item) { if (!Array.isArray(item.match)) item.match = item.match == null || item.match === "" ? [] : [item.match]; item.match.push(""); }
+    renderRoute();
+    const rows = $$(`[data-cg-match="${cgMatchAdd.dataset.cgIdx}"]`);
+    if (rows.length) rows[rows.length-1].focus();
+    return;
+  }
+  const cgMatchDel = e.target.closest('[data-action="cg-match-del"]');
+  if (cgMatchDel) {
+    const item = CFG.client_groups[Number(cgMatchDel.dataset.cgIdx)];
+    if (item && Array.isArray(item.match)) item.match.splice(Number(cgMatchDel.dataset.cgMatchIdx), 1);
+    renderRoute();
+    return;
+  }
+  const cgDnsAdd = e.target.closest('[data-action="cg-dns-add"]');
+  if (cgDnsAdd) {
+    const item = CFG.client_groups[Number(cgDnsAdd.dataset.cgIdx)];
+    if (item) { if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns]; item.dns.push(""); }
+    renderRoute();
+    const rows = $$(`[data-cg-dns="${cgDnsAdd.dataset.cgIdx}"]`);
+    if (rows.length) rows[rows.length-1].focus();
+    return;
+  }
+  const cgDnsDel = e.target.closest('[data-action="cg-dns-del"]');
+  if (cgDnsDel) {
+    const item = CFG.client_groups[Number(cgDnsDel.dataset.cgIdx)];
+    if (item && Array.isArray(item.dns)) item.dns.splice(Number(cgDnsDel.dataset.cgDnsIdx), 1);
+    renderRoute();
+    return;
+  }
+  const cgToggle = e.target.closest("[data-cg-switch],[data-cg-invert],[data-cg-ads],[data-cg-cloudcheck],[data-cg-ecs]");
+  if (cgToggle) {
+    const ds = cgToggle.dataset;
+    const i = Number(ds.cgSwitch ?? ds.cgInvert ?? ds.cgAds ?? ds.cgCloudcheck ?? ds.cgEcs);
+    const item = CFG.client_groups[i];
+    if (item) {
+      if (ds.cgSwitch !== undefined) item.enabled = !item.enabled;
+      else if (ds.cgInvert !== undefined) item.invert = !item.invert;
+      else if (ds.cgAds !== undefined) item.allow_domain_split = !item.allow_domain_split;
+      else if (ds.cgCloudcheck !== undefined) item.enable_cloud_check = !item.enable_cloud_check;
+      else if (ds.cgEcs !== undefined) {
+        if (!item.ecs) item.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
+        item.ecs.enabled = !item.ecs.enabled;
+      }
+      renderRoute();
+    }
+    return;
+  }
+
   /* 折叠区状态保持 */
   const adv = e.target.closest("[data-adv]");
   if (adv && e.target.tagName === "SUMMARY") {
@@ -1629,6 +2087,25 @@ document.addEventListener("click", async e => {
     walkFields(sec.cards, f => setPath(CFG, f.id, clone(getPath(BASELINE,f.id))));
     renderRoute();
     return;
+  }
+
+  /* 证书页操作 */
+  const certAct = e.target.closest('[data-action^="cert-"]');
+  if (certAct) {
+    const a = certAct.dataset.action;
+    if (a === "cert-upload") { uploadCert(certAct); return; }
+    if (a === "cert-del") { deleteCert(certAct.dataset.name); return; }
+    if (a === "cert-reload") { reloadCerts(certAct); return; }
+    if (a === "cert-copy-url") {
+      const el = $("#cert-deploy-url");
+      if (el) {
+        el.select();
+        const done = () => toast("Webhook 地址已复制", "ok");
+        if (navigator.clipboard?.writeText) navigator.clipboard.writeText(el.value).then(done, () => { document.execCommand("copy"); done(); });
+        else { document.execCommand("copy"); done(); }
+      }
+      return;
+    }
   }
 
   /* 规则页操作 */
@@ -1957,6 +2434,13 @@ function renderLogTable() {
 }
 
 /* 日志页筛选输入：改动即刷新（关键字防抖，只重绘表格以保持输入焦点） */
+/* 证书上传表单输入暂存（页面重渲染时不丢内容） */
+function syncCertInput(el) {
+  if (el.id === "cert-name") CERT_UPLOAD.name = el.value;
+  else if (el.id === "cert-pem") CERT_UPLOAD.cert = el.value;
+  else if (el.id === "cert-key") CERT_UPLOAD.key = el.value;
+}
+
 function syncLogInput(el) {
   const map = { "log-q":"q", "log-action":"action", "log-qtype":"qtype", "log-start":"start", "log-end":"end" };
   const key = map[el.id];
@@ -2148,6 +2632,152 @@ function renderStatBody() {
 }
 
 /* ================= 路由渲染入口 ================= */
+/* ================= 证书托管页 ================= */
+let CERTS = [], CERT_DEPLOY = null, CERT_UPLOAD = { name:"", cert:"", key:"" };
+
+async function loadCerts() {
+  const r = await api("GET", "/api/certs");
+  CERTS = r.certs || [];
+  try { CERT_DEPLOY = await api("GET", "/api/certs/deploy-config"); } catch (e) { CERT_DEPLOY = null; }
+}
+
+function certStatus(c) {
+  const d = Number(c.remaining_days);
+  if (d <= 0) return { cls:"cert-bad", text:"已过期" };
+  if (d < 14) return { cls:"cert-warn", text:`剩余 ${d} 天` };
+  return { cls:"cert-ok", text:`剩余 ${d} 天` };
+}
+function fmtDate(s) {
+  if (!s) return "--";
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  const p = n => String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+}
+function esc2(s) { return esc(String(s == null ? "" : s)); }
+
+function renderCerts() {
+  const rows = CERTS.map(c => {
+    const st = certStatus(c);
+    return `<tr>
+      <td class="wrap mono" data-label="名称">${esc2(c.name)}</td>
+      <td class="wrap mono" data-label="覆盖域名">${(c.domains||[]).map(esc2).join(", ") || "--"}</td>
+      <td data-label="来源"><span class="proto ok">${esc2(c.source || "-")}</span></td>
+      <td data-label="到期时间">${fmtDate(c.not_after)} <span class="badge-restart ${st.cls}">${st.text}</span></td>
+      <td class="mono" data-label="指纹" title="${esc2(c.fingerprint)}">${esc2((c.fingerprint||"").slice(0,16))}…</td>
+      <td class="cell-actions" data-label="">
+        <button class="btn btn-danger-ghost small" data-action="cert-del" data-name="${esc2(c.name)}">删除</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  const table = CERTS.length ? `
+    <div class="table-wrap">
+      <table class="rules">
+        <thead><tr><th>名称</th><th>覆盖域名</th><th style="width:88px">来源</th><th style="width:200px">到期时间</th><th style="width:150px">指纹</th><th style="width:90px">操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="count-note">共 ${CERTS.length} 张证书；DoT / DoH / DoH3 共用同一证书来源，按 SNI 自动选择，替换后无需重启。</div>`
+    : `<div class="table-wrap"><div class="empty">
+        <div class="big">还没有证书</div>
+        <div class="sub">上传证书或在下方通过 Webhook 由 certd 类平台自动推送；也可把 &lt;name&gt;.crt / &lt;name&gt;.key 成对放入证书目录后点「重扫目录」。</div>
+      </div></div>`;
+
+  const deploy = CERT_DEPLOY ? `
+    <div class="field span-2">
+      <label>Webhook 地址（certd「Webhook 部署」填此 URL）</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" class="mono" id="cert-deploy-url" value="${esc2(CERT_DEPLOY.url)}" readonly>
+        <button class="btn btn-ghost small" data-action="cert-copy-url">复制</button>
+      </div>
+      <div class="help">请求方式 ${esc2(CERT_DEPLOY.method)}，Content-Type ${esc2(CERT_DEPLOY.content_type)}；成功判定字符串填 <code>status</code>。字段映射：domain→名称，crt→证书 PEM，key→私钥 PEM，ic→中间证书（可选）。</div>
+    </div>` : `<div class="help span-2">Webhook 配置不可用（未配置 token 或证书功能未就绪）。</div>`;
+
+  $("#view").innerHTML = `<div class="view-inner">
+    <div class="page-head">
+      <h1>证书托管</h1>
+      <p>为 DoT / DoH / DoH3 提供证书。私钥仅以 0600 落盘于 <code>${esc2((CFG&&CFG.cert_store_dir)||"./data/certs")}</code>，不入库；更新后热加载，<b>无需重启</b>。</p>
+    </div>
+    <section class="card">
+      <div class="card-head split"><h2>证书列表</h2>
+        <button class="btn btn-ghost small" data-action="cert-reload">重扫目录（SSH 更新）</button>
+      </div>
+      <div class="card-body">${table}</div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>上传证书</h2></div>
+      <div class="card-body grid">
+        <div class="field">
+          <label for="cert-name">证书名称</label>
+          <input type="text" id="cert-name" class="mono" value="${esc2(CERT_UPLOAD.name)}" placeholder="dns.example.com">
+          <div class="help">仅作标识与文件名；同名会覆盖更新。</div>
+        </div>
+        <div class="field span-2">
+          <label for="cert-pem">证书 PEM（可含中间证书链）</label>
+          <textarea id="cert-pem" class="mono" rows="5" placeholder="-----BEGIN CERTIFICATE-----">${esc2(CERT_UPLOAD.cert)}</textarea>
+        </div>
+        <div class="field span-2">
+          <label for="cert-key">私钥 PEM</label>
+          <textarea id="cert-key" class="mono" rows="5" placeholder="-----BEGIN PRIVATE KEY-----">${esc2(CERT_UPLOAD.key)}</textarea>
+        </div>
+        <div class="form-actions" style="grid-column:1/-1">
+          <button class="btn btn-primary" data-action="cert-upload">上传并热加载</button>
+        </div>
+      </div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Webhook 自动部署</h2></div>
+      <div class="card-body grid">${deploy}</div>
+    </section>
+  </div>`;
+  updateChrome();
+}
+
+async function uploadCert(btn) {
+  const name = $("#cert-name").value.trim();
+  const cert = $("#cert-pem").value.trim();
+  const key = $("#cert-key").value.trim();
+  if (!name) { toast("请填写证书名称", "err"); return; }
+  if (!cert || !key) { toast("请粘贴证书与私钥 PEM", "err"); return; }
+  CERT_UPLOAD = { name, cert, key };
+  btn.classList.add("loading");
+  try {
+    await api("POST", "/api/certs", { name, cert, key });
+    CERT_UPLOAD = { name:"", cert:"", key:"" };
+    await loadCerts(); renderCerts();
+    toast("证书已上传并热加载", "ok");
+  } catch (e) {
+    toast("上传失败：" + e.message, "err");
+    btn.classList.remove("loading");
+  }
+}
+
+async function deleteCert(name) {
+  const ok = await confirmModal({
+    title:"删除证书",
+    bodyHTML:`确认删除证书 <code>${esc2(name)}</code>？删除后若仍在被 SNI 使用，握手会回退到默认证书或失败。`,
+    confirmText:"删除", danger:true,
+  });
+  if (!ok) return;
+  try {
+    await api("DELETE", "/api/certs/" + encodeURIComponent(name));
+    await loadCerts(); renderCerts();
+    toast("证书已删除", "warn");
+  } catch (e) { toast("删除失败：" + e.message, "err"); }
+}
+
+async function reloadCerts(btn) {
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "重扫中…"; }
+  try {
+    const r = await api("POST", "/api/certs/reload");
+    await loadCerts(); renderCerts();
+    toast(`重扫完成：发现 ${r.scanned} 张证书`, "ok");
+  } catch (e) { toast("重扫失败：" + e.message, "err"); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
+}
+
 function renderRoute() {
   const route = currentRoute();
   document.body.classList.remove("sidebar-open");
@@ -2158,6 +2788,10 @@ function renderRoute() {
     renderQueryLogs();
   } else if (route.type === "stats") {
     renderStats();
+  } else if (route.type === "certs") {
+    buildSidebar("certs");
+    renderCerts();
+    loadCerts().then(renderCerts).catch(e => toast("证书加载失败：" + e.message, "err"));
   } else if (route.type === "all") {
     buildSidebar("all");
     renderSettings(SECTIONS.map(s=>s.id), true);

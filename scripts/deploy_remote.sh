@@ -28,7 +28,7 @@ PY
 cd "$DIR" || { echo "无法进入 $DIR"; exit 1; }
 
 # 监听地址以配置库为准，避免与生产实际配置脱节
-WEB_ADDR=$(read_cfg web_addr); [ -n "$WEB_ADDR" ] || WEB_ADDR=":5380"
+WEB_ADDR=$(read_cfg web_addr); [ -n "$WEB_ADDR" ] || WEB_ADDR=":8880"
 LISTEN_PORT=$(read_cfg listen_port); [ -n "$LISTEN_PORT" ] || LISTEN_PORT=53
 WEB_PORT=${WEB_ADDR##*:}
 WEB_HOST=${WEB_ADDR%:*}

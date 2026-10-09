@@ -28,9 +28,13 @@ type RecoveryManager struct {
 	store           *config.Store
 	webServer       *web.Server
 	dnsHandler      *dns.RefactoredHandler
+	certStore       *dns.CertStore
 	queryLog        *querylog.Store // 进程级解析日志库（独立于 DNS 服务生命周期）
 	udpServer       *dns.Server
 	tcpServer       *dns.Server
+	dotServer       *dns.DoTServer
+	dohServer       *dns.DoHServer
+	doh3Server      *dns.DoH3Server
 	ctx             context.Context
 	cancel          context.CancelFunc
 	mu              sync.RWMutex
@@ -95,6 +99,13 @@ func (rm *RecoveryManager) GetDNSHandler() *dns.RefactoredHandler {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	return rm.dnsHandler
+}
+
+// GetCertStore 获取当前证书存储（web 层证书 API 使用）
+func (rm *RecoveryManager) GetCertStore() *dns.CertStore {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.certStore
 }
 
 // processRestartDelay 进程级重启前的等待：先让 HTTP 响应写回客户端，再终止自身
@@ -229,15 +240,20 @@ func (rm *RecoveryManager) startWebServer() {
 		return
 	}
 
-	rm.webServer = web.NewServer(rm.store, rm.logger, rm.GetDNSHandler, rm.RequestRestart, rm.queryLog)
-	addr := rm.config.WebAddr
-	if addr == "" {
-		addr = config.DefaultWebAddr
+	rm.webServer = web.NewServer(rm.store, rm.logger, rm.GetDNSHandler, rm.GetCertStore, rm.RequestRestart, rm.queryLog)
+	rm.webServer.SetWebTLS(rm.config.WebTLS)
+	httpAddr := rm.config.WebAddr
+	if httpAddr == "" {
+		httpAddr = config.DefaultWebAddr
 	}
-	if err := rm.webServer.Start(addr); err != nil {
+	tlsAddr := rm.config.WebTLSAddr
+	if tlsAddr == "" {
+		tlsAddr = config.DefaultWebTLSAddr
+	}
+	if err := rm.webServer.Start(httpAddr, tlsAddr); err != nil {
 		rm.logger.Warn("⚠️ [Web管理端启动失败] ", map[string]interface{}{
 			"rule":  "WEB_SERVER_START_FAILED",
-			"addr":  addr,
+			"addr":  httpAddr,
 			"error": err.Error(),
 		})
 	}
@@ -315,6 +331,20 @@ func (rm *RecoveryManager) startDNSService() error {
 		"port": rm.config.ListenPort,
 	})
 
+	// 初始化证书存储（TLS/QUIC 共用）
+	certStore, err := rm.loadCertStore()
+	if err != nil {
+		rm.logger.Warn("⚠️ [证书加载失败，继续启动] ", map[string]interface{}{
+			"rule":  "CERT_STORE_LOAD_FAILED",
+			"error": err.Error(),
+		})
+		// 未启用入站加密服务时，证书失败不应阻塞启动
+		if rm.config.EnableDoT || rm.config.EnableDoH || rm.config.EnableDoH3 {
+			return fmt.Errorf("启用入站加密服务时证书加载失败: %w", err)
+		}
+	}
+	rm.certStore = certStore
+
 	// 创建DNS处理器
 	handler, err := dns.NewRefactoredHandler(rm.config, rm.logger, rm.queryLog)
 	if err != nil {
@@ -384,11 +414,159 @@ func (rm *RecoveryManager) startDNSService() error {
 	// 在单独的goroutine中启动TCP服务器（带panic恢复）
 	go rm.runDNSServer(tcpServer, "TCP")
 
+	// 启动 DoT 入站服务
+	if rm.config.EnableDoT {
+		if err := rm.startDoTServer(handler); err != nil {
+			return fmt.Errorf("启动DoT服务失败: %w", err)
+		}
+	}
+
+	// 启动 DoH 入站服务
+	if rm.config.EnableDoH {
+		if err := rm.startDoHServer(handler); err != nil {
+			return fmt.Errorf("启动DoH服务失败: %w", err)
+		}
+	}
+
+	// 启动 DoH3 入站服务
+	if rm.config.EnableDoH3 {
+		if err := rm.startDoH3Server(handler); err != nil {
+			return fmt.Errorf("启动DoH3服务失败: %w", err)
+		}
+	}
+
 	rm.running = true
 	rm.logger.Info("✅ [DNS服务启动成功] ", map[string]interface{}{
 		"rule": "DNS_SERVICE_STARTED",
 	})
 
+	return nil
+}
+
+// certRecordToDNS 将 config.CertRecord 转换为 dns.CertRecord
+func certRecordToDNS(r config.CertRecord) dns.CertRecord {
+	return dns.CertRecord{
+		ID:          r.ID,
+		Name:        r.Name,
+		Domains:     r.Domains,
+		CertPath:    r.CertPath,
+		KeyPath:     r.KeyPath,
+		Fingerprint: r.Fingerprint,
+		NotBefore:   r.NotBefore,
+		NotAfter:    r.NotAfter,
+		Source:      dns.CertSource(r.Source),
+		UpdatedAt:   r.UpdatedAt,
+	}
+}
+
+// certRecordToConfig 将 dns.CertRecord 转换为 config.CertRecord
+func certRecordToConfig(r dns.CertRecord) config.CertRecord {
+	return config.CertRecord{
+		ID:          r.ID,
+		Name:        r.Name,
+		Domains:     r.Domains,
+		CertPath:    r.CertPath,
+		KeyPath:     r.KeyPath,
+		Fingerprint: r.Fingerprint,
+		NotBefore:   r.NotBefore,
+		NotAfter:    r.NotAfter,
+		Source:      string(r.Source),
+		UpdatedAt:   r.UpdatedAt,
+	}
+}
+
+// loadCertStore 从数据库与约定目录加载证书；失败时返回 nil
+func (rm *RecoveryManager) loadCertStore() (*dns.CertStore, error) {
+	if rm.config.CertStoreDir == "" {
+		return nil, fmt.Errorf("证书存储目录未配置")
+	}
+
+	certStore := dns.NewCertStore(rm.config.CertStoreDir, rm.config.CertDefault, rm.logger)
+
+	// 1. 从数据库加载已有证书元数据
+	if rm.store != nil {
+		records, err := rm.store.ListCerts()
+		if err != nil {
+			return nil, fmt.Errorf("读取数据库证书失败: %w", err)
+		}
+		dnsRecords := make([]dns.CertRecord, len(records))
+		for i, r := range records {
+			dnsRecords[i] = certRecordToDNS(r)
+		}
+		if err := certStore.LoadRecords(dnsRecords); err != nil {
+			return nil, fmt.Errorf("加载证书记录失败: %w", err)
+		}
+	}
+
+	// 2. 扫描目录发现新证书（如 SSH 同步放入的 cert/key），并同步到数据库
+	scanned, err := certStore.ScanDir()
+	if err != nil {
+		return nil, fmt.Errorf("扫描证书目录失败: %w", err)
+	}
+	if rm.store != nil && len(scanned) > 0 {
+		// 以 fingerprint 为键，避免重复写入
+		existing, err := rm.store.ListCerts()
+		if err != nil {
+			return nil, fmt.Errorf("读取已有证书失败: %w", err)
+		}
+		fpSet := make(map[string]struct{}, len(existing))
+		for _, r := range existing {
+			fpSet[r.Fingerprint] = struct{}{}
+		}
+		for _, r := range scanned {
+			if _, ok := fpSet[r.Fingerprint]; ok {
+				continue
+			}
+			rec := certRecordToConfig(r)
+			if err := rm.store.AddOrReplaceCert(&rec); err != nil {
+				rm.logger.Warn("⚠️ [扫描证书持久化失败] ", map[string]interface{}{
+					"rule":  "CERT_SCAN_PERSIST_FAILED",
+					"name":  r.Name,
+					"error": err.Error(),
+				})
+			}
+		}
+	}
+
+	return certStore, nil
+}
+
+// startDoTServer 启动 DoT 入站服务
+func (rm *RecoveryManager) startDoTServer(handler *dns.RefactoredHandler) error {
+	if rm.certStore == nil {
+		return fmt.Errorf("证书存储未就绪")
+	}
+	server := dns.NewDoTServer(rm.config.DoTAddr, rm.certStore, handler, rm.logger)
+	if err := server.Start(); err != nil {
+		return err
+	}
+	rm.dotServer = server
+	return nil
+}
+
+// startDoHServer 启动 DoH 入站服务
+func (rm *RecoveryManager) startDoHServer(handler *dns.RefactoredHandler) error {
+	if rm.certStore == nil {
+		return fmt.Errorf("证书存储未就绪")
+	}
+	server := dns.NewDoHServer(rm.config.DoHAddr, rm.config.DoHPath, rm.config.DoHAltSvc, rm.certStore, handler, rm.logger)
+	if err := server.Start(); err != nil {
+		return err
+	}
+	rm.dohServer = server
+	return nil
+}
+
+// startDoH3Server 启动 DoH3 入站服务
+func (rm *RecoveryManager) startDoH3Server(handler *dns.RefactoredHandler) error {
+	if rm.certStore == nil {
+		return fmt.Errorf("证书存储未就绪")
+	}
+	server := dns.NewDoH3Server(rm.config.DoH3Addr, rm.config.DoHPath, rm.certStore, handler, rm.logger)
+	if err := server.Start(); err != nil {
+		return err
+	}
+	rm.doh3Server = server
 	return nil
 }
 
@@ -443,6 +621,24 @@ func (rm *RecoveryManager) stopDNSService() {
 		"rule": "DNS_SERVICE_STOP",
 	})
 
+	// 停止 DoH3 入站服务器
+	if rm.doh3Server != nil {
+		rm.doh3Server.Stop()
+		rm.doh3Server = nil
+	}
+
+	// 停止 DoH 入站服务器
+	if rm.dohServer != nil {
+		rm.dohServer.Stop()
+		rm.dohServer = nil
+	}
+
+	// 停止 DoT 入站服务器
+	if rm.dotServer != nil {
+		rm.dotServer.Stop()
+		rm.dotServer = nil
+	}
+
 	// 停止UDP DNS服务器
 	if rm.udpServer != nil {
 		rm.udpServer.Stop()
@@ -464,6 +660,7 @@ func (rm *RecoveryManager) stopDNSService() {
 		rm.dnsHandler = nil
 	}
 
+	rm.certStore = nil
 	rm.running = false
 	rm.logger.Info("✅ [DNS服务已停止] ", map[string]interface{}{
 		"rule": "DNS_SERVICE_STOPPED",

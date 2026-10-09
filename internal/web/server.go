@@ -29,24 +29,30 @@ type RestartOutcome struct {
 
 // Server Web 管理端服务器
 type Server struct {
-	store      *config.Store
-	logger     *utils.EnhancedLogger
-	getHandler func() *dns.RefactoredHandler  // 获取当前DNS处理器（重启后自动指向新实例）
-	restart    func() (RestartOutcome, error) // 按库中配置重启服务（nil=不支持重启）
-	queryLog   *querylog.Store                // 解析日志库（可为 nil 表示不可用）
+	store        *config.Store
+	logger       *utils.EnhancedLogger
+	getHandler   func() *dns.RefactoredHandler  // 获取当前DNS处理器（重启后自动指向新实例）
+	getCertStore func() *dns.CertStore          // 获取当前证书存储（nil=证书功能不可用）
+	restart      func() (RestartOutcome, error) // 按库中配置重启服务（nil=不支持重启）
+	queryLog     *querylog.Store                // 解析日志库（可为 nil 表示不可用）
 
-	srv *http.Server
-	ln  net.Listener
+	webTLS bool // 是否以 HTTPS 服务 Web 管理端（需证书可用，否则回退明文）
+
+	srv    *http.Server // HTTP 监听（web_addr）
+	ln     net.Listener
+	tlsSrv *http.Server // HTTPS 监听（web_tls_addr，webTLS 且证书可用时启动）
+	tlsLn  net.Listener
 }
 
 // NewServer 创建 Web 管理端服务器（qlog 为进程级解析日志库，可为 nil）
-func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler func() *dns.RefactoredHandler, restart func() (RestartOutcome, error), qlog *querylog.Store) *Server {
+func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler func() *dns.RefactoredHandler, getCertStore func() *dns.CertStore, restart func() (RestartOutcome, error), qlog *querylog.Store) *Server {
 	s := &Server{
-		store:      store,
-		logger:     logger,
-		getHandler: getHandler,
-		restart:    restart,
-		queryLog:   qlog,
+		store:        store,
+		logger:       logger,
+		getHandler:   getHandler,
+		getCertStore: getCertStore,
+		restart:      restart,
+		queryLog:     qlog,
 	}
 
 	mux := http.NewServeMux()
@@ -62,23 +68,38 @@ func NewServer(store *config.Store, logger *utils.EnhancedLogger, getHandler fun
 	mux.HandleFunc("PUT /api/overrides/{id}", s.handleUpdateOverride)
 	mux.HandleFunc("DELETE /api/overrides/{id}", s.handleDeleteOverride)
 
+	// 证书管理 API
+	mux.HandleFunc("GET /api/certs", s.handleListCerts)
+	mux.HandleFunc("POST /api/certs", s.handleUploadCert)
+	mux.HandleFunc("DELETE /api/certs/{name}", s.handleDeleteCert)
+	mux.HandleFunc("POST /api/certs/reload", s.handleReloadCerts)
+	mux.HandleFunc("GET /api/certs/deploy-config", s.handleCertDeployConfig)
+	mux.HandleFunc("POST /api/certs/deploy", s.handleCertDeploy)
+
 	s.srv = &http.Server{Handler: mux}
+	s.tlsSrv = &http.Server{Handler: mux}
 	return s
 }
 
-// Start 监听指定地址并在后台运行
-func (s *Server) Start(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+// SetWebTLS 设置是否以 HTTPS 服务 Web 管理端。启用后若证书存储不可用或无证书，
+// Start 时自动回退明文 HTTP，避免管理端整体不可用。
+func (s *Server) SetWebTLS(enabled bool) { s.webTLS = enabled }
+
+// Start 监听 HTTP 地址并在后台运行。若启用了 WebTLS 且证书可用，则额外监听
+// tlsAddr 提供 HTTPS；HTTPS 未启动（证书缺失/端口冲突）仅告警，不影响 HTTP。
+func (s *Server) Start(httpAddr, tlsAddr string) error {
+	ln, err := net.Listen("tcp", httpAddr)
 	if err != nil {
-		return fmt.Errorf("Web管理端监听失败: %w", err)
+		return fmt.Errorf("Web管理端HTTP监听失败: %w", err)
 	}
 	s.ln = ln
 
 	go func() {
-		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			s.logger.Error("❌ [Web管理端运行失败] ", map[string]interface{}{
+		serveErr := s.srv.Serve(ln)
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			s.logger.Error("❌ [Web管理端HTTP运行失败] ", map[string]interface{}{
 				"rule":  "WEB_SERVER_FAILED",
-				"error": err.Error(),
+				"error": serveErr.Error(),
 			})
 		}
 	}()
@@ -87,6 +108,52 @@ func (s *Server) Start(addr string) error {
 		"rule": "WEB_SERVER_START",
 		"addr": ln.Addr().String(),
 	})
+
+	// HTTPS 监听（可选）：WebTLS 已开启但证书不可用时跳过，绝不令 HTTP 受影响
+	if s.webTLS {
+		var certStore *dns.CertStore
+		if s.getCertStore != nil {
+			certStore = s.getCertStore()
+		}
+		switch {
+		case certStore == nil:
+			s.logger.Warn("⚠️ [Web管理端HTTPS未开启] 已开启WebTLS但证书存储不可用，跳过HTTPS", map[string]interface{}{
+				"rule": "WEB_TLS_FALLBACK",
+			})
+		case len(certStore.Records()) == 0:
+			s.logger.Warn("⚠️ [Web管理端HTTPS未开启] 已开启WebTLS但证书存储中无可用证书，跳过HTTPS", map[string]interface{}{
+				"rule": "WEB_TLS_FALLBACK",
+			})
+		default:
+			tlsLn, err := net.Listen("tcp", tlsAddr)
+			if err != nil {
+				s.logger.Warn("⚠️ [Web管理端HTTPS未开启] HTTPS监听失败，仅提供HTTP", map[string]interface{}{
+					"rule":     "WEB_TLS_BIND_FAIL",
+					"tls_addr": tlsAddr,
+					"error":    err.Error(),
+				})
+				break
+			}
+			s.tlsLn = tlsLn
+			// 复用证书存储的 SNI 选择与热加载（与 DoH 一致），证书交给 GetCertificate 处理
+			s.tlsSrv.TLSConfig = certStore.TLSConfig()
+			go func() {
+				serveErr := s.tlsSrv.ServeTLS(tlsLn, "", "")
+				if serveErr != nil && serveErr != http.ErrServerClosed {
+					s.logger.Error("❌ [Web管理端HTTPS运行失败] ", map[string]interface{}{
+						"rule":     "WEB_TLS_FAILED",
+						"tls_addr": tlsAddr,
+						"error":    serveErr.Error(),
+					})
+				}
+			}()
+			s.logger.Info("🔒 [Web管理端HTTPS已启动] ", map[string]interface{}{
+				"rule":     "WEB_TLS_START",
+				"tls_addr": tlsLn.Addr().String(),
+			})
+		}
+	}
+
 	return nil
 }
 
@@ -98,8 +165,11 @@ func (s *Server) Addr() string {
 	return s.ln.Addr().String()
 }
 
-// Shutdown 优雅关闭 Web 管理端
+// Shutdown 优雅关闭 Web 管理端（HTTP 与 HTTPS）
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.tlsSrv != nil {
+		_ = s.tlsSrv.Shutdown(ctx)
+	}
 	return s.srv.Shutdown(ctx)
 }
 
