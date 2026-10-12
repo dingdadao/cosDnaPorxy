@@ -94,8 +94,11 @@ func TestIndexPageHasNewSections(t *testing.T) {
 	for _, marker := range []string{
 		`id:"inbound"`, `id:"clients"`, `入站加密服务`, `客户端 IP 分流`,
 		`item("certs","证书托管")`, `renderCerts`, `cert-upload`, `cert-deploy-url`,
-		`enable_doh3`, `client_groups`, `doh3_quic_keepalive`,
+		`enable_doh3`, `doh3_quic_keepalive`,
 		`listPlaceholder`, `cgMatchValid`,
+		// 新版客户端分组：运营商固定分组 + 自定义分组 + 运营商识别开关
+		`source_enabled`, `source_update_hours`, `isp_groups`, `custom_groups`,
+		`ispGroupEditorHTML`, `customGroupEditorHTML`, `normalizeISPGroups`, `ISP_GROUP_DEFS`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("页面缺少标记 %q", marker)
@@ -119,20 +122,27 @@ func TestWebhookTokenIsHotReloadableInUI(t *testing.T) {
 	}
 }
 
+// 客户端分组的错误位键名必须与 validateClientGroups 产出的键名一致
+// （同为 <kind><i>.<field>，kind ∈ {isp, custom}），否则校验会「弹提示但不标红」。
+// 同时确认键名带 kind 前缀——无前缀的 <i>.<field> 会与分流列表的错误键名冲突（单页视图同时渲染两者）。
 func TestClientGroupErrorKeysArePrefixed(t *testing.T) {
 	s := newCertTestServer(t)
 	body := certReq(s, "GET", "/", "").Body.String()
 
-	if !strings.Contains(body, `data-cg-err="cg${i}.`) {
-		t.Error("分组错误位应使用 cg<i>.<field> 前缀键名")
+	if !strings.Contains(body, `data-cg-err="${kind}${i}.`) {
+		t.Error("分组字段错误位应使用 <kind><i>.<field> 前缀键名")
+	}
+	if !strings.Contains(body, `data-cg-err="custom${i}.name"`) {
+		t.Error("自定义分组名称错误位应带 custom 前缀")
 	}
 	// 反例：无前缀的 ${i}.<field> 会与分流列表的错误键名冲突（单页视图同时渲染两者）
 	if strings.Contains(body, `data-cg-err="${i}.`) {
-		t.Error("发现未加 cg 前缀的分组错误位，会与分流列表错误键名冲突")
+		t.Error("发现未加 kind 前缀的分组错误位，会与分流列表错误键名冲突")
 	}
 	// 错误消费端也必须读取带前缀的键
-	if !strings.Contains(body, `errors["cg" + inp.dataset.cgIdx`) {
-		t.Error("showErrors 应按 cg 前缀读取分组字段错误")
+	if !strings.Contains(body, `function cgErrKey(el)`) ||
+		!strings.Contains(body, "errors[cgErrKey(inp)]") {
+		t.Error("showErrors 应按 <kind><idx>.<field> 读取分组字段错误")
 	}
 }
 

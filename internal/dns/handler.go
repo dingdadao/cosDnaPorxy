@@ -83,7 +83,12 @@ type RefactoredHandler struct {
 	// 入站加密与客户端维度分流
 	certStore          *CertStore
 	clientGroupMatcher *ClientGroupMatcher
-	sourceAutoStop     func() // 运营商库定时更新停止函数；nil 表示未启用
+
+	// 运营商段库（按运营商自动分组的数据来源）
+	ispDB          *source.DB // nil 表示当前未启用运营商识别
+	ispDBDir       string     // 已加载的段库目录，用于识别目录变更
+	sourceAutoStop func()     // 段库定时更新停止函数；nil 表示未启用
+	sourceAutoKey  string     // 已生效的自动更新参数（baseURL|hours），用于识别参数变更
 
 	// 解析日志（进程级，独立于处理器生命周期，可为 nil 表示不记录）
 	queryLog *querylog.Store
@@ -111,6 +116,7 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 
 	// 创建连接池
 	dotConnPool := NewDoTConnPool()
+	dotConnPool.SetBootstrapResolver(cfg.Upstream) // 用 UDP 上游解析 DoT 主机名，不依赖系统 DNS
 	dohConnPool := NewDoHConnPool()
 	doh3ConnPool := NewDoH3ConnPool()
 	udpConnPool := NewUDPConnPool()
@@ -209,44 +215,12 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 	handler.overrideMatcher = NewOverrideMatcher(logger)
 
 	// 初始化客户端分组匹配器
-	handler.clientGroupMatcher = NewClientGroupMatcher(cfg.ClientGroups)
+	handler.clientGroupMatcher = NewClientGroupMatcher(cfg.ISPGroups, cfg.CustomGroups)
 
-	// 可选：加载运营商来源库，为 isp: 匹配项提供支持
-	if cfg.SourceEnabled && cfg.SourceDBDir != "" {
-		var ispDB *source.DB
-		if db, err := source.LoadFromDir(cfg.SourceDBDir); err != nil {
-			logger.Warn("⚠️ [运营商来源库加载失败，isp: 匹配暂不可用] ", map[string]interface{}{
-				"rule":  "SOURCE_DB_LOAD_FAILED",
-				"dir":   cfg.SourceDBDir,
-				"error": err.Error(),
-			})
-		} else {
-			ispDB = db
-			handler.clientGroupMatcher.SetISPLookup(ispDB)
-			logger.Info("🚀 [运营商来源库已加载] ", map[string]interface{}{
-				"rule": "SOURCE_DB_LOADED",
-				"dir":  cfg.SourceDBDir,
-			})
-		}
-		// 定时刷新：仅当配置了更新间隔时才启用，避免启动即触发网络请求
-		if ispDB != nil && cfg.SourceUpdateHours > 0 {
-			handler.sourceAutoStop = source.AutoUpdate(
-				ispDB, cfg.SourceBaseURL, cfg.SourceDBDir,
-				time.Duration(cfg.SourceUpdateHours)*time.Hour,
-				func(err error) {
-					logger.Warn("⚠️ [运营商来源库自动更新失败] ", map[string]interface{}{
-						"rule":  "SOURCE_DB_UPDATE_FAILED",
-						"error": err.Error(),
-					})
-				},
-			)
-			logger.Info("🔄 [运营商来源库自动更新已启用] ", map[string]interface{}{
-				"rule":  "SOURCE_DB_AUTO_UPDATE",
-				"base":  cfg.SourceBaseURL,
-				"hours": cfg.SourceUpdateHours,
-			})
-		}
-	}
+	// 可选：加载运营商段库，为"按运营商自动分组"提供支持。
+	// 即使目录为空/首次部署也注入空库（全部落 other），并在配置了更新间隔时触发首次下载。
+	// 该逻辑同时被 ApplyConfig 复用，因此"是否启用识别/段库目录/更新间隔"均可热切换。
+	handler.syncSourceDB(cfg)
 
 	// 设置缓存回调
 	handler.cacheManager.SetRefreshCallback(handler.refreshDNSRecord)
@@ -317,7 +291,8 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 	h.cnameProcessor.UpdateConfig(cfg)
 	h.cloudDetector.SetReplaceDomains(cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
 	h.matcherHandler.UpdateConfig(cfg)
-	h.clientGroupMatcher.UpdateGroups(cfg.ClientGroups)
+	h.clientGroupMatcher.UpdateGroups(cfg.ISPGroups, cfg.CustomGroups)
+	sourceChanged := h.syncSourceDB(cfg) // 运营商识别开关/段库目录可热切换
 	h.Logger.SetLevel(cfg.LogLevel)
 	if h.queryLog != nil {
 		h.queryLog.UpdateOptions(querylog.Options{
@@ -337,7 +312,7 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 	// 客户端分组变更同理：不同分组可能得到不同上游，旧缓存会串味
 	if splitListsRoutingChanged(old.SplitLists, cfg.SplitLists) || old.IPPrefer != cfg.IPPrefer ||
 		old.ReplaceCFAPI != cfg.ReplaceCFAPI || old.ReplaceAPICount != cfg.ReplaceAPICount ||
-		clientGroupsRoutingChanged(old.ClientGroups, cfg.ClientGroups) {
+		clientGroupsRoutingChanged(old, cfg) || sourceChanged {
 		h.cacheManager.Clear()
 		h.Logger.Info("🧹 [分流路由变更，已清空缓存] ", map[string]interface{}{
 			"rule":           "SPLIT_ROUTING_CHANGED_CACHE_CLEARED",
@@ -375,24 +350,123 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 		old.WebTLSAddr != cfg.WebTLSAddr
 }
 
-// clientGroupsRoutingChanged 判断客户端分组路由是否变化（影响缓存命中率与正确性）
-func clientGroupsRoutingChanged(old, cur []config.ClientGroup) bool {
-	if len(old) != len(cur) {
+// clientGroupsRoutingChanged 判断客户端分组路由是否变化（影响缓存命中率与正确性）。
+// 判定原则：任何会改变"某个 scope 该用哪条上游"的字段变化都必须返回 true，否则旧缓存会串味。
+// 注意 custom_groups 的顺序参与匹配（Priority 相同时按原顺序），因此按索引比对即可发现顺序变化。
+func clientGroupsRoutingChanged(old, cur *config.Config) bool {
+	if len(old.ISPGroups) != len(cur.ISPGroups) || len(old.CustomGroups) != len(cur.CustomGroups) {
 		return true
 	}
-	for i := range old {
-		a, b := old[i], cur[i]
+	for i := range old.ISPGroups {
+		a, b := old.ISPGroups[i], cur.ISPGroups[i]
+		if a.ISP != b.ISP || a.Enabled != b.Enabled || a.DNSMode != b.DNSMode ||
+			a.IPPrefer != b.IPPrefer ||
+			!slices.Equal(a.SplitRefs, b.SplitRefs) ||
+			!slices.Equal(a.FallbackDNS, b.FallbackDNS) ||
+			a.ECS != b.ECS {
+			return true
+		}
+	}
+	for i := range old.CustomGroups {
+		a, b := old.CustomGroups[i], cur.CustomGroups[i]
 		if a.Name != b.Name || a.Enabled != b.Enabled || a.Priority != b.Priority ||
-			a.Invert != b.Invert || a.DNSMode != b.DNSMode ||
-			a.IPPrefer != b.IPPrefer || a.EnableCloudCheck != b.EnableCloudCheck ||
-			a.AllowDomainSplit != b.AllowDomainSplit ||
+			a.DNSMode != b.DNSMode || a.IPPrefer != b.IPPrefer ||
 			!slices.Equal(a.Match, b.Match) ||
-			!slices.Equal(a.DNS, b.DNS) ||
+			!slices.Equal(a.SplitRefs, b.SplitRefs) ||
+			!slices.Equal(a.FallbackDNS, b.FallbackDNS) ||
 			a.ECS != b.ECS {
 			return true
 		}
 	}
 	return false
+}
+
+// syncSourceDB 按配置同步运营商段库：热切换「是否启用运营商识别 / 段库目录 / 自动更新参数」。
+// 返回是否发生了影响匹配结果的变化（调用方据此清空缓存，避免旧 scope 的缓存串味）。
+// 该函数同时用于启动与 ApplyConfig，保证两条路径行为一致。
+func (h *RefactoredHandler) syncSourceDB(cfg *config.Config) bool {
+	enabled := cfg.SourceEnabled && cfg.SourceDBDir != ""
+	changed := false
+
+	// 1. 需要卸载段库：识别被关闭，或段库目录变更（旧库对应的 IP 段已失效）
+	if h.ispDB != nil && (!enabled || h.ispDBDir != cfg.SourceDBDir) {
+		h.stopSourceAutoUpdate()
+		h.ispDB = nil
+		h.ispDBDir = ""
+		h.clientGroupMatcher.SetISPLookup(nil)
+		changed = true
+	}
+
+	// 2. 识别关闭：运营商分组一律不命中，等价于"没有客户端分组"
+	if !enabled {
+		if changed {
+			h.Logger.Info("⏸️ [运营商识别已关闭，客户端分组不再按运营商命中] ", map[string]interface{}{
+				"rule": "SOURCE_DISABLED",
+			})
+		}
+		return changed
+	}
+
+	// 3. 首次启用，或目录变更后重建段库
+	if h.ispDB == nil {
+		db := source.New()
+		if err := source.ReloadFromDir(db, cfg.SourceDBDir); err != nil {
+			h.Logger.Warn("⚠️ [运营商段库目录不可用，将全部归入「其他」] ", map[string]interface{}{
+				"rule":  "SOURCE_DB_LOAD_FAILED",
+				"dir":   cfg.SourceDBDir,
+				"error": err.Error(),
+			})
+		}
+		h.ispDB = db
+		h.ispDBDir = cfg.SourceDBDir
+		h.clientGroupMatcher.SetISPLookup(db)
+		changed = true
+	}
+
+	// 4. 自动更新：间隔/下载源变化时重建定时任务（首次启用会立即下载一次并热加载）
+	key := ""
+	if cfg.SourceUpdateHours > 0 {
+		key = fmt.Sprintf("%s|%d", cfg.SourceBaseURL, cfg.SourceUpdateHours)
+	}
+	if h.sourceAutoKey != key {
+		h.stopSourceAutoUpdate()
+		if key != "" {
+			h.sourceAutoStop = source.AutoUpdate(
+				h.ispDB, cfg.SourceBaseURL, cfg.SourceDBDir,
+				time.Duration(cfg.SourceUpdateHours)*time.Hour,
+				func(err error) {
+					h.Logger.Warn("⚠️ [运营商来源库自动更新失败] ", map[string]interface{}{
+						"rule":  "SOURCE_DB_UPDATE_FAILED",
+						"error": err.Error(),
+					})
+				},
+			)
+			h.sourceAutoKey = key
+			h.Logger.Info("🔄 [运营商来源库自动更新已启用] ", map[string]interface{}{
+				"rule":  "SOURCE_DB_AUTO_UPDATE",
+				"base":  cfg.SourceBaseURL,
+				"dir":   cfg.SourceDBDir,
+				"hours": cfg.SourceUpdateHours,
+			})
+		}
+	}
+
+	if changed {
+		h.Logger.Info("🔄 [运营商识别已启用，客户端分组按运营商自动命中] ", map[string]interface{}{
+			"rule": "SOURCE_ENABLED",
+			"dir":  cfg.SourceDBDir,
+		})
+	}
+	return changed
+}
+
+// stopSourceAutoUpdate 停止段库定时更新任务（幂等）
+func (h *RefactoredHandler) stopSourceAutoUpdate() {
+	if h.sourceAutoStop != nil {
+		h.sourceAutoStop()
+		h.sourceAutoStop = nil
+	}
+	h.sourceAutoKey = ""
 }
 
 // splitListsNeedRestart 判断分流列表是否发生需重启才生效的结构性变更
@@ -626,16 +700,8 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 		return
 	}
 
-	// 2. 分流决策：先客户端分组，再域名分流（若 AllowDomainSplit 未关闭）
-	var decision SplitDecision
-	var upstreams []string
-	if clientDecision.Matched && !clientDecision.AllowDomainSplit {
-		decision = SplitDecision{Matched: true, DNS: clientDecision.DNS, DNSMode: clientDecision.DNSMode, ListName: clientDecision.GroupName}
-		upstreams = clientDecision.DNS
-	} else {
-		decision = h.matcherHandler.MatchDomain(domain)
-		upstreams = h.upstreamsFor(domain, decision)
-	}
+	// 2. 分流决策：客户端分组内引用规则优先，未命中走分组默认上游，再回退全局
+	decision, upstreams := h.resolveRoute(domain, clientDecision)
 
 	// 3. 执行查询（不经过云服务检测和替换逻辑）
 	resp, server, err := h.queryWithFallback(req, upstreams, decision.DNSMode)
@@ -745,22 +811,9 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		}
 	}
 
-	// 2. 分流决策：客户端分组优先，域名分流次之
-	decision := h.matcherHandler.MatchDomain(domain)
-	upstreams := h.upstreamsFor(domain, decision)
+	// 2. 分流决策：客户端分组内引用规则优先，未命中走分组默认上游，再回退全局
+	decision, upstreams := h.resolveRoute(domain, clientDecision)
 	ecs := ecsSummary(req, decision)
-
-	if clientDecision.Matched {
-		// 若分组关闭域名分流，直接采用分组 DNS
-		if !clientDecision.AllowDomainSplit {
-			decision = SplitDecision{Matched: true, DNS: clientDecision.DNS, DNSMode: clientDecision.DNSMode, ListName: clientDecision.GroupName}
-			upstreams = clientDecision.DNS
-		}
-		// 分组的 ECS 与 IPPrefer 覆盖域名分流的同名语义
-		if clientDecision.ECS.Enabled {
-			ecs = ecsSummary(req, decision) // 保持 req 引用；后续 applySplitECS 会处理
-		}
-	}
 
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query")
@@ -942,8 +995,8 @@ func (h *RefactoredHandler) GetCacheManager() *CacheManager {
 	return h.cacheManager
 }
 
-// resolveClientAndScope 解析客户端 IP、匹配客户端分组，返回 scope
-// scope 用于缓存隔离：未命中分组为 "-"，命中为分组名
+// resolveClientAndScope 解析客户端 IP、匹配客户端分组，返回缓存 scope
+// scope 用于缓存隔离：未命中分组为 "-"，命中内置运营商分组为该 ISP key，命中自定义组为 "c:<name>"
 func (h *RefactoredHandler) resolveClientAndScope(w dns.ResponseWriter) (clientIP netip.Addr, scope string) {
 	ip, source := h.ResolveClientIP(w)
 	if !ip.IsValid() {
@@ -951,49 +1004,32 @@ func (h *RefactoredHandler) resolveClientAndScope(w dns.ResponseWriter) (clientI
 	}
 
 	decision := h.clientGroupMatcher.Match(ip)
-	if !decision.Matched {
+	if !decision.Matched || decision.Scope == "" {
 		return ip, "-"
 	}
 
 	h.Logger.Debug("🎯 [客户端分组命中] ", map[string]interface{}{
 		"rule":      "CLIENT_GROUP_HIT",
-		"group":     decision.GroupName,
+		"group":     decision.Label,
+		"scope":     decision.Scope,
 		"client_ip": ip.String(),
 		"ip_source": source,
 	})
-	return ip, decision.GroupName
+	return ip, decision.Scope
 }
 
-// clientDecisionFromScope 根据 scope（分组名）反查客户端分组决策
+// clientDecisionFromScope 根据缓存 scope 反查客户端分组决策。
+// 未命中分组（scope 为 "-"）或分组已被删除/禁用时返回零值决策，调用方按"无客户端分组"处理。
 func (h *RefactoredHandler) clientDecisionFromScope(scope string) ClientDecision {
-	if scope == "" || scope == "-" {
-		return ClientDecision{Matched: false, AllowDomainSplit: true}
-	}
-	for _, g := range h.getConfig().ClientGroups {
-		if g.Name == scope {
-			return ClientDecision{
-				Matched:          true,
-				GroupName:        g.Name,
-				DNS:              g.DNS,
-				DNSMode:          normDNSMode(g.DNSMode),
-				EnableCloudCheck: g.EnableCloudCheck,
-				ECS:              g.ECS,
-				IPPrefer:         g.IPPrefer,
-				AllowDomainSplit: g.AllowDomainSplit,
-			}
-		}
-	}
-	return ClientDecision{Matched: false, AllowDomainSplit: true}
+	return h.clientGroupMatcher.DecisionForScope(scope)
 }
 
 // Close 关闭处理器
 func (h *RefactoredHandler) Close() {
 	h.cancel()
 
-	if h.sourceAutoStop != nil {
-		h.sourceAutoStop()
-		h.sourceAutoStop = nil
-	}
+	h.stopSourceAutoUpdate()
+	h.ispDB = nil
 
 	if h.cacheManager != nil {
 		h.cacheManager.Close()
@@ -1044,6 +1080,56 @@ func (h *RefactoredHandler) upstreamsFor(domain string, d SplitDecision) []strin
 		return d.DNS
 	}
 	return h.getConfig().Upstream
+}
+
+// resolveRoute 计算本次查询最终使用的「分流决策 + 上游列表」。
+//
+//  1. 客户端未命中分组 → 走全局域名分流（原有行为）
+//  2. 客户端命中分组：
+//     a. 先按分组的 SplitRefs 引用顺序匹配域名分流列表（命中哪条复用哪条的策略）
+//     b. 全部未命中 → 用分组 FallbackDNS 兜底（覆盖全局上游）；FallbackDNS 为空则回退全局 upstream
+func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (SplitDecision, []string) {
+	if !cd.Matched {
+		d := h.matcherHandler.MatchDomain(domain)
+		return d, h.upstreamsFor(domain, d)
+	}
+
+	// a. 按分组引用顺序匹配域名分流：命中即复用该分流列表的 DNS/模式/ECS/偏好/云检测
+	if len(cd.SplitRefs) > 0 {
+		if d := h.matcherHandler.MatchDomainWithin(domain, cd.SplitRefs); d.Matched {
+			h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
+				"rule":   "CLIENT_GROUP_SUBDIVERT",
+				"group":  cd.Label,
+				"scope":  cd.Scope,
+				"domain": domain,
+				"list":   d.ListName,
+			})
+			return d, d.DNS
+		}
+	}
+
+	// b. 引用分流未命中：使用分组兜底 DNS
+	upstreams := cd.FallbackDNS
+	if len(upstreams) == 0 {
+		upstreams = h.getConfig().Upstream
+	}
+	// 兜底查询按分组配置的解析模式 / A-AAAA 偏好 / ECS 策略处理
+	d := SplitDecision{
+		Matched:  true,
+		DNS:      upstreams,
+		DNSMode:  normDNSMode(cd.DNSMode),
+		ListName: cd.Label,
+		IPPrefer: cd.IPPrefer,
+		ECS:      cd.ECS,
+	}
+	h.Logger.Debug("🎯 [客户端分组命中，分流未命中走兜底 DNS] ", map[string]interface{}{
+		"rule":   "CLIENT_GROUP_FALLBACK",
+		"group":  cd.Label,
+		"scope":  cd.Scope,
+		"domain": domain,
+		"dns":    upstreams,
+	})
+	return d, upstreams
 }
 
 // formatAnswerRecords 格式化回答记录用于日志

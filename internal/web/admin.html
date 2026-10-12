@@ -189,10 +189,47 @@
   .icon-btn:disabled { opacity:.28; cursor:not-allowed; color:var(--text-3); background:none; }
   .list-add { align-self:flex-start; margin-top:2px; }
 
+  /* 分组「引用分流列表」：可搜索勾选式下拉多选 */
+  .cg-refs { position:relative; min-width:0; }
+  .cg-refs-trigger { width:100%; display:flex; align-items:center; justify-content:space-between; gap:8px;
+    background:var(--bg-inset); color:var(--text-1); border:1px solid var(--border); border-radius:6px;
+    padding:7px 10px; font:inherit; cursor:pointer; text-align:left; }
+  .cg-refs-trigger:hover { border-color:var(--accent); }
+  .cg-refs.invalid .cg-refs-trigger { border-color:var(--danger); box-shadow:0 0 0 2px var(--danger-soft); }
+  .cg-refs-trigger .chev { flex:none; color:var(--text-3); transition:transform .15s; }
+  .cg-refs.open .cg-refs-trigger .chev { transform:rotate(90deg); }
+  .cg-refs-summary { flex:1; min-width:0; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cg-refs-summary.empty { color:var(--text-3); }
+  .cg-refs-panel { position:absolute; z-index:30; top:calc(100% + 4px); left:0; right:0;
+    background:var(--bg-surface); border:1px solid var(--border); border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,.28);
+    padding:8px; display:flex; flex-direction:column; gap:6px; }
+  .cg-refs-panel[hidden] { display:none; }
+  .cg-refs-search { flex:none; }
+  .cg-refs-opts { display:flex; flex-direction:column; gap:2px; max-height:210px; overflow-y:auto; }
+  .cg-refs-opt { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:5px; cursor:pointer; font-size:12.5px; }
+  .cg-refs-opt:hover { background:var(--bg-inset); }
+  .cg-refs-opt input { flex:none; width:auto; }
+  .cg-refs-opt .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cg-refs-opt .off { flex:none; font-size:10.5px; color:var(--text-3); }
+  .cg-refs-opt input:disabled + .nm { color:var(--text-3); }
+  .cg-refs-none { font-size:11.5px; color:var(--text-3); padding:4px 8px; }
+
   /* 客户端分组：优先级输入 */
   .cg-prio { display:inline-flex; align-items:center; }
   .cg-prio-input { width:56px; text-align:center; font-family:var(--mono); font-size:12px; padding:5px 6px; }
   .cg-prio::before { content:"P"; font-size:10px; color:var(--text-3); margin-right:3px; }
+
+  /* 客户端分组：内置分组标识与引用规则勾选 */
+  .grp-builtin { cursor:default; }
+  .grp-key { font-family:var(--mono); font-size:10.5px; color:var(--text-3); padding:2px 7px; border:1px solid var(--border); border-radius:5px; flex:none; }
+  .ref-editor { display:flex; flex-direction:column; gap:4px; }
+  .ref-row { display:flex; align-items:center; gap:9px; padding:6px 9px; border:1px solid var(--border); border-radius:7px; background:var(--bg-surface); cursor:pointer; }
+  .ref-row:hover { border-color:var(--accent); }
+  .ref-row.is-off { opacity:.6; }
+  .ref-row input[type="checkbox"] { width:14px; height:14px; flex:none; accent-color:var(--accent); cursor:pointer; }
+  .ref-row .ref-name { flex:1; min-width:0; font-size:12.5px; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ref-row .ref-tag { font-family:var(--mono); font-size:10.5px; color:var(--text-3); flex:none; max-width:46%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ref-empty { font-size:11.5px; color:var(--text-3); padding:8px 0; }
 
   /* 证书状态徽标 */
   .badge-restart.cert-ok { color:var(--success); border-color:rgba(63,185,80,.45); }
@@ -475,7 +512,16 @@ const SECTIONS = [
         help:"certd 等平台推送证书的鉴权令牌，以 URL 查询参数 ?token=xxx 传入（只认 query，不认请求头）；改动即时生效、无需重启。留空则 webhook 端点一律返回 403（关闭推送）。令牌明文存于配置库，且会随 /api/config 与「证书托管」页的地址回显，请勿把管理端口暴露到公网，也不要把带 token 的地址发到公开渠道。" },
     ]},
   ]},
-  { id:"clients", title:"客户端 IP 分流", desc:"按来源公网 IP 决定上游、ECS 与 A/AAAA 偏好；与域名分流正交（先定人、再定域名）。", cards:[
+  { id:"clients", title:"客户端 IP 分流", desc:"先定人、再定域名：按来源公网 IP 归组，组内只引用需要的域名分流规则，全部不中时用该组的默认上游。", cards:[
+    { kind:"toggle", key:"source_enabled", title:"按运营商自动分组",
+      desc:"启用后，来源 IP 会用本地运营商段库（电信 / 联通 / 移动 / 其他）自动归组，无需手工维护网段；关闭时下面的「运营商分组」一律不生效。", body:[
+      { id:"source_db_dir", label:"运营商段库目录", type:"text", mono:true, span2:true, placeholder:"./data/ispdb",
+        help:"目录内按 <运营商>.txt 存放逐行 CIDR（telecom / unicom / cmcc / cernet / chinabtn / gwbn）。识别失败或目录为空时全部归入「其他」。" },
+      { id:"source_base_url", label:"段库下载源", type:"text", mono:true, span2:true, placeholder:"https://ispip.clang.cn",
+        help:"自动更新时从该地址下载 telecom/unicom/cmcc 等文件；下载失败保留旧库，不会清空。" },
+      { id:"source_update_hours", label:"自动更新间隔（小时）", type:"number",
+        help:"0 = 不自动更新。改动即时生效；保存后若已到期会立刻下载一次。" },
+    ]},
     { title:"客户端 IP 解析", body:[
       { id:"client_ip_sources", label:"取值优先级", type:"iplist", span2:true,
         help:"依次尝试：static=静态映射（最高），header=请求头（仅连接 IP 命中可信代理时采信），socket=连接对端地址（兜底）。可拖动顺序调整优先级。" },
@@ -484,9 +530,13 @@ const SECTIONS = [
       { id:"trusted_proxies", label:"可信代理（CIDR）", type:"iplist", span2:true,
         help:"仅当连接对端命中这些网段时才采信上面的请求头，否则忽略以防伪造。如 127.0.0.1/32、::1/128。" },
     ]},
-    { title:"客户端分组", body:[
-      { id:"client_groups", label:"分组规则", type:"clientgroups", span2:true,
-        help:"按 Priority 从大到小匹配，同值按自上而下顺序；命中即采用该组的上游 / ECS / 云检测 / A·AAAA 偏好。关闭「继续域名分流」时命中组后不再进入域名匹配。分组会按 scope 隔离缓存，粒度建议取粗以免降低命中率。" },
+    { title:"运营商分组（内置 4 组，不可增删）", body:[
+      { id:"isp_groups", label:"分组规则", type:"ispgroups", span2:true,
+        help:"按来源运营商自动匹配（电信/联通/移动/其他），命中哪组就用哪组的自定义 DNS 解析。启用某组时必须至少配置一条 DNS；「其他」承接未识别与境外 IP，可单独启用而不影响三大运营商。" },
+    ]},
+    { title:"自定义分组（按 IP / CIDR 匹配）", body:[
+      { id:"custom_groups", label:"分组规则", type:"customgroups", span2:true,
+        help:"用于机房出口、专线等运营商识别覆盖不到的来源。匹配项整体优先于上面的运营商分组，组内按 Priority 从大到小、同值按自上而下顺序匹配；命中即用该组自定义 DNS 解析。" },
     ]},
   ]},
   { id:"cloud", title:"云 IP 检测与替换", desc:"识别 Cloudflare / AWS 地址并替换为优选 IP。", cards:[
@@ -591,14 +641,25 @@ function humanizeConfig(c) {
     l.ip_prefer = String(l.ip_prefer || "").trim();
   });
   /* 客户端分组：归一化数组字段与默认值 */
-  if (!Array.isArray(c.client_groups)) c.client_groups = [];
-  c.client_groups.forEach(g => {
-    if (!Array.isArray(g.match)) g.match = (g.match == null || g.match === "") ? [] : [g.match];
-    if (!Array.isArray(g.dns)) g.dns = (g.dns == null || g.dns === "") ? [] : [g.dns];
+  /* 运营商分组一条一个规则（下拉选运营商，选过即禁用）；自定义分组按 IP/CIDR 匹配 */
+  c.isp_groups = normalizeISPGroups(c.isp_groups);
+  if (!Array.isArray(c.custom_groups)) c.custom_groups = [];
+  c.custom_groups.forEach(g => {
+    g.name = String(g.name || "");
+    g.priority = Number(g.priority) || 0;
+    g.match = asArray(g.match);
+    if (g.fallback_dns == null && g.dns) g.fallback_dns = g.dns;
+    delete g.dns;
+    g.fallback_dns = asArray(g.fallback_dns);
+    g.split_refs = Array.isArray(g.split_refs) ? g.split_refs.map(String).filter(Boolean) : [];
     g.dns_mode = String(g.dns_mode || "").trim() || "race";
     g.ip_prefer = String(g.ip_prefer || "").trim();
-    g.priority = Number(g.priority) || 0;
-    if (!g.ecs) g.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
+    const ecs = g.ecs || {};
+    g.ecs = {
+      enabled: !!ecs.enabled,
+      isp_type: String(ecs.isp_type || "").trim() || "telecom",
+      subnet: String(ecs.subnet || "").trim(),
+    };
   });
   /* 客户端 IP 取值链 / 请求头 / 可信代理：兼容单字符串写法 */
   ["client_ip_sources","client_ip_headers","trusted_proxies"].forEach(k => {
@@ -772,8 +833,10 @@ function fieldHTML(f) {
     control = ipListEditorHTML(f.id, val || []);
   } else if (f.type === "splitlist") {
     control = splitListEditorHTML(val || []);
-  } else if (f.type === "clientgroups") {
-    control = clientGroupEditorHTML(val || []);
+  } else if (f.type === "ispgroups") {
+    control = ispGroupEditorHTML(val || []);
+  } else if (f.type === "customgroups") {
+    control = customGroupEditorHTML(val || []);
   } else {
     const cls = f.mono ? "mono" : "";
     const ph = f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : "";
@@ -947,139 +1010,276 @@ function splitListEditorHTML(items) {
     <button type="button" class="btn btn-ghost small list-add" data-action="sl-add">+ 添加一条分流列表</button></div>`;
 }
 
-/* 客户端分组编辑器：Priority 大者优先，同值按数组顺序 */
-function cgMatchHTML(i, list) {
-  const rows = (list || []).map((v, j) => `<div class="list-row">
-      <span class="sl-idx">${j+1}</span>
-      <input type="text" class="mono" value="${esc(v)}" data-cg-match="${i}" data-cg-match-idx="${j}" placeholder="1.2.3.0/24 或 2001:db8::/32">
-      <button type="button" class="icon-btn" data-action="cg-match-del" data-cg-idx="${i}" data-cg-match-idx="${j}" aria-label="删除此条">
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button></div>`).join("");
-  return `<div class="list-editor">${rows}
-    <button type="button" class="btn btn-ghost small list-add" data-action="cg-match-add" data-cg-idx="${i}">+ 添加一条匹配</button></div>`;
+/* ================= 客户端分组编辑器 =================
+   模型：内置运营商分组（固定 4 个，不可增删改标识）+ 自定义分组（IP/CIDR，可增删）
+   每个分组只回答两件事：① 引用哪些域名分流规则 ② 默认上游（规则全不中时使用） */
+
+const ISP_GROUP_DEFS = [
+  { v:"telecom", label:"中国电信" },
+  { v:"unicom",  label:"中国联通" },
+  { v:"cmcc",    label:"中国移动" },
+  { v:"other",   label:"其他" },
+];
+
+/* 字符串列表字段归一化：兼容旧的单字符串写法 */
+function asArray(v) {
+  if (Array.isArray(v)) return v.map(s => String(s ?? "").trim()).filter(Boolean);
+  const s = String(v ?? "").trim();
+  return s ? [s] : [];
 }
-function cgDNSHTML(i, servers) {
+
+/* 分组的引用分流列表 / 兜底 DNS / 解析偏好 / ECS 公共归一化 */
+function normGroupAdvanced(g) {
+  const ecs = g.ecs || {};
+  return {
+    split_refs: asArray(g.split_refs),
+    fallback_dns: asArray(g.fallback_dns),
+    dns_mode: String(g.dns_mode || "").trim() || "race",
+    ip_prefer: String(g.ip_prefer || "").trim(),
+    ecs: {
+      enabled: !!ecs.enabled,
+      isp_type: String(ecs.isp_type || "").trim() || "telecom",
+      subnet: String(ecs.subnet || "").trim(),
+    },
+  };
+}
+
+/* 把 isp_groups 归一化：保留已配置的运营商分组、保持原有顺序。 */
+function normalizeISPGroups(list) {
+  const byKey = new Map();
+  (Array.isArray(list) ? list : []).forEach(g => {
+    const k = String((g || {}).isp || "").trim().toLowerCase();
+    if (k && !byKey.has(k)) byKey.set(k, g);
+  });
+  const out = [];
+  ISP_GROUP_DEFS.forEach(d => {
+    const g = byKey.get(d.v);
+    if (!g) return;
+    out.push(Object.assign({ isp: d.v, enabled: !!g.enabled }, normGroupAdvanced(g)));
+  });
+  return out;
+}
+
+/* 取分组对象：kind 为 "isp" | "custom" */
+function groupAt(kind, i) {
+  const arr = kind === "isp" ? (CFG.isp_groups || []) : (CFG.custom_groups || []);
+  return arr[i];
+}
+
+/* 分组脏标记：与基线中同身份（isp / name）的那条比对，调整顺序不误报 */
+function groupDirty(kind, g) {
+  const key = kind === "isp" ? "isp" : "name";
+  const base = kind === "isp" ? (BASELINE.isp_groups || []) : (BASELINE.custom_groups || []);
+  const o = base.find(b => String(b[key] || "") === String(g[key] || ""));
+  return !o || JSON.stringify(g) !== JSON.stringify(o);
+}
+
+/* 分组内嵌 DNS 列表：默认上游 / 兜底上游 */
+function dnsListHTML(kind, i, servers) {
   const rows = (servers || []).map((v, j) => {
-    const scheme = (/^([a-z0-9]+):\/\//.exec(v||"") || [,""])[1];
-    const proto = scheme ? ["udp","tcp","https","tls","h3"].includes(scheme) ? scheme : "?" : "";
+    const scheme = (/^([a-z0-9]+):\/\//.exec(v || "") || [, ""])[1];
+    const proto = scheme ? (["udp","tcp","https","tls","h3"].includes(scheme) ? scheme : "?") : "";
     return `<div class="list-row">
-      <span class="proto ${scheme==="" ? "" : proto==="?"?"bad":"ok"}">${proto || "scheme"}</span>
-      <input type="text" class="mono" value="${esc(v)}" data-cg-dns="${i}" data-cg-dns-idx="${j}" placeholder="https://223.6.6.6/dns-query">
-      <button type="button" class="icon-btn" data-action="cg-dns-del" data-cg-idx="${i}" data-cg-dns-idx="${j}" aria-label="删除此条">
+      <span class="proto ${scheme === "" ? "" : proto === "?" ? "bad" : "ok"}">${proto || "scheme"}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-cg-kind="${kind}" data-cg-idx="${i}"
+        data-cg-dns data-cg-dns-idx="${j}" placeholder="https://223.6.6.6/dns-query">
+      <button type="button" class="icon-btn" data-action="grp-dns-del" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-dns-idx="${j}" aria-label="删除此条">
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button></div>`;
   }).join("");
   return `<div class="list-editor">${rows}
-    <button type="button" class="btn btn-ghost small list-add" data-action="cg-dns-add" data-cg-idx="${i}">+ 添加一条 DNS</button></div>`;
+    <button type="button" class="btn btn-ghost small list-add" data-action="grp-dns-add" data-cg-kind="${kind}" data-cg-idx="${i}">+ 添加一条</button></div>`;
 }
-function clientGroupEditorHTML(items) {
-  const rows = items.map((g, i) => {
-    const gdirty = cgDirty(g);
-    const field = (key, label, opts = {}) => `
-      <div class="field ${opts.span2?"span-2":""}">
-        <label for="cg_${i}_${key}"><span class="dirty-dot"></span>${esc(label)}</label>
-        ${opts.list ? cgDNSHTML(i, g.dns)
-          : opts.match ? cgMatchHTML(i, g.match)
-          : opts.select ? `<select id="cg_${i}_${key}" data-cg-idx="${i}" data-cg-field="${key}">
-          ${opts.select.map(o => {
-            const cur = String(g[key] ?? "").trim() || opts.def || opts.select[0].v;
-            return `<option value="${esc(o.v)}"${cur === o.v ? " selected" : ""}>${esc(o.label)}</option>`;
-          }).join("")}
-        </select>`
-          : `<input type="text" id="cg_${i}_${key}" class="mono" value="${esc(g[key] ?? "")}"
-          data-cg-idx="${i}" data-cg-field="${key}" placeholder="${esc(opts.ph || "")}">`}
-        ${opts.help ? `<div class="help">${esc(opts.help)}</div>` : ""}
-        <div class="err" data-cg-err="cg${i}.${key}"></div>
-      </div>`;
-    return `<div class="sl-item ${gdirty?"is-dirty":""}">
+
+/* 自定义分组的 IP / CIDR 匹配清单 */
+function cgMatchHTML(i, list) {
+  const rows = (list || []).map((v, j) => `<div class="list-row">
+      <span class="sl-idx">${j+1}</span>
+      <input type="text" class="mono" value="${esc(v)}" data-cg-kind="custom" data-cg-idx="${i}"
+        data-cg-match data-cg-match-idx="${j}" placeholder="1.2.3.0/24 或 2001:db8::/32">
+      <button type="button" class="icon-btn" data-action="grp-match-del" data-cg-kind="custom" data-cg-idx="${i}" data-cg-match-idx="${j}" aria-label="删除此条">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button></div>`).join("");
+  return `<div class="list-editor">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="grp-match-add" data-cg-kind="custom" data-cg-idx="${i}">+ 添加一条匹配</button></div>`;
+}
+
+/* 多 DNS 解析模式下拉 */
+function dnsModeSelect(kind, i, cur) {
+  const v = String(cur || "").trim() || "race";
+  return `<select data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="dns_mode">
+    <option value="race"${v === "race" ? " selected" : ""}>并发竞速：同时查询全部 DNS，取最快成功的结果（默认）</option>
+    <option value="failover"${v === "failover" ? " selected" : ""}>串行故障转移：按顺序依次查询，前一个失败/超时才用下一个</option>
+  </select>`;
+}
+
+/* 分组「引用分流列表」编辑器：可搜索勾选式下拉多选。
+   选项来自「上游与域名分流」中已配置的列表；勾选顺序即匹配顺序。
+   只允许引用启用的列表；其余分组已服务/被停用的列表置灰。 */
+function splitRefsEditorHTML(kind, i, refs) {
+  const all = (CFG.split_lists || []).filter(l => l && l.name && String(l.name).trim());
+  const chosen = (refs || []).map(String);
+  const opts = all.map(l => {
+    const name = String(l.name).trim();
+    const on = chosen.includes(name);
+    const disabled = !on && !l.enabled;
+    return `<label class="cg-refs-opt">
+      <input type="checkbox" value="${esc(name)}" ${on ? "checked" : ""} ${disabled ? "disabled" : ""}
+        data-cg-refs-cb data-cg-kind="${kind}" data-cg-idx="${i}">
+      <span class="nm">${esc(name)}</span>
+      ${disabled ? `<span class="off">（已停用）</span>` : ""}
+    </label>`;
+  }).join("");
+  const summary = chosen.length ? `已选 ${chosen.length} 项：${esc(chosen.join("、"))}` : "点击选择要复用的分流列表…";
+  return `<div class="cg-refs" data-cg-refs data-cg-kind="${kind}" data-cg-idx="${i}">
+    <button type="button" class="cg-refs-trigger" data-cg-refs-toggle data-cg-kind="${kind}" data-cg-idx="${i}" aria-expanded="false">
+      <span class="cg-refs-summary ${chosen.length ? "" : "empty"}">${summary}</span>
+      <svg class="chev" width="10" height="10" viewBox="0 0 10 10"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+    </button>
+    <div class="cg-refs-panel" hidden>
+      <input type="search" class="cg-refs-search mono" placeholder="搜索分流列表…" data-cg-refs-search data-cg-kind="${kind}" data-cg-idx="${i}">
+      <div class="cg-refs-opts">${opts || `<div class="cg-refs-none">暂无分流列表，请先在「上游与域名分流」中定义</div>`}</div>
+    </div>
+  </div>`;
+}
+
+/* 分组兜底查询的 A/AAAA 解析偏好下拉 */
+function ipPreferSelect(kind, i, cur) {
+  const v = String(cur || "").trim();
+  const opts = [
+    ["", "跟随全局默认（在「常规服务」里配置）"],
+    ["prefer_a", "优先A：查 AAAA 时若域名有 A 记录则返回空"],
+    ["prefer_aaaa", "优先AAAA：不抑制 A，AAAA 不因云替换缺 IPv6 而被置空"],
+    ["only_a", "只能A：查 AAAA 一律返回空"],
+  ].map(([ov, label]) => `<option value="${ov}"${v === ov ? " selected" : ""}>${label}</option>`).join("");
+  return `<select data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ip_prefer">
+    ${opts}
+  </select>`;
+}
+
+/* 分组的 ECS 兜底注入编辑器（仅在兜底查询生效） */
+function groupECSHTML(kind, i, ecs) {
+  const e = ecs || {};
+  const ispOpts = ECS_TYPES.map(t =>
+    `<option value="${t.v}"${((e.isp_type || "telecom")) === t.v ? " selected" : ""}>${esc(t.label)}</option>`).join("");
+  return `<div class="group-ecs">
+    <div class="sl-opt">
+      <div class="txt">
+        <span>兜底查询注入 ECS（按线路解析）</span>
+        <small>开启后兜底上游按下面填的公网 IP 返回对应线路；关闭时剥离客户端 ECS</small>
+      </div>
+      <button type="button" role="switch" aria-checked="${!!e.enabled}" class="switch"
+        data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.enabled" aria-label="ECS 注入开关"></button>
+    </div>
+    ${e.enabled ? `<div class="grid">
+      <div class="field">
+        <label><span class="dirty-dot"></span>线路类型</label>
+        <select data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.isp_type">${ispOpts}</select>
+        <div class="err" data-cg-err="${kind}${i}.ecs.isp_type"></div>
+      </div>
+      <div class="field">
+        <label><span class="dirty-dot"></span>本地公网 IP / CIDR</label>
+        <input type="text" class="mono" value="${esc(e.subnet || "")}" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.subnet" placeholder="1.2.3.4 或 240e:1:2::/32">
+        <div class="err" data-cg-err="${kind}${i}.ecs.subnet"></div>
+      </div>
+    </div>` : `<div class="err" data-cg-err="${kind}${i}.ecs.enabled" style="display:none"></div>`}
+  </div>`;
+}
+
+/* 分组内的一个字段块（含错误位，键名 <kind><i>.<key>） */
+function grpField(i, kind, key, label, control, help) {
+  return `<div class="field span-2">
+    <label><span class="dirty-dot"></span>${esc(label)}</label>
+    ${control}
+    ${help ? `<div class="help">${esc(help)}</div>` : ""}
+    <div class="err" data-cg-err="${kind}${i}.${key}"></div>
+  </div>`;
+}
+
+/* 内置运营商分组编辑器：一条一个规则。
+   每条 = 运营商下拉 + 启用 + 引用分流列表（多选）+ 兜底 DNS + 解析偏好 + ECS + 删除。
+   命中分组先按引用分流匹配，未命中走兜底 DNS。 */
+function ispGroupEditorHTML(items) {
+  const used = new Set((items || []).map(g => String((g || {}).isp || "").trim().toLowerCase()));
+  const rows = (items || []).map((g, i) => {
+    const def = ISP_GROUP_DEFS.find(d => d.v === g.isp) || { label: g.isp, v: g.isp };
+    const dirty = groupDirty("isp", g);
+    const opts = ISP_GROUP_DEFS.map(d => {
+      const taken = used.has(d.v) && d.v !== g.isp;
+      return `<option value="${d.v}" ${d.v === g.isp ? "selected" : ""} ${taken ? "disabled" : ""}>${d.label}</option>`;
+    }).join("");
+    return `<div class="sl-item ${dirty ? "is-dirty" : ""}">
       <div class="sl-head">
         <span class="sl-idx">${i+1}</span>
-        <input type="text" class="sl-name" value="${esc(g.name ?? "")}" data-cg-idx="${i}"
-          data-cg-field="name" placeholder="分组名称（如 华东专线）" aria-label="分组名称">
-        <span class="cg-prio" title="优先级：数值大者先匹配">
-          <input type="number" class="cg-prio-input" value="${Number(g.priority)||0}" data-cg-idx="${i}" data-cg-field="priority" aria-label="优先级">
-        </span>
+        <select class="sl-name" data-cg-kind="isp" data-cg-idx="${i}" data-cg-field="isp" aria-label="运营商">
+          ${opts}
+        </select>
         <button type="button" role="switch" aria-checked="${!!g.enabled}" class="switch"
-          data-cg-switch="${i}" aria-label="启用该分组"></button>
-        <button type="button" class="icon-btn move" data-action="cg-up" data-cg-idx="${i}" ${i===0?"disabled":""} aria-label="上移">
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 12.5V3.5M4.5 7L8 3.5l3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button type="button" class="icon-btn move" data-action="cg-down" data-cg-idx="${i}" ${i===items.length-1?"disabled":""} aria-label="下移">
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 3.5v9M4.5 9l3.5 3.5L11.5 9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button type="button" class="icon-btn" data-action="cg-del" data-cg-idx="${i}" aria-label="删除该分组">
+          data-cg-kind="isp" data-cg-idx="${i}" data-cg-toggle aria-label="启用该分组"></button>
+        <button type="button" class="icon-btn" data-action="grp-del" data-cg-kind="isp" data-cg-idx="${i}" aria-label="删除该运营商分组">
           <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
-      <div class="err" data-cg-err="cg${i}.name"></div>
       <div class="grid">
-        ${field("match", "匹配来源 IP / CIDR", { span2:true, match:true,
-          help:"命中这些网段（或取反后不在其中）即启用本分组；支持 IPv4/IPv6 与 CIDR" })}
-        ${field("dns", "命中时使用的 DNS", { span2:true, list:true,
-          help:"支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://；填写后覆盖域名分流的候选上游；未写端口按协议补默认端口（udp/tcp→53、tls→853）" })}
-        ${field("dns_mode", "多 DNS 解析模式", { span2:true, def:"race", select:[
-          { v:"race", label:"并发竞速：同时查询全部 DNS，取最快成功的结果（默认）" },
-          { v:"failover", label:"串行故障转移：按顺序依次查询，前一个失败/超时才用下一个" },
-        ] })}
-        ${field("ip_prefer", "A/AAAA 解析偏好", { span2:true, select:[
-          { v:"", label:"跟随全局默认（在「常规服务」里配置）" },
-          { v:"prefer_a", label:"优先A" },
-          { v:"prefer_aaaa", label:"优先AAAA" },
-          { v:"only_a", label:"只能A" },
-        ] })}
+        ${grpField(i, "isp", "split_refs", "引用分流列表（命中即复用）", splitRefsEditorHTML("isp", i, g.split_refs),
+          "命中该运营商的客户端，先按这里勾选的「上游与域名分流」列表匹配，命中哪条就用哪条的 DNS / 模式 / ECS / 偏好。顺序 = 匹配优先级（上下拖选调整）。")}
+        ${grpField(i, "isp", "fallback_dns", "覆盖上游 DNS（分流未命中时用）", dnsListHTML("isp", i, g.fallback_dns),
+          "引用分流全部未命中时，用这里的 DNS 解析并覆盖全局上游；留空则回退全局上游。")}
+        ${grpField(i, "isp", "dns_mode", "兜底 DNS 解析模式", dnsModeSelect("isp", i, g.dns_mode),
+          "同时查询全部 DNS 取最快成功（race），或按顺序取第一个成功（failover）。")}
+        ${grpField(i, "isp", "ip_prefer", "解析偏好（A/AAAA）", ipPreferSelect("isp", i, g.ip_prefer),
+          "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
       </div>
-      <div class="sl-opt">
-        <div class="txt">
-          <span>取反匹配</span>
-          <small>开启后，来源 IP「不在」上面清单里时才命中本分组</small>
-        </div>
-        <button type="button" role="switch" aria-checked="${!!g.invert}" class="switch"
-          data-cg-invert="${i}" aria-label="取反匹配"></button>
-      </div>
-      <div class="sl-opt">
-        <div class="txt">
-          <span>继续进入域名分流</span>
-          <small>开启时，命中本分组后仍按域名分流列表细化上游；关闭则直接使用本分组 DNS</small>
-        </div>
-        <button type="button" role="switch" aria-checked="${!!g.allow_domain_split}" class="switch"
-          data-cg-ads="${i}" aria-label="继续进入域名分流"></button>
-      </div>
-      <div class="sl-opt">
-        <div class="txt">
-          <span>命中后做 CF/AWS 云检测</span>
-          <small>关闭时，本分组不启用云 IP 替换</small>
-        </div>
-        <button type="button" role="switch" aria-checked="${!!g.enable_cloud_check}" class="switch"
-          data-cg-cloudcheck="${i}" aria-label="命中后做云检测"></button>
-      </div>
-      <div class="sl-opt">
-        <div class="txt">
-          <span>EDNS 客户端子网（按线路解析）</span>
-          <small>开启后向上游注入下面填的公网 IP；「自动」模式留空即用客户端真实 IP 派生</small>
-        </div>
-        <button type="button" role="switch" aria-checked="${!!(g.ecs||{}).enabled}" class="switch"
-          data-cg-ecs="${i}" aria-label="向上游注入 EDNS 客户端子网"></button>
-      </div>
-      ${(g.ecs||{}).enabled ? `<div class="grid">
-        <div class="field">
-          <label for="cg_${i}_ecs_isp"><span class="dirty-dot"></span>线路类型</label>
-          <select id="cg_${i}_ecs_isp" data-cg-idx="${i}" data-cg-field="ecs.isp_type">
-            ${ECS_TYPES.map(t => `<option value="${t.v}"${((g.ecs||{}).isp_type||"telecom")===t.v?" selected":""}>${esc(t.label)}</option>`).join("")}
-          </select>
-          <div class="err" data-cg-err="cg${i}.ecs.isp_type"></div>
-        </div>
-        <div class="field">
-          <label for="cg_${i}_ecs_subnet"><span class="dirty-dot"></span>本地公网 IP / CIDR</label>
-          <input type="text" id="cg_${i}_ecs_subnet" class="mono" value="${esc((g.ecs||{}).subnet ?? "")}"
-            data-cg-idx="${i}" data-cg-field="ecs.subnet" placeholder="留空 = 用客户端真实 IP">
-          <div class="help">留空表示按客户端真实 IP 自动派生（IPv4 /24、IPv6 /56）；也可填固定网段</div>
-          <div class="err" data-cg-err="cg${i}.ecs.subnet"></div>
-        </div>
-      </div>` : ""}
+      ${groupECSHTML("isp", i, g.ecs)}
     </div>`;
   }).join("");
-  return `<div class="sl-editor" data-cg-group="client_groups">${rows}
-    <button type="button" class="btn btn-ghost small list-add" data-action="cg-add">+ 添加一个客户端分组</button></div>`;
+  return `<div class="sl-editor" data-cg-group="isp_groups">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="grp-add" data-cg-kind="isp">+ 添加一个运营商分组</button></div>`;
+}
+
+/* 自定义分组编辑器（按 IP/CIDR 匹配，整体优先于运营商分组）。
+   路由语义与运营商组一致：先按引用分流匹配，未命中走兜底 DNS。 */
+function customGroupEditorHTML(items) {
+  const rows = (items || []).map((g, i) => {
+    const dirty = groupDirty("custom", g);
+    return `<div class="sl-item ${dirty ? "is-dirty" : ""}">
+      <div class="sl-head">
+        <span class="sl-idx">${i+1}</span>
+        <input type="text" class="sl-name" value="${esc(g.name ?? "")}" data-cg-kind="custom" data-cg-idx="${i}"
+          data-cg-field="name" placeholder="分组名称（如 机房出口）" aria-label="分组名称">
+        <span class="cg-prio" title="优先级：数值大者先匹配">
+          <input type="number" class="cg-prio-input" value="${Number(g.priority) || 0}" data-cg-kind="custom" data-cg-idx="${i}" data-cg-field="priority" aria-label="优先级">
+        </span>
+        <button type="button" role="switch" aria-checked="${!!g.enabled}" class="switch"
+          data-cg-kind="custom" data-cg-idx="${i}" data-cg-toggle aria-label="启用该分组"></button>
+        <button type="button" class="icon-btn move" data-action="grp-up" data-cg-kind="custom" data-cg-idx="${i}" ${i === 0 ? "disabled" : ""} aria-label="上移">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 12.5V3.5M4.5 7L8 3.5l3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn move" data-action="grp-down" data-cg-kind="custom" data-cg-idx="${i}" ${i === items.length - 1 ? "disabled" : ""} aria-label="下移">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 3.5v9M4.5 9l3.5 3.5L11.5 9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn" data-action="grp-del" data-cg-kind="custom" data-cg-idx="${i}" aria-label="删除该分组">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6.5 4V3h3v1M4.5 4l.5 9h6l.5-9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div class="err" data-cg-err="custom${i}.name"></div>
+      <div class="grid">
+        ${grpField(i, "custom", "match", "匹配来源 IP / CIDR", cgMatchHTML(i, g.match),
+          "命中这些网段即启用本分组，支持 IPv4/IPv6 的裸 IP 与 CIDR。自定义分组整体优先于上面的运营商分组。")}
+        ${grpField(i, "custom", "split_refs", "引用分流列表（命中即复用）", splitRefsEditorHTML("custom", i, g.split_refs),
+          "命中该分组的客户端，先按这里勾选的「上游与域名分流」列表匹配，命中哪条就用哪条的 DNS / 模式 / ECS / 偏好。")}
+        ${grpField(i, "custom", "fallback_dns", "覆盖上游 DNS（分流未命中时用）", dnsListHTML("custom", i, g.fallback_dns),
+          "引用分流全部未命中时，用这里的 DNS 解析并覆盖全局上游；留空则回退全局上游。")}
+        ${grpField(i, "custom", "dns_mode", "兜底 DNS 解析模式", dnsModeSelect("custom", i, g.dns_mode),
+          "同时查询全部 DNS 取最快成功（race），或按顺序取第一个成功（failover）。")}
+        ${grpField(i, "custom", "ip_prefer", "解析偏好（A/AAAA）", ipPreferSelect("custom", i, g.ip_prefer),
+          "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
+      </div>
+      ${groupECSHTML("custom", i, g.ecs)}
+    </div>`;
+  }).join("");
+  return `<div class="sl-editor" data-cg-group="custom_groups">${rows}
+    <button type="button" class="btn btn-ghost small list-add" data-action="grp-add">+ 添加一个自定义分组</button></div>`;
 }
 
 function cardHTML(card) {
@@ -1193,11 +1393,13 @@ function showErrors(errors) {
     el.classList.toggle("show", !!msg);
   });
   $$("[data-cg-field]").forEach(inp =>
-    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgIdx + "." + inp.dataset.cgField]));
+    inp.classList.toggle("invalid", !!errors[cgErrKey(inp)]));
   $$("[data-cg-match]").forEach(inp =>
-    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgMatch + ".match"]));
+    inp.classList.toggle("invalid", !!errors["custom" + inp.dataset.cgIdx + ".match"]));
   $$("[data-cg-dns]").forEach(inp =>
-    inp.classList.toggle("invalid", !!errors["cg" + inp.dataset.cgDns + ".dns"]));
+    inp.classList.toggle("invalid", !!errors[inp.dataset.cgKind + inp.dataset.cgIdx + ".dns"]));
+  $$("[data-cg-refs]").forEach(wrap =>
+    wrap.classList.toggle("invalid", !!errors[wrap.dataset.cgKind + wrap.dataset.cgIdx + ".split_refs"]));
   const first = Object.keys(errors)[0];
   if (first) {
     const el = $(`[data-bind="${first}"]`) || $(`[data-list-group="${first}"]`) ||
@@ -1205,9 +1407,16 @@ function showErrors(errors) {
     if (el) el.scrollIntoView({ behavior:"smooth", block:"center" });
     const inp = $(`[data-bind="${first}"]`) ||
       $(`[data-sl-err="${first}"]`)?.parentElement.querySelector("[data-sl-field], [data-sldns-list]") ||
-      $(`[data-cg-err="${first}"]`)?.parentElement.querySelector("[data-cg-field], [data-cg-match], [data-cg-dns]");
+      $(`[data-cg-err="${first}"]`)?.parentElement.querySelector("[data-cg-field], [data-cg-match], [data-cg-dns], [data-cg-refs-toggle]");
     if (inp) setTimeout(()=>inp.focus(), 250);
   }
+}
+
+/* 分组控件的错误位键名：<kind><idx>.<field> */
+function cgErrKey(el) {
+  const kind = el.dataset.cgKind, field = el.dataset.cgField;
+  // 内置运营商分组没有 name 字段，索引即 isp 数组下标
+  return `${kind}${el.dataset.cgIdx}.${field}`;
 }
 
 /* 归一化一条分流列表的 DNS：去空格去空项，始终返回数组 */
@@ -1236,32 +1445,46 @@ function validateSplitLists(errors) {
   });
 }
 
-/* 校验客户端分组：名称必填；启用时需有匹配条件与上游；ECS 填了就必须合法 */
+/* 校验客户端分组：启用时必须至少引用分流列表或配置兜底 DNS；引用必须真实存在。
+   错误位键名与编辑器产出的 data-cg-err 一致：isp<i>.<field> / custom<i>.<field> */
 function validateClientGroups(errors) {
-  (CFG.client_groups || []).forEach((g, i) => {
-    if (!String(g.name || "").trim()) errors[`cg${i}.name`] = "请填写分组名称";
-    const match = (g.match || []).map(s => String(s || "").trim()).filter(Boolean);
-    const servers = cgDNS(g);
-    if (g.enabled && !match.length) errors[`cg${i}.match`] = "启用分组需至少一条匹配条件";
-    else if (match.some(m => !cgMatchValid(m))) errors[`cg${i}.match`] = "匹配项须为合法 IP 或 CIDR，如 1.2.3.0/24、2001:db8::/32";
-    if (g.enabled && !servers.length) errors[`cg${i}.dns`] = "启用分组需至少一个上游 DNS";
-    if (servers.some(s => !DNS_RE.test(s))) errors[`cg${i}.dns`] = "DNS 地址须以 udp:// tcp:// https:// tls:// h3:// 开头";
-    const ecs = g.ecs || {};
-    if (ecs.enabled && ecs.subnet) {
-      if (!ECS_TYPES.some(t => t.v === ecs.isp_type)) errors[`cg${i}.ecs.isp_type`] = "请选择线路类型";
-      if (!ecsSubnetValid(String(ecs.subnet).trim())) errors[`cg${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24（留空=自动）";
+  const splitNames = new Set((CFG.split_lists || []).map(l => String((l || {}).name || "").trim()).filter(Boolean));
+  const checkDNS = (prefix, i, servers) => {
+    if (servers.length && servers.some(s => !DNS_RE.test(s)))
+      errors[`${prefix}${i}.fallback_dns`] = "DNS 地址须以 udp:// tcp:// https:// tls:// h3:// 开头";
+  };
+  const checkRefs = (prefix, i, refs) => {
+    if (refs.some(r => !splitNames.has(r)))
+      errors[`${prefix}${i}.split_refs`] = "引用的分流列表不存在，请先在「上游与域名分流」中定义";
+  };
+
+  (CFG.isp_groups || []).forEach((g, i) => {
+    const refs = asArray(g.split_refs);
+    checkRefs("isp", i, refs);
+    if (!g.enabled) return;
+    const fb = asArray(g.fallback_dns);
+    if (!refs.length && !fb.length) errors[`isp${i}.split_refs`] = "启用后需引用分流列表或配置兜底 DNS 之一";
+    else checkDNS("isp", i, fb);
+    if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
+      errors[`isp${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
     }
   });
-}
 
-/* 归一化一个客户端分组的 DNS：去空格去空项，始终数组 */
-function cgDNS(g) {
-  const raw = Array.isArray(g.dns) ? g.dns : (g.dns == null || g.dns === "" ? [] : [g.dns]);
-  return raw.map(s => String(s || "").trim()).filter(Boolean);
-}
-function cgMatch(g) {
-  const raw = Array.isArray(g.match) ? g.match : (g.match == null || g.match === "" ? [] : [g.match]);
-  return raw.map(s => String(s || "").trim()).filter(Boolean);
+  (CFG.custom_groups || []).forEach((g, i) => {
+    if (!String(g.name || "").trim()) errors[`custom${i}.name`] = "请填写分组名称";
+    const match = asArray(g.match);
+    const refs = asArray(g.split_refs);
+    checkRefs("custom", i, refs);
+    if (g.enabled && !match.length) errors[`custom${i}.match`] = "启用分组需至少一条匹配条件";
+    else if (match.some(m => !cgMatchValid(m))) errors[`custom${i}.match`] = "匹配项须为合法 IP 或 CIDR，如 1.2.3.0/24、2001:db8::/32";
+    if (!g.enabled) return;
+    const fb = asArray(g.fallback_dns);
+    if (!refs.length && !fb.length) errors[`custom${i}.split_refs`] = "启用后需引用分流列表或配置兜底 DNS 之一";
+    else checkDNS("custom", i, fb);
+    if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
+      errors[`custom${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
+    }
+  });
 }
 
 /* 分流列表中需重启才生效的变更（DNS/顺序/取反/ECS 均可热更新）
@@ -1310,20 +1533,32 @@ async function saveSections(secs) {
       subnet: String((l.ecs || {}).subnet || "").trim(),
     },
   }));
-  CFG.client_groups = (CFG.client_groups || []).map(g => ({
+  /* 运营商分组：一条一个规则，只保留已配置的行；每行 = 引用分流 + 兜底 DNS + 解析模式 + 偏好 + ECS */
+  CFG.isp_groups = normalizeISPGroups(CFG.isp_groups).map(g => ({
+    isp: g.isp,
+    enabled: !!g.enabled,
+    split_refs: asArray(g.split_refs),
+    fallback_dns: asArray(g.fallback_dns),
+    dns_mode: (String(g.dns_mode || "").trim() || "race"),
+    ip_prefer: String(g.ip_prefer || "").trim(),
+    ecs: {
+      enabled: !!(g.ecs || {}).enabled,
+      isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
+      subnet: String((g.ecs || {}).subnet || "").trim(),
+    },
+  }));
+  CFG.custom_groups = (CFG.custom_groups || []).map(g => ({
     name: String(g.name || "").trim(),
     enabled: !!g.enabled,
     priority: Number(g.priority) || 0,
-    match: cgMatch(g),
-    invert: !!g.invert,
-    dns: cgDNS(g),
+    match: asArray(g.match),
+    split_refs: asArray(g.split_refs),
+    fallback_dns: asArray(g.fallback_dns),
     dns_mode: (String(g.dns_mode || "").trim() || "race"),
-    enable_cloud_check: !!g.enable_cloud_check,
     ip_prefer: String(g.ip_prefer || "").trim(),
-    allow_domain_split: !!g.allow_domain_split,
     ecs: {
       enabled: !!(g.ecs || {}).enabled,
-      isp_type: String((g.ecs || {}).isp_type || "").trim(),
+      isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
       subnet: String((g.ecs || {}).subnet || "").trim(),
     },
   }));
@@ -1735,11 +1970,96 @@ function splitListDirty(l) {
   return !o || JSON.stringify(l) !== JSON.stringify(o);
 }
 
-/* 客户端分组脏标记：与基线中同名分组比对，调整顺序不误报 */
-function cgDirty(g) {
-  const o = (BASELINE.client_groups || []).find(b => (b.name || "") === (g.name || ""));
-  return !o || JSON.stringify(g) !== JSON.stringify(o);
+/* 分组「引用分流列表」勾选同步：按列表出现顺序重排 split_refs */
+function syncCGSplitRefs(el) {
+  const kind = el.dataset.cgKind, i = Number(el.dataset.cgIdx);
+  const item = groupAt(kind, i);
+  if (!item) return;
+  const wrap = el.closest("[data-cg-refs]");
+  const names = $$("[data-cg-refs-cb]:checked", wrap).map(cb => cb.value);
+  item.split_refs = names;
+  const sum = wrap.querySelector(".cg-refs-summary");
+  sum.textContent = names.length ? `已选 ${names.length} 项：${names.join("、")}` : "点击选择要复用的分流列表…";
+  sum.classList.toggle("empty", !names.length);
+  el.closest(".sl-item")?.classList.toggle("is-dirty", groupDirty(kind, item));
+  const errEl = $(`[data-cg-err="${kind}${i}.split_refs"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
 }
+/* 引用分流列表面板内的搜索过滤 */
+function syncCGSplitRefsSearch(el) {
+  if (el.dataset.cgRefsSearch === undefined) return;
+  const q = el.value.trim().toLowerCase();
+  el.closest("[data-cg-refs]").querySelectorAll(".cg-refs-opt").forEach(opt => {
+    const name = opt.querySelector(".nm").textContent.toLowerCase();
+    opt.style.display = !q || name.includes(q) ? "" : "none";
+  });
+}
+
+/* 客户端分组文本/下拉/数字输入同步（kind: isp | custom） */
+function syncClientGroupInput(el) {
+  const key = el.dataset.cgField;
+  if (!key) return;
+  const kind = el.dataset.cgKind;
+  const i = Number(el.dataset.cgIdx);
+  const item = groupAt(kind, i);
+  if (!item) return;
+  let v = el.value;
+  if (key === "priority") v = Number(v) || 0;
+  if (key.startsWith("ecs.") && !item.ecs) item.ecs = {};
+  setPath(item, key, v);
+  el.closest(".sl-item")?.classList.toggle("is-dirty", groupDirty(kind, item));
+  const errEl = $(`[data-cg-err="${kind}${i}.${key}"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+/* 自定义分组的匹配项输入同步 */
+function syncCGMatchInput(el) {
+  if (el.dataset.cgMatch === undefined) return;
+  const i = Number(el.dataset.cgIdx);
+  const item = groupAt("custom", i);
+  if (!item) return;
+  item.match = asArray(item.match);
+  item.match[Number(el.dataset.cgMatchIdx)] = el.value;
+  el.closest(".sl-item")?.classList.toggle("is-dirty", groupDirty("custom", item));
+  const errEl = $(`[data-cg-err="custom${i}.match"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+/* 分组的 DNS 输入同步 */
+function syncCGDNSInput(el) {
+  if (el.dataset.cgDns === undefined) return;
+  const kind = el.dataset.cgKind;
+  const i = Number(el.dataset.cgIdx);
+  const item = groupAt(kind, i);
+  if (!item) return;
+  item.fallback_dns = asArray(item.fallback_dns);
+  item.fallback_dns[Number(el.dataset.cgDnsIdx)] = el.value;
+  const protoEl = el.parentElement.querySelector(".proto");
+  if (protoEl) {
+    const scheme = (/^([a-z0-9]+):\/\//.exec(el.value||"") || [,""])[1];
+    protoEl.textContent = scheme || "scheme";
+    protoEl.className = "proto " + (scheme === "" ? "" : (["udp","tcp","https","tls","h3"].includes(scheme) ? "ok" : "bad"));
+  }
+  el.closest(".sl-item")?.classList.toggle("is-dirty", groupDirty(kind, item));
+  const errEl = $(`[data-cg-err="${kind}${i}.fallback_dns"]`);
+  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
+  updateChrome();
+}
+document.addEventListener("input", e => { syncBoundInput(e.target); syncListInput(e.target); syncSplitListInput(e.target); syncSplitDNSInput(e.target); syncClientGroupInput(e.target); syncCGMatchInput(e.target); syncCGDNSInput(e.target); syncCGSplitRefsSearch(e.target); syncLogInput(e.target); syncCertInput(e.target); });
+document.addEventListener("change", e => {
+  if (e.target.dataset.bind) { syncBoundInput(e.target); return; }
+  if (e.target.dataset.slField) { syncSplitListInput(e.target); return; }
+  if (e.target.dataset.cgRefsCb !== undefined) { syncCGSplitRefs(e.target); return; }
+  if (e.target.dataset.cgField) { syncClientGroupInput(e.target); return; }
+  if (e.target.dataset.cgField === "isp" && e.target.dataset.cgKind === "isp") {
+    renderRoute(); // 运营商变更后刷新其它行下拉的 disabled 选项
+    return;
+  }
+  if (e.target.id === "ov-search") { ovFilter.q = e.target.value; renderOverrides(); $("#ov-search").focus(); }
+  if (e.target.id === "ov-type-filter") { ovFilter.type = e.target.value; renderOverrides(); }
+  if (e.target.id === "ov-en-filter") { ovFilter.enabled = e.target.value; renderOverrides(); }
+});
 
 /* 分流列表内嵌 DNS 列表的输入同步 */
 function syncSplitDNSInput(el) {
@@ -1762,65 +2082,29 @@ function syncSplitDNSInput(el) {
   }
   updateChrome();
 }
-/* 客户端分组文本/下拉输入同步 */
-function syncClientGroupInput(el) {
-  const key = el.dataset.cgField;
-  if (!key) return;
-  const i = Number(el.dataset.cgIdx);
-  const item = (CFG.client_groups || [])[i];
-  if (!item) return;
-  if (key === "ecs.isp_type" || key === "ecs.subnet") {
-    if (!item.ecs) item.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
-  }
-  let v = el.value;
-  if (key === "priority") v = Number(v) || 0;
-  setPath(item, key, v);
-  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
-  const errEl = $(`[data-cg-err="cg${i}.${key}"]`);
-  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
-  updateChrome();
-}
-function syncCGMatchInput(el) {
-  if (el.dataset.cgMatch === undefined) return;
-  const i = Number(el.dataset.cgMatch);
-  const item = (CFG.client_groups || [])[i];
-  if (!item) return;
-  if (!Array.isArray(item.match)) item.match = item.match == null || item.match === "" ? [] : [item.match];
-  item.match[Number(el.dataset.cgMatchIdx)] = el.value;
-  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
-  const errEl = $(`[data-cg-err="cg${i}.match"]`);
-  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
-  updateChrome();
-}
-function syncCGDNSInput(el) {
-  if (el.dataset.cgDns === undefined) return;
-  const i = Number(el.dataset.cgDns);
-  const item = (CFG.client_groups || [])[i];
-  if (!item) return;
-  if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns];
-  item.dns[Number(el.dataset.cgDnsIdx)] = el.value;
-  const protoEl = el.parentElement.querySelector(".proto");
-  if (protoEl) {
-    const scheme = (/^([a-z0-9]+):\/\//.exec(el.value||"") || [,""])[1];
-    protoEl.textContent = scheme || "scheme";
-    protoEl.className = "proto " + (scheme === "" ? "" : (["udp","tcp","https","tls","h3"].includes(scheme) ? "ok" : "bad"));
-  }
-  el.closest(".sl-item")?.classList.toggle("is-dirty", cgDirty(item));
-  const errEl = $(`[data-cg-err="cg${i}.dns"]`);
-  if (errEl && errEl.classList.contains("show")) { errEl.classList.remove("show"); errEl.textContent=""; el.classList.remove("invalid"); }
-  updateChrome();
-}
-document.addEventListener("input", e => { syncBoundInput(e.target); syncListInput(e.target); syncSplitListInput(e.target); syncSplitDNSInput(e.target); syncClientGroupInput(e.target); syncCGMatchInput(e.target); syncCGDNSInput(e.target); syncLogInput(e.target); syncCertInput(e.target); });
-document.addEventListener("change", e => {
-  if (e.target.dataset.bind) { syncBoundInput(e.target); return; }
-  if (e.target.dataset.slField) { syncSplitListInput(e.target); return; }
-  if (e.target.dataset.cgField) { syncClientGroupInput(e.target); return; }
-  if (e.target.id === "ov-search") { ovFilter.q = e.target.value; renderOverrides(); $("#ov-search").focus(); }
-  if (e.target.id === "ov-type-filter") { ovFilter.type = e.target.value; renderOverrides(); }
-  if (e.target.id === "ov-en-filter") { ovFilter.enabled = e.target.value; renderOverrides(); }
-});
 
 document.addEventListener("click", async e => {
+  /* 引用分流列表：点击触发器展开/收起 */
+  const refsToggle = e.target.closest("[data-cg-refs-toggle]");
+  if (refsToggle) {
+    const wrap = refsToggle.closest("[data-cg-refs]");
+    const isOpen = wrap.classList.contains("open");
+    $$(".cg-refs.open").forEach(w => { w.classList.remove("open"); w.querySelector(".cg-refs-panel").hidden = true; w.querySelector("[data-cg-refs-toggle]").setAttribute("aria-expanded", "false"); });
+    if (!isOpen) {
+      wrap.classList.add("open");
+      const panel = wrap.querySelector(".cg-refs-panel");
+      panel.hidden = false;
+      refsToggle.setAttribute("aria-expanded", "true");
+      const search = wrap.querySelector("[data-cg-refs-search]");
+      if (search) { search.focus(); syncCGSplitRefsSearch(search); }
+    }
+    return;
+  }
+  /* 点击其它区域关闭引用分流列表面板 */
+  if (!e.target.closest("[data-cg-refs]")) {
+    $$(".cg-refs.open").forEach(w => { w.classList.remove("open"); w.querySelector(".cg-refs-panel").hidden = true; w.querySelector("[data-cg-refs-toggle]").setAttribute("aria-expanded", "false"); });
+  }
+
   /* 侧栏导航 */
   const navBtn = e.target.closest("[data-nav]");
   if (navBtn) { await navigate(navBtn.dataset.nav); document.body.classList.remove("sidebar-open"); return; }
@@ -1981,84 +2265,86 @@ document.addEventListener("click", async e => {
     return;
   }
 
-  /* 客户端分组编辑器 */
-  const cgAdd = e.target.closest('[data-action="cg-add"]');
-  if (cgAdd) {
-    CFG.client_groups = CFG.client_groups || [];
-    CFG.client_groups.push({ name:"", enabled:true, priority:0, match:[""], invert:false, dns:[""], dns_mode:"race",
-      enable_cloud_check:false, ip_prefer:"", allow_domain_split:true, ecs:{ enabled:false, isp_type:"telecom", subnet:"" } });
-    renderRoute();
-    const names = $$('[data-cg-field="name"]');
-    if (names.length) names[names.length-1].focus();
-    return;
-  }
-  const cgDel = e.target.closest('[data-action="cg-del"]');
-  if (cgDel) {
-    CFG.client_groups.splice(Number(cgDel.dataset.cgIdx), 1);
-    renderRoute();
-    return;
-  }
-  const cgMove = e.target.closest('[data-action="cg-up"],[data-action="cg-down"]');
-  if (cgMove) {
-    const up = cgMove.dataset.action === "cg-up";
-    const i = Number(cgMove.dataset.cgIdx);
-    const j = up ? i - 1 : i + 1;
-    const L = CFG.client_groups || [];
-    if (i >= 0 && j >= 0 && i < L.length && j < L.length) {
-      [L[i], L[j]] = [L[j], L[i]];
-      renderRoute();
-      $(`.sl-name[data-cg-idx="${j}"]`)?.focus();
-    }
-    return;
-  }
-  const cgMatchAdd = e.target.closest('[data-action="cg-match-add"]');
-  if (cgMatchAdd) {
-    const item = CFG.client_groups[Number(cgMatchAdd.dataset.cgIdx)];
-    if (item) { if (!Array.isArray(item.match)) item.match = item.match == null || item.match === "" ? [] : [item.match]; item.match.push(""); }
-    renderRoute();
-    const rows = $$(`[data-cg-match="${cgMatchAdd.dataset.cgIdx}"]`);
-    if (rows.length) rows[rows.length-1].focus();
-    return;
-  }
-  const cgMatchDel = e.target.closest('[data-action="cg-match-del"]');
-  if (cgMatchDel) {
-    const item = CFG.client_groups[Number(cgMatchDel.dataset.cgIdx)];
-    if (item && Array.isArray(item.match)) item.match.splice(Number(cgMatchDel.dataset.cgMatchIdx), 1);
-    renderRoute();
-    return;
-  }
-  const cgDnsAdd = e.target.closest('[data-action="cg-dns-add"]');
-  if (cgDnsAdd) {
-    const item = CFG.client_groups[Number(cgDnsAdd.dataset.cgIdx)];
-    if (item) { if (!Array.isArray(item.dns)) item.dns = item.dns == null || item.dns === "" ? [] : [item.dns]; item.dns.push(""); }
-    renderRoute();
-    const rows = $$(`[data-cg-dns="${cgDnsAdd.dataset.cgIdx}"]`);
-    if (rows.length) rows[rows.length-1].focus();
-    return;
-  }
-  const cgDnsDel = e.target.closest('[data-action="cg-dns-del"]');
-  if (cgDnsDel) {
-    const item = CFG.client_groups[Number(cgDnsDel.dataset.cgIdx)];
-    if (item && Array.isArray(item.dns)) item.dns.splice(Number(cgDnsDel.dataset.cgDnsIdx), 1);
-    renderRoute();
-    return;
-  }
-  const cgToggle = e.target.closest("[data-cg-switch],[data-cg-invert],[data-cg-ads],[data-cg-cloudcheck],[data-cg-ecs]");
-  if (cgToggle) {
-    const ds = cgToggle.dataset;
-    const i = Number(ds.cgSwitch ?? ds.cgInvert ?? ds.cgAds ?? ds.cgCloudcheck ?? ds.cgEcs);
-    const item = CFG.client_groups[i];
-    if (item) {
-      if (ds.cgSwitch !== undefined) item.enabled = !item.enabled;
-      else if (ds.cgInvert !== undefined) item.invert = !item.invert;
-      else if (ds.cgAds !== undefined) item.allow_domain_split = !item.allow_domain_split;
-      else if (ds.cgCloudcheck !== undefined) item.enable_cloud_check = !item.enable_cloud_check;
-      else if (ds.cgEcs !== undefined) {
-        if (!item.ecs) item.ecs = { enabled:false, isp_type:"telecom", subnet:"" };
-        item.ecs.enabled = !item.ecs.enabled;
+  /* 客户端分组编辑器（kind: isp=内置运营商组，custom=自定义组） */
+  const grpBtn = e.target.closest('[data-action^="grp-"]');
+  if (grpBtn) {
+    const a = grpBtn.dataset.action;
+    const kind = grpBtn.dataset.cgKind || "custom";
+    const i = Number(grpBtn.dataset.cgIdx);
+    const L = kind === "isp" ? CFG.isp_groups : CFG.custom_groups;
+
+    if (a === "grp-add") {
+      if (kind === "isp") {
+        CFG.isp_groups = CFG.isp_groups || [];
+        const used = new Set(CFG.isp_groups.map(g => String((g || {}).isp || "").trim().toLowerCase()));
+        const next = ISP_GROUP_DEFS.find(d => !used.has(d.v));
+        if (!next) { toast("四个运营商都已配置", "warn"); return; }
+        CFG.isp_groups.push({ isp: next.v, enabled: false, split_refs: [], fallback_dns: [""], dns_mode: "race", ip_prefer: "", ecs: { enabled: false, isp_type: "telecom", subnet: "" } });
+        renderRoute();
+        const rows = $$(`[data-cg-field="isp"][data-cg-kind="isp"]`);
+        if (rows.length) rows[rows.length-1].focus();
+        return;
       }
+      CFG.custom_groups = CFG.custom_groups || [];
+      CFG.custom_groups.push({ name:"", enabled:true, priority:0, match:[""], split_refs: [], fallback_dns:[""], dns_mode:"race", ip_prefer:"", ecs:{ enabled:false, isp_type:"telecom", subnet:"" } });
+      renderRoute();
+      const names = $$('[data-cg-field="name"]');
+      if (names.length) names[names.length-1].focus();
+      return;
+    }
+    if (!L || !L[i]) return;
+    if (a === "grp-del") { L.splice(i, 1); renderRoute(); return; }
+    if (a === "grp-up" || a === "grp-down") {
+      const j = a === "grp-up" ? i - 1 : i + 1;
+      if (j >= 0 && j < L.length) {
+        [L[i], L[j]] = [L[j], L[i]];
+        renderRoute();
+        $(`.sl-name[data-cg-kind="${kind}"][data-cg-idx="${j}"]`)?.focus();
+      }
+      return;
+    }
+    if (a === "grp-match-add") {
+      L[i].match = asArray(L[i].match); L[i].match.push("");
+      renderRoute();
+      const rows = $$(`[data-cg-match][data-cg-kind="${kind}"][data-cg-idx="${i}"]`);
+      if (rows.length) rows[rows.length-1].focus();
+      return;
+    }
+    if (a === "grp-match-del") {
+      L[i].match = asArray(L[i].match);
+      L[i].match.splice(Number(grpBtn.dataset.cgMatchIdx), 1);
+      renderRoute();
+      return;
+    }
+    if (a === "grp-dns-add") {
+      L[i].fallback_dns = asArray(L[i].fallback_dns); L[i].fallback_dns.push("");
+      renderRoute();
+      const rows = $$(`[data-cg-dns][data-cg-kind="${kind}"][data-cg-idx="${i}"]`);
+      if (rows.length) rows[rows.length-1].focus();
+      return;
+    }
+    if (a === "grp-dns-del") {
+      L[i].fallback_dns = asArray(L[i].fallback_dns);
+      L[i].fallback_dns.splice(Number(grpBtn.dataset.cgDnsIdx), 1);
+      renderRoute();
+      return;
+    }
+  }
+  /* 分组「兜底查询注入 ECS」开关：按钮只触发 click，需单独处理 */
+  const ecsBtn = e.target.closest('button[data-cg-field="ecs.enabled"]');
+  if (ecsBtn) {
+    const item = groupAt(ecsBtn.dataset.cgKind, Number(ecsBtn.dataset.cgIdx));
+    if (item) {
+      item.ecs = item.ecs || {};
+      item.ecs.enabled = !item.ecs.enabled;
       renderRoute();
     }
+    return;
+  }
+  const grpToggle = e.target.closest("[data-cg-toggle]");
+  if (grpToggle) {
+    const item = groupAt(grpToggle.dataset.cgKind, Number(grpToggle.dataset.cgIdx));
+    if (item) { item.enabled = !item.enabled; renderRoute(); }
     return;
   }
 

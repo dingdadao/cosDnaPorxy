@@ -58,6 +58,26 @@ func (l *EnhancedLogger) SetLevel(levelStr string) {
 	}
 }
 
+// StartFileLogCleanup 启动文件日志定时清理：
+// 启动时立即清理一次，之后每天执行一次，删除超过保留天数的 dns-proxy-*.log。
+// fileLogger 为 nil（文件日志创建失败）时静默跳过。
+func (l *EnhancedLogger) StartFileLogCleanup(retentionDays int) {
+	if l.fileLogger == nil {
+		return
+	}
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+	go func() {
+		_ = l.fileLogger.CleanupOldLogs(retentionDays)
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			_ = l.fileLogger.CleanupOldLogs(retentionDays)
+		}
+	}()
+}
+
 // getLevel 读取当前日志级别
 func (l *EnhancedLogger) getLevel() LogLevel {
 	l.levelMu.RLock()
@@ -270,10 +290,12 @@ func (l *EnhancedLogger) StartTimer(operation string, fields ...map[string]inter
 	}
 }
 
-// End 结束计时并记录
+// End 结束计时并记录。
+// 用 Debug 级别输出：性能计时器在 info 配置下触发频率极高（每个查询都会记录），
+// 会撑爆磁盘并推高瞬时内存/GC；降到 debug 后生产 info 不再输出，保留排查能力。
 func (pt *PerformanceTimer) End() time.Duration {
 	duration := time.Since(pt.startTime)
-	pt.logger.WithDuration(LogInfo, fmt.Sprintf("⏱️ %s completed", pt.operation), duration, pt.fields)
+	pt.logger.WithDuration(LogDebug, fmt.Sprintf("⏱️ %s completed", pt.operation), duration, pt.fields)
 	return duration
 }
 

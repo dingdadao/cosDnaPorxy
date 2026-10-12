@@ -288,6 +288,160 @@ cur=$(api_cfg)
 req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']; c['split_lists']=c['split_lists'][:2]; print(json.dumps(c))")
 api_put "$req" >/dev/null
 
+
+say "== 客户端分组（运营商固定分组 + 自定义分组）=="
+
+# 现状：默认不启用任何分组
+api_cfg | jqpy "c=json.load(sys.stdin)['config']; sys.exit(0 if c['isp_groups']==[] and c['custom_groups']==[] else 1)"
+check $? "初始 isp_groups / custom_groups 为空"
+
+# 合法保存：启用电信组，引用已存在的启用分流列表
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'telecom','enabled':True,'split_refs':['定向域名'],'fallback_dns':['udp://1.1.1.1'],'dns_mode':'race'}]
+print(json.dumps(c))")
+echo "$(api_put "$req" | head -1)" | jqpy "r=json.load(sys.stdin); sys.exit(0 if r.get('ok') and r.get('restart_required') is False else 1)"
+check $? "新增运营商分组 → 热更新(restart_required=false)"
+api_cfg | jqpy "g=json.load(sys.stdin)['config']['isp_groups']; sys.exit(0 if len(g)==1 and g[0]['isp']=='telecom' and g[0]['split_refs']==['定向域名'] else 1)"
+check $? "运营商分组已落库(isp/split_refs)"
+[ "$(api_cfg | jqpy "print(json.load(sys.stdin)['config']['isp_groups'][0]['fallback_dns'][0])")" = "udp://1.1.1.1:53" ]
+check $? "默认上游缺端口被归一化(udp://1.1.1.1 → :53)"
+
+# 分组路由变更必须清空缓存（否则旧 scope 的缓存会串味）
+found=1
+for _ in $(seq 1 10); do
+  if grep -aq "SPLIT_ROUTING_CHANGED_CACHE_CLEARED" "$LOG" 2>/dev/null || grep -rq "SPLIT_ROUTING_CHANGED_CACHE_CLEARED" "$WORK_DIR/logs" 2>/dev/null; then
+    found=0; break
+  fi
+  sleep 0.3
+done
+check $found "客户端分组变更触发缓存清空日志"
+
+# 启用但未引用任何分流列表 → 400
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'unicom','enabled':True,'split_refs':[],'fallback_dns':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "启用但未引用分流列表被拒绝 (http=$code, 期望400)"
+
+# 引用不存在的分流列表 → 400
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'unicom','enabled':True,'split_refs':['不存在列表'],'fallback_dns':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "引用不存在的分流列表被拒绝 (http=$code, 期望400)"
+
+# 引用存在但未启用的分流列表 → 400（停用列表必须在同一次请求里清掉对它的引用，否则该请求自身就非法）
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[]
+c['split_lists'][0]['enabled']=False
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "200" ]; check $? "先停用分流列表并清空分组 (http=$code)"
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'unicom','enabled':True,'split_refs':['定向域名'],'fallback_dns':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "引用未启用的分流列表被拒绝 (http=$code, 期望400)"
+# 恢复启用
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']; c['split_lists'][0]['enabled']=True; print(json.dumps(c))")
+api_put "$req" >/dev/null
+
+# 未启用分组允许留空引用（用于「先配置后启用」）
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'unicom','enabled':False,'split_refs':[],'fallback_dns':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "200" ]; check $? "未启用的运营商分组允许空引用 (http=$code)"
+
+# 非法 isp 标识 → 400（常见别名如 chinatelecom/mobile 会被归一化，这里用真正无法识别值）
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'ctcc','enabled':False}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "非法 isp 标识被拒绝 (http=$code, 期望400)"
+# 别名归一化：chinatelecom → telecom（落库为内置标识）
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'chinatelecom','enabled':False}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "200" ]; check $? "isp 别名被接受 (http=$code)"
+[ "$(api_cfg | jqpy "print(json.load(sys.stdin)['config']['isp_groups'][0]['isp'])")" = "telecom" ]
+check $? "别名已归一化为内置标识 telecom"
+
+# 重复 isp → 400
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'other','enabled':False},{'isp':'other','enabled':False}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "重复 isp 分组被拒绝 (http=$code, 期望400)"
+
+# 运营商分组恢复为单条启用
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['isp_groups']=[{'isp':'telecom','enabled':True,'split_refs':['定向域名'],'fallback_dns':['udp://1.1.1.1:53'],'dns_mode':'race'}]
+print(json.dumps(c))")
+api_put "$req" >/dev/null
+
+# 自定义分组：名称必填
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['custom_groups']=[{'name':'  ','enabled':False,'match':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "自定义分组空名称被拒绝 (http=$code, 期望400)"
+
+# 自定义分组：Match 只接受 IP/CIDR，域名 → 400
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['custom_groups']=[{'name':'机房','enabled':True,'priority':10,'match':['example.com'],'split_refs':['定向域名'],'fallback_dns':[]}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "400" ]; check $? "自定义分组 Match 含域名被拒绝 (http=$code, 期望400)"
+
+# 自定义分组：合法保存 + 热更新
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['custom_groups']=[{'name':'机房','enabled':True,'priority':10,'match':['10.0.0.0/8','2001:db8::/32'],'split_refs':['定向域名','中国域名'],'fallback_dns':['https://1.1.1.1/dns-query'],'dns_mode':'failover'}]
+print(json.dumps(c))")
+echo "$(api_put "$req" | head -1)" | jqpy "r=json.load(sys.stdin); sys.exit(0 if r.get('ok') and r.get('restart_required') is False else 1)"
+check $? "自定义分组保存 → 热更新(restart_required=false)"
+api_cfg | jqpy "g=json.load(sys.stdin)['config']['custom_groups']
+sys.exit(0 if len(g)==1 and g[0]['name']=='机房' and g[0]['priority']==10 and g[0]['match']==['10.0.0.0/8','2001:db8::/32'] and g[0]['dns_mode']=='failover' else 1)"
+check $? "自定义分组已落库(名称/优先级/网段/解析模式)"
+
+# 保留：管理端页面含新分组编辑器与运营商识别开关
+body=$(api_get "$API/")
+for marker in 'ispGroupEditorHTML' 'customGroupEditorHTML' 'source_enabled' 'isp_groups' 'custom_groups' '按运营商自动分组'; do
+  case "$body" in *"$marker"*) ok "管理页含标记 $marker" ;; *) bad "管理页缺少标记 $marker" ;; esac
+done
+
+# 清理：清空分组，避免影响后续解析断言
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']; c['isp_groups']=[]; c['custom_groups']=[]; print(json.dumps(c))")
+api_put "$req" >/dev/null
+api_cfg | jqpy "c=json.load(sys.stdin)['config']; sys.exit(0 if c['isp_groups']==[] and c['custom_groups']==[] else 1)"
+check $? "客户端分组已清空（回归现场）"
+
+# 兼容：旧版 client_groups 仍能写入并被服务端接受（字段不再回显，但不应报错）
+cur=$(api_cfg)
+req=$(echo "$cur" | jqpy "c=json.load(sys.stdin)['config']
+c['client_groups']=[{'name':'旧分组','enabled':True,'match':['10.0.0.0/8'],'dns':['udp://1.1.1.1:53']}]
+print(json.dumps(c))")
+code=$(api_put "$req" | tail -1)
+[ "$code" = "200" ]; check $? "携带旧 client_groups 的请求仍被接受 (http=$code)"
+api_cfg | jqpy "c=json.load(sys.stdin)['config']; sys.exit(0 if 'client_groups' not in c else 1)"
+check $? "旧 client_groups 字段不再回显"
+
 say "== 篡改规则 API =="
 code=$(api_req -X POST "$API/api/overrides" -H 'Content-Type: application/json' \
   -d '{"domain":"test.example.com","qtype":"A","value":"1.2.3.4","ttl":60,"enabled":true}')

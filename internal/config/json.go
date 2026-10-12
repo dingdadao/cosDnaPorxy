@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -55,7 +56,8 @@ type ConfigJSON struct {
 	ClientIPSources   stringOrList      `json:"client_ip_sources"`
 	ClientIPHeaders   stringOrList      `json:"client_ip_headers"`
 	ClientIPStatic    map[string]string `json:"client_ip_static,omitempty"`
-	ClientGroups      []ClientGroupJSON `json:"client_groups"`
+	ISPGroups         []ISPGroupJSON    `json:"isp_groups"`
+	CustomGroups      []CustomGroupJSON `json:"custom_groups"`
 	AllowACLs         stringOrList      `json:"allow_acls"`
 	SourceEnabled     bool              `json:"source_enabled"`
 	SourceDBDir       string            `json:"source_db_dir"`
@@ -73,6 +75,9 @@ type ConfigJSON struct {
 	LegacyChinaDomainFileURL     string `json:"china_domain_file_url,omitempty"`
 	LegacyChinaDomainRefresh     string `json:"china_domain_refresh,omitempty"`
 	LegacyEnableChinaDomainCheck bool   `json:"enable_china_domain_check,omitempty"`
+
+	// 旧版客户端分组（自由命名 + IP/CIDR + 取反），仅用于导入迁移，写入时不再输出
+	LegacyClientGroups []legacyClientGroupJSON `json:"client_groups,omitempty"`
 }
 
 // stringOrList 兼容 dns 字段的历史写法（单个字符串）与列表写法（字符串数组）
@@ -115,8 +120,38 @@ type SplitListJSON struct {
 	IPPrefer         string        `json:"ip_prefer"`
 }
 
-// ClientGroupJSON 客户端分组的 JSON 表示
-type ClientGroupJSON struct {
+// ISPGroupJSON 运营商固定分组的 JSON 表示
+type ISPGroupJSON struct {
+	ISP         string        `json:"isp"`
+	Enabled     bool          `json:"enabled"`
+	SplitRefs   stringOrList  `json:"split_refs"`
+	FallbackDNS stringOrList  `json:"fallback_dns"`
+	DNSMode     string        `json:"dns_mode"`
+	IPPrefer    string        `json:"ip_prefer"`
+	ECS         ECSPolicyJSON `json:"ecs"`
+
+	// 以下为旧版字段，仅用于导入迁移（旧 dns → fallback_dns；旧 split_refs 直接沿用）。
+	// 写回时不再输出。
+	LegacyDNS stringOrList `json:"dns,omitempty"`
+}
+
+// CustomGroupJSON 自定义分组的 JSON 表示
+type CustomGroupJSON struct {
+	Name        string        `json:"name"`
+	Enabled     bool          `json:"enabled"`
+	Priority    int           `json:"priority"`
+	Match       stringOrList  `json:"match"`
+	SplitRefs   stringOrList  `json:"split_refs"`
+	FallbackDNS stringOrList  `json:"fallback_dns"`
+	DNSMode     string        `json:"dns_mode"`
+	IPPrefer    string        `json:"ip_prefer"`
+	ECS         ECSPolicyJSON `json:"ecs"`
+
+	LegacyDNS stringOrList `json:"dns,omitempty"`
+}
+
+// legacyClientGroupJSON 旧版客户端分组的 JSON 表示，仅用于导入迁移，写入时不再输出
+type legacyClientGroupJSON struct {
 	Name             string        `json:"name"`
 	Enabled          bool          `json:"enabled"`
 	Priority         int           `json:"priority"`
@@ -174,24 +209,39 @@ func (c *Config) ToJSON() *ConfigJSON {
 		})
 	}
 
-	groups := make([]ClientGroupJSON, 0, len(c.ClientGroups))
-	for _, g := range c.ClientGroups {
-		groups = append(groups, ClientGroupJSON{
-			Name:     g.Name,
-			Enabled:  g.Enabled,
-			Priority: g.Priority,
-			Match:    stringOrList(g.Match),
-			Invert:   g.Invert,
-			DNS:      stringOrList(g.DNS),
-			DNSMode:  g.DNSMode,
+	ispGroups := make([]ISPGroupJSON, 0, len(c.ISPGroups))
+	for _, g := range c.ISPGroups {
+		ispGroups = append(ispGroups, ISPGroupJSON{
+			ISP:         string(g.ISP),
+			Enabled:     g.Enabled,
+			SplitRefs:   stringOrList(g.SplitRefs),
+			FallbackDNS: stringOrList(g.FallbackDNS),
+			DNSMode:     g.DNSMode,
+			IPPrefer:    g.IPPrefer,
 			ECS: ECSPolicyJSON{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
-			EnableCloudCheck: g.EnableCloudCheck,
-			IPPrefer:         g.IPPrefer,
-			AllowDomainSplit: g.AllowDomainSplit,
+		})
+	}
+
+	customGroups := make([]CustomGroupJSON, 0, len(c.CustomGroups))
+	for _, g := range c.CustomGroups {
+		customGroups = append(customGroups, CustomGroupJSON{
+			Name:        g.Name,
+			Enabled:     g.Enabled,
+			Priority:    g.Priority,
+			Match:       stringOrList(g.Match),
+			SplitRefs:   stringOrList(g.SplitRefs),
+			FallbackDNS: stringOrList(g.FallbackDNS),
+			DNSMode:     g.DNSMode,
+			IPPrefer:    g.IPPrefer,
+			ECS: ECSPolicyJSON{
+				Enabled: g.ECS.Enabled,
+				ISPType: g.ECS.ISPType,
+				Subnet:  g.ECS.Subnet,
+			},
 		})
 	}
 
@@ -250,7 +300,8 @@ func (c *Config) ToJSON() *ConfigJSON {
 		ClientIPSources:   stringOrList(c.ClientIPSources),
 		ClientIPHeaders:   stringOrList(c.ClientIPHeaders),
 		ClientIPStatic:    c.ClientIPStatic,
-		ClientGroups:      groups,
+		ISPGroups:         ispGroups,
+		CustomGroups:      customGroups,
 		AllowACLs:         stringOrList(c.AllowACLs),
 		SourceEnabled:     c.SourceEnabled,
 		SourceDBDir:       c.SourceDBDir,
@@ -379,34 +430,82 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		EnableAWSCheck:        j.EnableAWSCheck,
 	}
 
-	clientGroups := make([]ClientGroup, 0, len(j.ClientGroups))
-	for i, g := range j.ClientGroups {
-		if !ValidIPPrefer(g.IPPrefer) {
-			return nil, fmt.Errorf("client_groups[%d].ip_prefer: 非法取值 %q", i, g.IPPrefer)
+	ispGroups := make([]ISPGroup, 0, len(j.ISPGroups))
+	for i, g := range j.ISPGroups {
+		key, ok := ParseISPKey(g.ISP)
+		if !ok {
+			return nil, fmt.Errorf("isp_groups[%d].isp: 非法分组标识 %q", i, g.ISP)
 		}
-		clientGroups = append(clientGroups, ClientGroup{
-			Name:     g.Name,
-			Enabled:  g.Enabled,
-			Priority: g.Priority,
-			Match:    []string(g.Match),
-			Invert:   g.Invert,
-			DNS:      []string(g.DNS),
-			DNSMode:  g.DNSMode,
+		// 新字段 fallback_dns 为空时回退到旧字段 dns（兼容旧版 DNS-only 模型）
+		fallback := []string(g.FallbackDNS)
+		if len(fallback) == 0 && len(g.LegacyDNS) > 0 {
+			fallback = []string(g.LegacyDNS)
+		}
+		ispGroups = append(ispGroups, ISPGroup{
+			ISP:         key,
+			Enabled:     g.Enabled,
+			SplitRefs:   []string(g.SplitRefs),
+			FallbackDNS: fallback,
+			DNSMode:     g.DNSMode,
+			IPPrefer:    g.IPPrefer,
 			ECS: ECSPolicy{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
-			EnableCloudCheck: g.EnableCloudCheck,
-			IPPrefer:         g.IPPrefer,
-			AllowDomainSplit: g.AllowDomainSplit,
 		})
 	}
-	cfg.ClientGroups = clientGroups
-	cfg.SourceEnabled = j.SourceEnabled
-	cfg.SourceDBDir = j.SourceDBDir
-	cfg.SourceBaseURL = j.SourceBaseURL
-	cfg.SourceUpdateHours = j.SourceUpdateHours
+
+	customGroups := make([]CustomGroup, 0, len(j.CustomGroups))
+	for _, g := range j.CustomGroups {
+		fallback := []string(g.FallbackDNS)
+		if len(fallback) == 0 && len(g.LegacyDNS) > 0 {
+			fallback = []string(g.LegacyDNS)
+		}
+		customGroups = append(customGroups, CustomGroup{
+			Name:        g.Name,
+			Enabled:     g.Enabled,
+			Priority:    g.Priority,
+			Match:       []string(g.Match),
+			SplitRefs:   []string(g.SplitRefs),
+			FallbackDNS: fallback,
+			DNSMode:     g.DNSMode,
+			IPPrefer:    g.IPPrefer,
+			ECS: ECSPolicy{
+				Enabled: g.ECS.Enabled,
+				ISPType: g.ECS.ISPType,
+				Subnet:  g.ECS.Subnet,
+			},
+		})
+	}
+
+	// 旧版 client_groups 迁移：仅当新版字段全空时才启用，避免与新版并存时互相覆盖
+	if len(ispGroups) == 0 && len(customGroups) == 0 && len(j.LegacyClientGroups) > 0 {
+		ispGroups, customGroups = migrateLegacyClientGroups(j.LegacyClientGroups)
+	}
+
+	cfg.ISPGroups = ispGroups
+	cfg.CustomGroups = customGroups
+
+	// 运营商识别：老配置里没有 source_* 字段（四项全为零值）时按默认策略启用。
+	// 只要任一字段有值就说明是新版写出的配置，原样尊重用户的开关选择。
+	if j.SourceDBDir == "" && j.SourceBaseURL == "" && !j.SourceEnabled && j.SourceUpdateHours == 0 {
+		cfg.SourceEnabled = def.SourceEnabled
+		cfg.SourceDBDir = def.SourceDBDir
+		cfg.SourceBaseURL = def.SourceBaseURL
+		cfg.SourceUpdateHours = def.SourceUpdateHours
+	} else {
+		cfg.SourceEnabled = j.SourceEnabled
+		cfg.SourceDBDir = j.SourceDBDir
+		cfg.SourceBaseURL = j.SourceBaseURL
+		cfg.SourceUpdateHours = j.SourceUpdateHours
+	}
+	if cfg.SourceBaseURL == "" {
+		cfg.SourceBaseURL = def.SourceBaseURL
+	}
+	if cfg.SourceDBDir == "" {
+		cfg.SourceDBDir = def.SourceDBDir
+	}
 	cfg.TrustedProxies = []string(j.TrustedProxies)
 	cfg.ClientIPSources = []string(j.ClientIPSources)
 	cfg.ClientIPHeaders = []string(j.ClientIPHeaders)
@@ -454,4 +553,63 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// migrateLegacyClientGroups 把旧版「自由命名 + IP/CIDR/isp: + 取反」的客户端分组迁移为新模型。
+//
+// 规则：
+//   - `isp:<name>`  → 对应运营商固定分组（启用；兜底 DNS = 旧组 DNS，不再引用分流列表）
+//   - 纯 IP/CIDR    → 自定义分组（保留 IP 匹配能力；兜底 DNS = 旧组 DNS）
+//   - invert        → 丢弃（旧取反语义与新模型冲突）
+//   - 旧组 DNS  → fallback_dns（分流未命中时兜底，与旧「命中即用组 DNS」行为最接近）
+//
+// 仅当旧组非空且至少有一条 DNS 时才迁移；否则跳过，避免生成"启用即不合法"的配置。
+func migrateLegacyClientGroups(legacy []legacyClientGroupJSON) ([]ISPGroup, []CustomGroup) {
+	var isps []ISPGroup
+	var customs []CustomGroup
+	seenISP := map[ISPKey]bool{}
+
+	for _, g := range legacy {
+		if !g.Enabled {
+			continue
+		}
+		fallback := []string(g.DNS)
+		if len(fallback) == 0 {
+			// 没有 DNS 即视为未配置，不迁移
+			continue
+		}
+		var ips []string
+		for _, m := range g.Match {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			if strings.HasPrefix(m, "isp:") {
+				key, ok := ParseISPKey(strings.TrimPrefix(m, "isp:"))
+				if !ok || seenISP[key] {
+					continue
+				}
+				seenISP[key] = true
+				isps = append(isps, ISPGroup{
+					ISP:         key,
+					Enabled:     true,
+					FallbackDNS: fallback,
+					DNSMode:     g.DNSMode,
+				})
+				continue
+			}
+			ips = append(ips, m)
+		}
+		if len(ips) > 0 {
+			customs = append(customs, CustomGroup{
+				Name:        g.Name,
+				Enabled:     true,
+				Priority:    g.Priority,
+				Match:       ips,
+				FallbackDNS: fallback,
+				DNSMode:     g.DNSMode,
+			})
+		}
+	}
+	return isps, customs
 }

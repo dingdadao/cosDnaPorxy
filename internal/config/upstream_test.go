@@ -143,11 +143,11 @@ func TestValidateConfigNormalizesUpstreams(t *testing.T) {
 			Enabled: true,
 			DNS:     []string{"udp://1.1.1.1", "tls://dns.google"},
 		}},
-		ClientGroups: []ClientGroup{{
-			Name:    "办公网",
-			Enabled: true,
-			Match:   []string{"10.0.0.0/8"},
-			DNS:     []string{"tls://dns.google"},
+		CustomGroups: []CustomGroup{{
+			Name:        "办公网",
+			Enabled:     true,
+			Match:       []string{"10.0.0.0/8"},
+			FallbackDNS: []string{"tls://dns.google"},
 		}},
 	}
 
@@ -165,7 +165,7 @@ func TestValidateConfigNormalizesUpstreams(t *testing.T) {
 		{"backup_dns", cfg.BackupDNS, "udp://9.9.9.9:53"},
 		{"split_lists[0].dns[0]", cfg.SplitLists[0].DNS[0], "udp://1.1.1.1:53"},
 		{"split_lists[0].dns[1]", cfg.SplitLists[0].DNS[1], "tls://dns.google:853"},
-		{"client_groups[0].dns[0]", cfg.ClientGroups[0].DNS[0], "tls://dns.google:853"},
+		{"custom_groups[0].fallback_dns[0]", cfg.CustomGroups[0].FallbackDNS[0], "tls://dns.google:853"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -185,9 +185,12 @@ func TestValidateConfigRejectsBadUpstreamFields(t *testing.T) {
 		{"分流列表协议不支持", func(c *Config) {
 			c.SplitLists = []SplitList{{Name: "x", Enabled: true, DNS: []string{"ftp://1.1.1.1"}}}
 		}, "split_lists[0].dns[0]"},
-		{"客户端分组协议不支持", func(c *Config) {
-			c.ClientGroups = []ClientGroup{{Name: "g", Enabled: true, Match: []string{"10.0.0.0/8"}, DNS: []string{"htps://1.1.1.1"}}}
-		}, "client_groups[0].dns[0]"},
+		{"运营商分组默认上游协议不支持", func(c *Config) {
+			c.ISPGroups = []ISPGroup{{ISP: ISPGroupTelecom, FallbackDNS: []string{"htps://1.1.1.1"}}}
+		}, "isp_groups[0].fallback_dns[0]"},
+		{"自定义分组默认上游协议不支持", func(c *Config) {
+			c.CustomGroups = []CustomGroup{{Name: "g", FallbackDNS: []string{"htps://1.1.1.1"}}}
+		}, "custom_groups[0].fallback_dns[0]"},
 		{"备份 DNS 非法", func(c *Config) { c.BackupDNS = "udp://" }, "backup_dns"},
 	}
 

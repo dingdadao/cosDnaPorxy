@@ -34,6 +34,13 @@ func main() {
 	// 创建日志系统
 	logger := utils.NewEnhancedLogger(cfg.LogLevel, "dns-proxy", cfg.LogFormat == "json")
 
+	// 文件日志定时清理：按查询日志保留时长换算天数，兜底 7 天
+	retentionDays := int(cfg.QueryLog.Retention.Hours() / 24)
+	if retentionDays < 1 {
+		retentionDays = 7
+	}
+	logger.StartFileLogCleanup(retentionDays)
+
 	logger.Info("🚀 [正在启动DNS代理服务] ", map[string]interface{}{
 		"rule": "MAIN_START",
 		"pid":  os.Getpid(),

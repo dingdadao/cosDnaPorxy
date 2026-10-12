@@ -396,43 +396,60 @@ func (h *RefactoredHandler) queryDoH(req *dns.Msg, server string) (*dns.Msg, err
 
 // queryDoT 执行DoT DNS查询
 func (h *RefactoredHandler) queryDoT(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 使用连接池获取DoT连接
-	ctx := context.Background()
-	conn, err := h.dotConnPool.GetConn(ctx, server)
-	if err != nil {
-		h.Logger.Error("获取DoT连接失败", map[string]interface{}{
-			"server": server,
-			"error":  err,
-		})
-		return nil, err
+	// 单次尝试：取连接→写入→读取。阿里 DoT 服务器会对连接做生命周期管理
+	//（约 60s 到点统一断开），复用被断开的连接会报写入/读取失败；
+	// 失败时自动丢弃死连接并用新连接重试一次，客户端无感，错误日志大幅减少。
+	tryOnce := func() (*dns.Msg, error) {
+		// 使用连接池获取DoT连接
+		conn, err := h.dotConnPool.GetConn(context.Background(), server)
+		if err != nil {
+			return nil, err
+		}
+
+		// 确保在函数结束时归还连接到池中
+		discarded := false
+		defer func() {
+			if !discarded {
+				h.dotConnPool.PutConn(conn)
+			}
+		}()
+
+		// 使用TLS连接创建dns.Conn并执行查询
+		dnsConn := &dns.Conn{Conn: conn.tlsConn}
+		if err := dnsConn.WriteMsg(req); err != nil {
+			// 写入失败说明连接已损坏（如服务器端断开导致的 broken pipe），
+			// 丢弃而非归还，避免后续复用死连接反复失败。
+			discarded = true
+			h.dotConnPool.DiscardConn(conn)
+			return nil, err
+		}
+
+		resp, err := dnsConn.ReadMsg()
+		if err != nil {
+			// 读取出错同样视为连接不可用，丢弃从池中移除并关闭。
+			discarded = true
+			h.dotConnPool.DiscardConn(conn)
+			return nil, err
+		}
+
+		return resp, nil
 	}
 
-	// 确保在函数结束时归还连接到池中
-	defer func() {
-		h.dotConnPool.PutConn(conn)
-	}()
-
-	// 使用TLS连接创建dns.Conn并执行查询
-	dnsConn := &dns.Conn{Conn: conn.tlsConn}
-	err = dnsConn.WriteMsg(req)
-	if err != nil {
-		h.Logger.Error("DoT写入请求失败", map[string]interface{}{
-			"server": server,
-			"error":  err,
-		})
-		return nil, err
+	resp, err := tryOnce()
+	if err == nil {
+		return resp, nil
 	}
-
-	resp, err := dnsConn.ReadMsg()
-	if err != nil {
-		h.Logger.Error("DoT读取响应失败", map[string]interface{}{
-			"server": server,
-			"error":  err,
-		})
-		return nil, err
+	// 首次失败（连接被服务器端周期性断开），丢弃死连接后用新连接重试一次
+	resp, err2 := tryOnce()
+	if err2 == nil {
+		return resp, nil
 	}
-
-	return resp, nil
+	// 重试仍失败才是真实错误
+	h.Logger.Error("DoT查询失败", map[string]interface{}{
+		"server": server,
+		"error":  err2,
+	})
+	return nil, err2
 }
 
 // queryDoH3 执行 DoH3 DNS 查询（真实 HTTP/3 over QUIC）

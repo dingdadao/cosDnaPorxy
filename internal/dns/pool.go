@@ -24,6 +24,11 @@ type DoTConnPool struct {
 	maxConns int
 	timeout  time.Duration
 
+	// resolver 用于解析 DoT 服务器主机名。
+	// 默认 nil 时走系统 /etc/resolv.conf；DNS 服务器自身解析上游不应依赖系统 DNS，
+	// 通过 SetBootstrapResolver 注入配置里的 UDP 上游作为 bootstrap。
+	resolver *net.Resolver
+
 	// 监控指标
 	metrics struct {
 		TotalConnsCreated int64
@@ -38,22 +43,53 @@ type DoTConn struct {
 	conn     net.Conn
 	tlsConn  *tls.Conn
 	lastUsed time.Time
+	created  time.Time // 连接建立时间：用于主动轮换
 	inUse    bool
 	server   string
 }
+
+// dotConnLifetime 单条 DoT 连接的最大寿命。
+// 实测阿里 DoT 服务器会对连接做生命周期管理（空闲约 60s 到点统一断开，EOF），
+// 正在使用该连接的查询会同时报"读取响应失败"。客户端主动在到期前轮换连接，
+// 可把这类失败降到接近零。40s 比服务器断开阈值（约 60s）留足余量。
+const dotConnLifetime = 40 * time.Second
 
 // NewDoTConnPool 创建新的DoT连接池
 func NewDoTConnPool() *DoTConnPool {
 	pool := &DoTConnPool{
 		conns:    make(map[string][]*DoTConn),
 		maxConns: 20,               // 增加每个服务器的最大连接数到20
-		timeout:  90 * time.Second, // 增加连接超时时间到90秒
+		timeout:  45 * time.Second, // 空闲连接过期时间：阿里 DoT 约 60s 断开空闲连接，45s 过期可赶在断开前清理，减少死连接复用
 	}
 
 	// 启动健康检查协程
 	go pool.healthCheckRoutine()
 
 	return pool
+}
+
+// SetBootstrapResolver 用配置里的 UDP 上游作为 bootstrap DNS 解析 DoT 服务器主机名。
+// 避免 DNS 服务器解析自己上游时依赖系统 /etc/resolv.conf（如内网 DNS 不可达会导致
+// tls:// 上游连接报 lookup i/o timeout）。
+// 仅当上游是 IP（非域名）时才可用作 bootstrap 服务器。
+func (p *DoTConnPool) SetBootstrapResolver(upstreams []string) {
+	for _, u := range upstreams {
+		host, _, err := net.SplitHostPort(config.UpstreamDialAddr(u))
+		if err != nil || net.ParseIP(host) == nil {
+			continue
+		}
+		addr := config.UpstreamDialAddr(u)
+		p.mu.Lock()
+		p.resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 3 * time.Second}
+				return d.DialContext(ctx, "udp", addr)
+			},
+		}
+		p.mu.Unlock()
+		return
+	}
 }
 
 // GetConn 获取DoT连接
@@ -66,7 +102,8 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 		// 先找可复用连接（过期连接放到循环外统一关闭清理，
 		// 否则边 range 边删元素会让后续迭代下标越界 panic）
 		for _, conn := range connList {
-			if !conn.inUse && time.Since(conn.lastUsed) < p.timeout {
+			if !conn.inUse && time.Since(conn.lastUsed) < p.timeout &&
+				time.Since(conn.created) < dotConnLifetime {
 				conn.inUse = true
 				conn.lastUsed = time.Now()
 				p.metrics.TotalConnsReused++
@@ -75,10 +112,12 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 				return conn, nil
 			}
 		}
-		// 关闭并移除过期的空闲连接
+		// 关闭并移除过期的空闲连接（空闲超时或超过最大寿命的都清理，
+		// 寿命到期前主动轮换，避免阿里 DoT 到点统一断开导致查询失败）
 		alive := connList[:0]
 		for _, conn := range connList {
-			if !conn.inUse && time.Since(conn.lastUsed) >= p.timeout {
+			if !conn.inUse && (time.Since(conn.lastUsed) >= p.timeout ||
+				time.Since(conn.created) >= dotConnLifetime) {
 				log.Printf("[DoT连接池] 连接已过期，关闭: %s", server)
 				conn.Close()
 				p.metrics.TotalConnsClosed++
@@ -90,13 +129,33 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 		p.conns[server] = alive
 	}
 
-	// 创建新连接
+	// 创建TCP连接（优先用 bootstrap resolver 解析主机名，避免依赖系统 DNS；
+	// bootstrap 解析失败时回退到系统 resolver，保证 tls:// 上游不被单点拖死）
 	// 归一化为 host:port：tls://dns.google → dns.google:853（缺端口时 dial 会报 missing port）
 	serverAddr := config.UpstreamDialAddr(server)
-
-	// 创建TCP连接
 	log.Printf("[DoT连接池] 开始连接TCP: %s", serverAddr)
-	tcpConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second) // 增加TCP连接超时
+	var tcpConn net.Conn
+	var err error
+	// 优先 IPv4：实测部分 DoT 上游（如阿里）IPv6 链路空闲断开更频繁（broken pipe），
+	// IPv4 更稳定；IPv4 失败时回退 IPv6，避免 IPv6-only 上游连不上。
+	// 网络族顺序：tcp4 → tcp6 → tcp（系统默认）
+	dialNetworks := []string{"tcp4", "tcp6"}
+	for _, network := range dialNetworks {
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		if p.resolver != nil {
+			dialer.Resolver = p.resolver
+		}
+		tcpConn, err = dialer.DialContext(ctx, network, serverAddr)
+		if err == nil {
+			break
+		}
+		log.Printf("[DoT连接池] TCP连接失败(%s): %s, 错误: %v", network, serverAddr, err)
+	}
+	// 前两轮都失败且系统解析可用时，最后再按系统默认网络试一次
+	if err != nil && p.resolver != nil {
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		tcpConn, err = dialer.DialContext(ctx, "tcp", serverAddr)
+	}
 	if err != nil {
 		log.Printf("[DoT连接池] TCP连接失败: %s, 错误: %v", serverAddr, err)
 		return nil, fmt.Errorf("failed to dial TCP: %w", err)
@@ -167,6 +226,7 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 		conn:     tcpConn,
 		tlsConn:  tlsConn,
 		lastUsed: time.Now(),
+		created:  time.Now(),
 		inUse:    true,
 		server:   server,
 	}
@@ -233,6 +293,37 @@ func (p *DoTConnPool) PutConn(conn *DoTConn) {
 	}
 }
 
+// DiscardConn 丢弃DoT连接：查询失败（写入/读取出错）时调用。
+// 若继续 PutConn 归还，死连接会被后续查询复用导致同样的失败，形成错误风暴；
+// 这里把连接从池中剔除并关闭，下一次 GetConn 会新建连接。
+func (p *DoTConnPool) DiscardConn(conn *DoTConn) {
+	if conn == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	conn.inUse = false
+	if p.metrics.ActiveConns > 0 {
+		p.metrics.ActiveConns--
+	}
+	connList := p.conns[conn.server]
+	for i, c := range connList {
+		if c == conn {
+			conn.Close()
+			p.metrics.TotalConnsClosed++
+			connList = append(connList[:i], connList[i+1:]...)
+			break
+		}
+	}
+	if len(connList) == 0 {
+		delete(p.conns, conn.server)
+	} else {
+		p.conns[conn.server] = connList
+	}
+}
+
 // Close 关闭连接池中的所有连接
 func (p *DoTConnPool) Close() {
 	p.mu.Lock()
@@ -258,7 +349,7 @@ func (c *DoTConn) Close() {
 
 // healthCheckRoutine 健康检查协程
 func (p *DoTConnPool) healthCheckRoutine() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -280,17 +371,17 @@ func (p *DoTConnPool) healthCheckRoutine() {
 						connList = append(connList[:i], connList[i+1:]...)
 					} else {
 						// 尝试发送一个简单的DNS查询来检查连接是否健康
-						_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-						defer cancel()
-
-						// 创建一个简单的DNS查询
+						// 注意：写入后必须读取并丢弃响应，否则残留数据会污染
+						// 下一次真实查询的 ReadMsg；且能确认对端仍存活。
+						// 用常见公网域名而非 healthcheck.local.：部分 DoT 上游
+						// 对未知 TLD 直接断开连接，导致健康检查误杀正常连接。
 						req := new(dns.Msg)
-						req.SetQuestion("healthcheck.local.", dns.TypeA)
+						req.SetQuestion("www.baidu.com.", dns.TypeA)
 						req.RecursionDesired = true
 
 						// 使用连接发送查询
 						dnsConn := &dns.Conn{Conn: conn.tlsConn}
-						err := dnsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+						err := dnsConn.SetDeadline(time.Now().Add(2 * time.Second))
 						if err != nil {
 							log.Printf("[DoT连接池] 健康检查：设置超时失败: %v", err)
 							conn.Close()
@@ -314,7 +405,19 @@ func (p *DoTConnPool) healthCheckRoutine() {
 							continue
 						}
 
-						// 不等待响应，只是检查写入是否成功
+						// 读取并丢弃响应，避免脏数据留在读缓冲
+						if _, err := dnsConn.ReadMsg(); err != nil {
+							log.Printf("[DoT连接池] 健康检查：读取响应失败: %v, 关闭连接: %s", err, server)
+							conn.Close()
+							p.metrics.TotalConnsClosed++
+							if p.metrics.ActiveConns > 0 {
+								p.metrics.ActiveConns--
+							}
+							connList = append(connList[:i], connList[i+1:]...)
+							continue
+						}
+						// 恢复读/写超时
+						conn.tlsConn.SetDeadline(time.Time{})
 					}
 				}
 			}

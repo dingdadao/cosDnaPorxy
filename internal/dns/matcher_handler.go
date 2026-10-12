@@ -159,32 +159,68 @@ func (mh *MatcherHandler) MatchDomain(domain string) SplitDecision {
 				continue
 			}
 			if _, hit := m.MatchDomain(domain); !hit {
-				return SplitDecision{
-					Matched:          true,
-					DNS:              l.DNS,
-					DNSMode:          normDNSMode(l.DNSMode),
-					ListName:         l.Name,
-					EnableCloudCheck: l.EnableCloudCheck,
-					ECS:              l.ECS,
-					IPPrefer:         l.IPPrefer,
-				}
+				return splitDecisionFrom(l, l.DNS)
 			}
 			continue
 		}
 
 		if dns, hit := m.MatchDomain(domain); hit {
-			return SplitDecision{
-				Matched:          true,
-				DNS:              dns,
-				DNSMode:          normDNSMode(l.DNSMode),
-				ListName:         l.Name,
-				EnableCloudCheck: l.EnableCloudCheck,
-				ECS:              l.ECS,
-				IPPrefer:         l.IPPrefer,
-			}
+			return splitDecisionFrom(l, dns)
 		}
 	}
 	return SplitDecision{}
+}
+
+// MatchDomainWithin 仅在 refs 指定的分流列表内匹配（客户端分组引用的子集）。
+// 按 refs 的顺序生效（即用户在分组里拖出来的引用顺序），未命中返回 Matched=false。
+func (mh *MatcherHandler) MatchDomainWithin(domain string, refs []string) SplitDecision {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	if len(refs) == 0 {
+		return SplitDecision{}
+	}
+	idx := make(map[string]int, len(mh.config.SplitLists))
+	for i, l := range mh.config.SplitLists {
+		idx[l.Name] = i
+	}
+	for _, ref := range refs {
+		i, ok := idx[ref]
+		if !ok || i >= len(mh.config.SplitLists) || i >= len(mh.matchers) {
+			continue // 悬空引用（校验已拦，这里再兜一层）
+		}
+		l := mh.config.SplitLists[i]
+		m := mh.matchers[i]
+		if !l.Enabled || m == nil {
+			continue
+		}
+		if l.Invert {
+			if m.RuleCount() == 0 || len(l.DNS) == 0 {
+				continue
+			}
+			if _, hit := m.MatchDomain(domain); !hit {
+				return splitDecisionFrom(l, l.DNS)
+			}
+			continue
+		}
+		if dns, hit := m.MatchDomain(domain); hit {
+			return splitDecisionFrom(l, dns)
+		}
+	}
+	return SplitDecision{}
+}
+
+// splitDecisionFrom 由分流列表配置与命中的 DNS 组装决策
+func splitDecisionFrom(l config.SplitList, dns []string) SplitDecision {
+	return SplitDecision{
+		Matched:          true,
+		DNS:              dns,
+		DNSMode:          normDNSMode(l.DNSMode),
+		ListName:         l.Name,
+		EnableCloudCheck: l.EnableCloudCheck,
+		ECS:              l.ECS,
+		IPPrefer:         l.IPPrefer,
+	}
 }
 
 // normDNSMode 空值按默认的并发竞速（race）处理，与解析路径的判定保持一致

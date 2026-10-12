@@ -132,20 +132,92 @@ type QueryLogConfig struct {
 	MaxRows   int           // 最大保留条数，超出后删除最旧记录
 }
 
-// ClientGroup 客户端分组：按来源 IP 决定上游、ECS、云检测与 A/AAAA 偏好
-type ClientGroup struct {
-	Name             string    // 分组名称
-	Enabled          bool      // 是否启用
-	Priority         int       // 优先级，大者优先
-	Match            []string  // IP / CIDR / 国家或运营商 code
-	Invert           bool      // 取反匹配
-	DNS              []string  // 命中后使用的上游列表
-	DNSMode          string    // race / failover
-	ECS              ECSPolicy // 复用现有 ECS 结构
-	EnableCloudCheck bool
-	IPPrefer         string
-	AllowDomainSplit bool // 是否继续进入域名分流阶段
+// ISPKey 运营商固定分组标识（内置枚举，不可自定义；仅 4 个）
+// 标识即缓存 scope，固定不变，避免"改个名字缓存全失效"
+type ISPKey string
+
+const (
+	ISPGroupTelecom ISPKey = "telecom" // 中国电信
+	ISPGroupUnicom  ISPKey = "unicom"  // 中国联通
+	ISPGroupCMCC    ISPKey = "cmcc"    // 中国移动（含铁通）
+	ISPGroupOther   ISPKey = "other"   // 其他（未识别 / 境外 / 教育网 / 广电 / 长宽）
+)
+
+// KnownISPGroups 返回全部运营商固定分组，顺序即 UI 展示顺序
+func KnownISPGroups() []ISPKey {
+	return []ISPKey{ISPGroupTelecom, ISPGroupUnicom, ISPGroupCMCC, ISPGroupOther}
 }
+
+// ISPGroupLabel 返回内置展示名（完全内置，不可自定义）
+func ISPGroupLabel(k ISPKey) string {
+	switch k {
+	case ISPGroupTelecom:
+		return "中国电信"
+	case ISPGroupUnicom:
+		return "中国联通"
+	case ISPGroupCMCC:
+		return "中国移动"
+	case ISPGroupOther:
+		return "其他"
+	}
+	return string(k)
+}
+
+// ParseISPKey 解析运营商分组标识（兼容常见别名），未知返回 ok=false
+func ParseISPKey(s string) (ISPKey, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "telecom", "chinatelecom", "电信":
+		return ISPGroupTelecom, true
+	case "unicom", "cnc", "cuc", "联通":
+		return ISPGroupUnicom, true
+	case "cmcc", "mobile", "moving", "移动":
+		return ISPGroupCMCC, true
+	case "other", "其他":
+		return ISPGroupOther, true
+	}
+	return "", false
+}
+
+// ValidISPKey 判断是否为内置运营商分组
+func ValidISPKey(k ISPKey) bool {
+	for _, x := range KnownISPGroups() {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
+// ISPGroup 运营商固定分组：来源运营商自动决定分组。
+// 命中分组后先按 SplitRefs 引用的域名分流列表匹配（命中哪条复用哪条的策略）；
+// 全部未命中时用 FallbackDNS 兜底（覆盖全局上游），兜底查询按 DNSMode/IPPrefer/ECS 处理。
+type ISPGroup struct {
+	ISP         ISPKey    // 固定标识（唯一键，决定缓存 scope）
+	Enabled     bool      // 未启用 = 不干预，走全局默认
+	SplitRefs   []string  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序（命中复用该列表 DNS/模式/ECS/偏好/云检测）
+	FallbackDNS []string  // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
+	DNSMode     string    // race / failover，仅作用于 FallbackDNS
+	IPPrefer    string    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
+	ECS         ECSPolicy // 兜底查询的 EDNS Client Subnet 策略
+}
+
+// CustomGroup 自定义分组：按 IP/CIDR 匹配，覆盖"非运营商"需求（机房出口、专线等）。
+// 路由语义与运营商分组一致：先按 SplitRefs 匹配域名分流，未命中走 FallbackDNS 兜底。
+// 越级（Priority 大的优先）排于 ISP 组之前。
+type CustomGroup struct {
+	Name        string // 展示名
+	Enabled     bool
+	Priority    int       // 大者优先（仅自定义组之间排序；整体优先于运营商组）
+	Match       []string  // 裸 IP / CIDR（v4/v6）
+	SplitRefs   []string  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
+	FallbackDNS []string  // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
+	DNSMode     string    // race / failover，仅作用于 FallbackDNS
+	IPPrefer    string    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
+	ECS         ECSPolicy // 兜底查询的 EDNS Client Subnet 策略
+}
+
+// CustomScope 自定义分组的缓存 scope（前缀 c: 与内置 ISP key 区分，避免重名串味）
+func CustomScope(name string) string { return "c:" + name }
 
 // Config 配置结构体（内存表示，时长为 time.Duration）
 type Config struct {
@@ -202,7 +274,8 @@ type Config struct {
 	ClientIPSources []string
 	ClientIPHeaders []string
 	ClientIPStatic  map[string]string // 连接 IP -> 客户端 IP 静态映射
-	ClientGroups    []ClientGroup
+	ISPGroups       []ISPGroup        // 运营商固定分组（内置 4 个，不可增删）
+	CustomGroups    []CustomGroup     // 自定义分组（按 IP/CIDR 匹配，可增删）
 	AllowACLs       []string
 
 	// 客户端来源识别（运营商 IP 段库）
@@ -290,12 +363,13 @@ func DefaultConfig() *Config {
 		TrustedProxies:    []string{"127.0.0.1/32", "::1/128"},
 		ClientIPSources:   []string{"static", "header", "socket"},
 		ClientIPHeaders:   []string{"cf-connecting-ip", "x-forwarded-for", "x-real-ip"},
-		ClientGroups:      []ClientGroup{},
+		ISPGroups:         []ISPGroup{},
+		CustomGroups:      []CustomGroup{},
 		AllowACLs:         []string{},
-		SourceEnabled:     false,
-		SourceDBDir:       "",
+		SourceEnabled:     true,
+		SourceDBDir:       "./data/ispdb",
 		SourceBaseURL:     "https://ispip.clang.cn",
-		SourceUpdateHours: 0,
+		SourceUpdateHours: 24,
 	}
 }
 
@@ -323,10 +397,18 @@ func ValidateConfig(cfg *Config) error {
 			return err
 		}
 	}
-	for i := range cfg.ClientGroups {
-		if err := normalizeUpstreamList(fmt.Sprintf("client_groups[%d].dns", i), cfg.ClientGroups[i].DNS); err != nil {
+	for i := range cfg.ISPGroups {
+		if err := normalizeUpstreamList(fmt.Sprintf("isp_groups[%d].fallback_dns", i), cfg.ISPGroups[i].FallbackDNS); err != nil {
 			return err
 		}
+		cfg.ISPGroups[i].SplitRefs = normalizeRefs(cfg.ISPGroups[i].SplitRefs)
+	}
+	for i := range cfg.CustomGroups {
+		if err := normalizeUpstreamList(fmt.Sprintf("custom_groups[%d].fallback_dns", i), cfg.CustomGroups[i].FallbackDNS); err != nil {
+			return err
+		}
+		cfg.CustomGroups[i].SplitRefs = normalizeRefs(cfg.CustomGroups[i].SplitRefs)
+		cfg.CustomGroups[i].Match = normalizeRefs(cfg.CustomGroups[i].Match)
 	}
 
 	if cfg.WebAddr == "" {
@@ -412,33 +494,106 @@ func ValidateConfig(cfg *Config) error {
 		}
 	}
 
-	// 校验客户端分组
-	for i, g := range cfg.ClientGroups {
-		if g.Name == "" {
-			return fmt.Errorf("client_groups[%d]: name 不能为空", i)
+	// 分流列表名称集合：分组 SplitRefs 引用的列表必须真实存在，否则运行时静默兜底，很难排查
+	splitNames := make(map[string]bool, len(cfg.SplitLists))
+	for _, l := range cfg.SplitLists {
+		if n := strings.TrimSpace(l.Name); n != "" {
+			splitNames[n] = true
 		}
+	}
+	validateGroupRouting := func(prefix, label string, refs []string, ipPrefer string, ecs ECSPolicy) error {
+		for _, ref := range refs {
+			if !splitNames[ref] {
+				return fmt.Errorf("%s（%s）: 引用的分流列表 %q 不存在（请在「上游与域名分流」中先定义）", prefix, label, ref)
+			}
+		}
+		if !ValidIPPrefer(ipPrefer) {
+			return fmt.Errorf("%s.ip_prefer: 非法取值 %q", prefix, ipPrefer)
+		}
+		if ecs.Enabled && !ValidECSType(ecs.ISPType) {
+			return fmt.Errorf("%s.ecs.isp_type: 非法取值 %q", prefix, ecs.ISPType)
+		}
+		if ecs.Enabled && strings.TrimSpace(ecs.Subnet) == "" {
+			return fmt.Errorf("%s.ecs.subnet: 启用 ECS 注入时必须填写公网 IP 或 CIDR", prefix)
+		}
+		return nil
+	}
+
+	// 校验运营商固定分组
+	seenISP := map[ISPKey]bool{}
+	for i := range cfg.ISPGroups {
+		g := &cfg.ISPGroups[i]
+		if !ValidISPKey(g.ISP) {
+			return fmt.Errorf("isp_groups[%d].isp: 非法分组标识 %q（可选 telecom/unicom/cmcc/other）", i, g.ISP)
+		}
+		if seenISP[g.ISP] {
+			return fmt.Errorf("isp_groups: 分组 %q 重复", g.ISP)
+		}
+		seenISP[g.ISP] = true
 		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover {
-			return fmt.Errorf("client_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
+			return fmt.Errorf("isp_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
 		}
-		if g.IPPrefer != "" && !ValidIPPrefer(g.IPPrefer) {
-			return fmt.Errorf("client_groups[%d].ip_prefer: 非法取值 %q", i, g.IPPrefer)
+		if err := validateGroupRouting(fmt.Sprintf("isp_groups[%d]", i), ISPGroupLabel(g.ISP), g.SplitRefs, g.IPPrefer, g.ECS); err != nil {
+			return err
 		}
-		// 匹配项：支持 裸 IP、CIDR、isp:<name>；非法项会被匹配器静默跳过，故此处直接拒绝
+		if !g.Enabled {
+			continue
+		}
+		if len(g.SplitRefs) == 0 && len(g.FallbackDNS) == 0 {
+			return fmt.Errorf("isp_groups[%d]（%s）: 启用时必须至少引用一条分流规则或配置一条兜底 DNS", i, ISPGroupLabel(g.ISP))
+		}
+	}
+
+	// 校验自定义分组
+	seenName := map[string]bool{}
+	for i := range cfg.CustomGroups {
+		g := &cfg.CustomGroups[i]
+		g.Name = strings.TrimSpace(g.Name)
+		if g.Name == "" {
+			return fmt.Errorf("custom_groups[%d]: name 不能为空", i)
+		}
+		if seenName[g.Name] {
+			return fmt.Errorf("custom_groups: 名称 %q 重复", g.Name)
+		}
+		seenName[g.Name] = true
+		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover {
+			return fmt.Errorf("custom_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
+		}
 		for _, m := range g.Match {
 			m = strings.TrimSpace(m)
 			if m == "" {
 				continue
 			}
-			if strings.HasPrefix(m, "isp:") {
-				continue // 运营商匹配：非空即可，非法名在匹配期忽略
-			}
 			if !ValidIPOrCIDR(m) {
-				return fmt.Errorf("client_groups[%d].match: 非法 IP/CIDR %q", i, m)
+				return fmt.Errorf("custom_groups[%d].match: 非法 IP/CIDR %q", i, m)
 			}
+		}
+		if err := validateGroupRouting(fmt.Sprintf("custom_groups[%d]", i), g.Name, g.SplitRefs, g.IPPrefer, g.ECS); err != nil {
+			return err
+		}
+		if !g.Enabled {
+			continue
+		}
+		if len(normalizeRefs(g.Match)) == 0 {
+			return fmt.Errorf("custom_groups[%d]（%s）: 启用时必须至少一条匹配条件", i, g.Name)
+		}
+		if len(g.SplitRefs) == 0 && len(g.FallbackDNS) == 0 {
+			return fmt.Errorf("custom_groups[%d]（%s）: 启用时必须至少引用一条分流规则或配置一条兜底 DNS", i, g.Name)
 		}
 	}
 
 	return nil
+}
+
+// normalizeRefs 去掉空白项并保留顺序（就地归一化用）
+func normalizeRefs(refs []string) []string {
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // ValidIPOrCIDR 判断字符串是否为合法的裸 IP（v4/v6）或 CIDR 网段

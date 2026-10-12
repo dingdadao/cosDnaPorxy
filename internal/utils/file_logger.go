@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -98,4 +99,39 @@ func (fl *FileLogger) GetLogFilePath() string {
 		return filepath.Join(fl.logDir, fmt.Sprintf("dns-proxy-%s.log", fl.currentDay))
 	}
 	return ""
+}
+
+// CleanupOldLogs 删除超过保留天数的历史日志文件（dns-proxy-YYYY-MM-DD.log）。
+// 保留天数按自然日计算：文件名里的日期早于 (今天-保留天数) 的文件都会被删除，
+// 当天文件无论大小都保留（由上层控制写盘量）。
+func (fl *FileLogger) CleanupOldLogs(retentionDays int) error {
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+	cutoff := time.Now().AddDate(0, 0, -retentionDays).Format("2006-01-02")
+	pattern := filepath.Join(fl.logDir, "dns-proxy-*.log")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	removed := 0
+	for _, path := range matches {
+		base := filepath.Base(path) // dns-proxy-2026-10-01.log
+		if len(base) < len("dns-proxy-")+len("2006-01-02") {
+			continue
+		}
+		day := base[len("dns-proxy-") : len("dns-proxy-")+10]
+		if _, err := time.Parse("2006-01-02", day); err != nil {
+			continue // 非标准日期命名，跳过
+		}
+		if day < cutoff {
+			if err := os.Remove(path); err == nil {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		log.Printf("[FileLogger] 清理过期日志: 保留 %d 天，删除 %d 个文件", retentionDays, removed)
+	}
+	return nil
 }
