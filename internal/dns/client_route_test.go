@@ -98,3 +98,50 @@ func TestResolveRouteMatchedGroupEmptyFallbackFallsBack(t *testing.T) {
 		t.Fatalf("兜底 DNS 为空时应回退全局上游，得到 %v", up)
 	}
 }
+
+// 命中引用分流，且列表走加密协议(DoH/DoT/DoH3)时，用分组 ECS 覆写列表自带 ECS；
+// 列表为纯明文 udp/tcp 上游时保留列表自身 ECS。
+func TestResolveRouteMatchedGroupOverrideECSOnModernProtocol(t *testing.T) {
+	cfg := routeCfg(t)
+	groupECS := config.ECSPolicy{Enabled: true, ISPType: "telecom", Subnet: "59.51.78.211"}
+	listECS := config.ECSPolicy{Enabled: true, ISPType: "unicom", Subnet: "31.59.174.0/23"}
+	cd := ClientDecision{
+		Matched:     true,
+		Scope:       "c:电信",
+		Label:       "电信",
+		SplitRefs:   []string{"国内", "国外"},
+		FallbackDNS: []string{"udp://10.0.0.1:53"},
+		ECS:         groupECS,
+	}
+
+	// 加一条明文 udp 分流列表并命中 → 保留列表自带 ECS，不被分组覆盖
+	cfg.SplitLists = append(cfg.SplitLists, config.SplitList{
+		Name: "明文", Enabled: true, DomainFile: writeRuleFile(t, "DOMAIN-SUFFIX,plain.example.com"),
+		DNS: []string{"udp://223.5.5.5:53"}, ECS: listECS, Refresh: time.Hour,
+	})
+	cd.SplitRefs = append(cd.SplitRefs, "明文")
+	hp := newRouteFixture(t, cfg)
+	d, _ := hp.resolveRoute("www.plain.example.com", cd)
+	if !d.Matched || d.ECS.ISPType != "unicom" {
+		t.Fatalf("明文上游应保留列表 ECS (unicom)，得到 %+v", d.ECS)
+	}
+
+	// 再加一条走 DoH 的加密分流列表并命中 → 用分组 ECS 覆写
+	cfg.SplitLists = append(cfg.SplitLists, config.SplitList{
+		Name: "加密", Enabled: true, DomainFile: writeRuleFile(t, "DOMAIN-SUFFIX,tls.example.com"),
+		DNS: []string{"https://8.8.8.8/dns-query"}, ECS: listECS, Refresh: time.Hour,
+	})
+	cd.SplitRefs = append(cd.SplitRefs, "加密")
+	h2 := newRouteFixture(t, cfg)
+	d2, _ := h2.resolveRoute("www.tls.example.com", cd)
+	if !d2.Matched || d2.ECS.ISPType != "telecom" || d2.ECS.Subnet != "59.51.78.211" {
+		t.Fatalf("加密上游应覆写为分组 ECS (telecom)，得到 %+v", d2.ECS)
+	}
+
+	// 分组未开 ECS → 加密上游也应保留列表自带 ECS
+	cd.ECS = config.ECSPolicy{Enabled: false}
+	d3, _ := h2.resolveRoute("www.tls.example.com", cd)
+	if !d3.Matched || d3.ECS.ISPType != "unicom" {
+		t.Fatalf("分组未开 ECS 时应保留列表 ECS (unicom)，得到 %+v", d3.ECS)
+	}
+}

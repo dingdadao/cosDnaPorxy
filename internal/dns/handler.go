@@ -33,6 +33,24 @@ func hasModernProtocols(upstreams []string) bool {
 	return false
 }
 
+// isEncryptedProtocol 判断是否为加密传输的 DNS 上游（DoH/DoT/DoH3）。
+// 与 hasModernProtocols 不同：只认加密协议，纯明文 udp/tcp 一律返回 false。
+func isEncryptedProtocol(upstream string) bool {
+	return strings.HasPrefix(upstream, "https://") ||
+		strings.HasPrefix(upstream, "tls://") ||
+		strings.HasPrefix(upstream, "h3://")
+}
+
+// hasEncryptedUpstream 判断上游列表中是否含加密协议（DoH/DoT/DoH3）
+func hasEncryptedUpstream(upstreams []string) bool {
+	for _, up := range upstreams {
+		if isEncryptedProtocol(up) {
+			return true
+		}
+	}
+	return false
+}
+
 // getProtocolTypes 获取协议类型列表
 func getProtocolTypes(upstreams []string) []string {
 	protocolSet := make(map[string]bool)
@@ -1097,6 +1115,11 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 	// a. 按分组引用顺序匹配域名分流：命中即复用该分流列表的 DNS/模式/ECS/偏好/云检测
 	if len(cd.SplitRefs) > 0 {
 		if d := h.matcherHandler.MatchDomainWithin(domain, cd.SplitRefs); d.Matched {
+			// 命中引用分流：列表走加密协议(DoH/DoT/DoH3)时，用分组的 ECS 覆写列表自带 ECS，
+			// 保证按分组的线路解析；纯明文 udp/tcp 上游则保留列表自身的 ECS 策略。
+			if hasEncryptedUpstream(d.DNS) && cd.ECS.Enabled {
+				d.ECS = cd.ECS
+			}
 			h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
 				"rule":   "CLIENT_GROUP_SUBDIVERT",
 				"group":  cd.Label,
