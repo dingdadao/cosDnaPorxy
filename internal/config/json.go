@@ -120,15 +120,26 @@ type SplitListJSON struct {
 	IPPrefer         string        `json:"ip_prefer"`
 }
 
+// CloudReplacePolicyJSON 分组云替换线路策略的 JSON 表示
+// override 为 false 时本组完全跟随全局（cf_domain/aws_domain/cf_api 忽略）
+type CloudReplacePolicyJSON struct {
+	Override  bool   `json:"override"`
+	CFDomain  string `json:"cf_domain"`
+	AWSDomain string `json:"aws_domain"`
+	CFAPI     string `json:"cf_api"`
+	APICount  int    `json:"api_count"`
+}
+
 // ISPGroupJSON 运营商固定分组的 JSON 表示
 type ISPGroupJSON struct {
-	ISP         string        `json:"isp"`
-	Enabled     bool          `json:"enabled"`
-	SplitRefs   stringOrList  `json:"split_refs"`
-	FallbackDNS stringOrList  `json:"fallback_dns"`
-	DNSMode     string        `json:"dns_mode"`
-	IPPrefer    string        `json:"ip_prefer"`
-	ECS         ECSPolicyJSON `json:"ecs"`
+	ISP          string                 `json:"isp"`
+	Enabled      bool                   `json:"enabled"`
+	SplitRefs    stringOrList           `json:"split_refs"`
+	FallbackDNS  stringOrList           `json:"fallback_dns"`
+	DNSMode      string                 `json:"dns_mode"`
+	IPPrefer     string                 `json:"ip_prefer"`
+	ECS          ECSPolicyJSON          `json:"ecs"`
+	CloudReplace CloudReplacePolicyJSON `json:"cloud_replace"`
 
 	// 以下为旧版字段，仅用于导入迁移（旧 dns → fallback_dns；旧 split_refs 直接沿用）。
 	// 写回时不再输出。
@@ -137,17 +148,40 @@ type ISPGroupJSON struct {
 
 // CustomGroupJSON 自定义分组的 JSON 表示
 type CustomGroupJSON struct {
-	Name        string        `json:"name"`
-	Enabled     bool          `json:"enabled"`
-	Priority    int           `json:"priority"`
-	Match       stringOrList  `json:"match"`
-	SplitRefs   stringOrList  `json:"split_refs"`
-	FallbackDNS stringOrList  `json:"fallback_dns"`
-	DNSMode     string        `json:"dns_mode"`
-	IPPrefer    string        `json:"ip_prefer"`
-	ECS         ECSPolicyJSON `json:"ecs"`
+	Name         string                 `json:"name"`
+	Enabled      bool                   `json:"enabled"`
+	Priority     int                    `json:"priority"`
+	Match        stringOrList           `json:"match"`
+	SplitRefs    stringOrList           `json:"split_refs"`
+	FallbackDNS  stringOrList           `json:"fallback_dns"`
+	DNSMode      string                 `json:"dns_mode"`
+	IPPrefer     string                 `json:"ip_prefer"`
+	ECS          ECSPolicyJSON          `json:"ecs"`
+	CloudReplace CloudReplacePolicyJSON `json:"cloud_replace"`
 
 	LegacyDNS stringOrList `json:"dns,omitempty"`
+}
+
+// cloudReplacePolicyToJSON 内存策略转 JSON 表示
+func cloudReplacePolicyToJSON(p CloudReplacePolicy) CloudReplacePolicyJSON {
+	return CloudReplacePolicyJSON{
+		Override:  p.Override,
+		CFDomain:  p.CFDomain,
+		AWSDomain: p.AWSDomain,
+		CFAPI:     p.CFAPI,
+		APICount:  p.APICount,
+	}
+}
+
+// cloudReplacePolicyFromJSON JSON 表示转内存策略（归一化交由 ValidateConfig 统一处理）
+func cloudReplacePolicyFromJSON(p CloudReplacePolicyJSON) CloudReplacePolicy {
+	return CloudReplacePolicy{
+		Override:  p.Override,
+		CFDomain:  p.CFDomain,
+		AWSDomain: p.AWSDomain,
+		CFAPI:     p.CFAPI,
+		APICount:  p.APICount,
+	}
 }
 
 // legacyClientGroupJSON 旧版客户端分组的 JSON 表示，仅用于导入迁移，写入时不再输出
@@ -223,6 +257,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
+			CloudReplace: cloudReplacePolicyToJSON(g.CloudReplace),
 		})
 	}
 
@@ -242,6 +277,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
+			CloudReplace: cloudReplacePolicyToJSON(g.CloudReplace),
 		})
 	}
 
@@ -453,6 +489,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
+			CloudReplace: cloudReplacePolicyFromJSON(g.CloudReplace),
 		})
 	}
 
@@ -476,6 +513,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
 			},
+			CloudReplace: cloudReplacePolicyFromJSON(g.CloudReplace),
 		})
 	}
 

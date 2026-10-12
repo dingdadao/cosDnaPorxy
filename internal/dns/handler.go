@@ -33,24 +33,6 @@ func hasModernProtocols(upstreams []string) bool {
 	return false
 }
 
-// isEncryptedProtocol 判断是否为加密传输的 DNS 上游（DoH/DoT/DoH3）。
-// 与 hasModernProtocols 不同：只认加密协议，纯明文 udp/tcp 一律返回 false。
-func isEncryptedProtocol(upstream string) bool {
-	return strings.HasPrefix(upstream, "https://") ||
-		strings.HasPrefix(upstream, "tls://") ||
-		strings.HasPrefix(upstream, "h3://")
-}
-
-// hasEncryptedUpstream 判断上游列表中是否含加密协议（DoH/DoT/DoH3）
-func hasEncryptedUpstream(upstreams []string) bool {
-	for _, up := range upstreams {
-		if isEncryptedProtocol(up) {
-			return true
-		}
-	}
-	return false
-}
-
 // getProtocolTypes 获取协议类型列表
 func getProtocolTypes(upstreams []string) []string {
 	protocolSet := make(map[string]bool)
@@ -131,6 +113,7 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 
 	// 设置替换域名配置
 	cloudDetector.SetReplaceDomains(cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
+	cloudDetector.SetReplaceDomainsAll(allReplaceDomains(cfg))
 
 	// 创建连接池
 	dotConnPool := NewDoTConnPool()
@@ -207,7 +190,8 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 	// 初始化刷新处理器（云域名刷新时通过该回调重建替换响应，保证与查询路径一致）
 	refreshHandler := NewRefreshHandler(cfg, logger, cacheManager, cloudDetector, queryOptimizer, matcherHandler, handler.proxyQuery,
 		func(originalResp *dns.Msg, domain string, qtype uint16, cloudType int) *dns.Msg {
-			v4, v6, err := cloudHandler.ResolveReplaceIPs(0, domain, qtype, cloudType)
+			// 异步刷新无法得知客户端线路，统一按全局替换目标重建
+			v4, v6, err := cloudHandler.ResolveReplaceIPs(0, domain, qtype, cloudType, handler.effectiveReplaceConfig(ClientDecision{}))
 			if err != nil {
 				return nil
 			}
@@ -308,6 +292,7 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 	h.cloudProcessor.UpdateConfig(cfg)
 	h.cnameProcessor.UpdateConfig(cfg)
 	h.cloudDetector.SetReplaceDomains(cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
+	h.cloudDetector.SetReplaceDomainsAll(allReplaceDomains(cfg))
 	h.matcherHandler.UpdateConfig(cfg)
 	h.clientGroupMatcher.UpdateGroups(cfg.ISPGroups, cfg.CustomGroups)
 	sourceChanged := h.syncSourceDB(cfg) // 运营商识别开关/段库目录可热切换
@@ -368,6 +353,23 @@ func (h *RefactoredHandler) ApplyConfig(cfg *config.Config) bool {
 		old.WebTLSAddr != cfg.WebTLSAddr
 }
 
+// allReplaceDomains 汇总全部替换域名（全局 + 各分组覆写），供云检测跳过替换域名自检
+func allReplaceDomains(cfg *config.Config) []string {
+	out := make([]string, 0, 2+len(cfg.ISPGroups)+len(cfg.CustomGroups))
+	out = append(out, cfg.ReplaceCFDomain, cfg.ReplaceAWSDomain)
+	for _, g := range cfg.ISPGroups {
+		if g.CloudReplace.Override {
+			out = append(out, g.CloudReplace.CFDomain, g.CloudReplace.AWSDomain)
+		}
+	}
+	for _, g := range cfg.CustomGroups {
+		if g.CloudReplace.Override {
+			out = append(out, g.CloudReplace.CFDomain, g.CloudReplace.AWSDomain)
+		}
+	}
+	return out
+}
+
 // clientGroupsRoutingChanged 判断客户端分组路由是否变化（影响缓存命中率与正确性）。
 // 判定原则：任何会改变"某个 scope 该用哪条上游"的字段变化都必须返回 true，否则旧缓存会串味。
 // 注意 custom_groups 的顺序参与匹配（Priority 相同时按原顺序），因此按索引比对即可发现顺序变化。
@@ -381,7 +383,8 @@ func clientGroupsRoutingChanged(old, cur *config.Config) bool {
 			a.IPPrefer != b.IPPrefer ||
 			!slices.Equal(a.SplitRefs, b.SplitRefs) ||
 			!slices.Equal(a.FallbackDNS, b.FallbackDNS) ||
-			a.ECS != b.ECS {
+			a.ECS != b.ECS ||
+			a.CloudReplace != b.CloudReplace {
 			return true
 		}
 	}
@@ -392,7 +395,8 @@ func clientGroupsRoutingChanged(old, cur *config.Config) bool {
 			!slices.Equal(a.Match, b.Match) ||
 			!slices.Equal(a.SplitRefs, b.SplitRefs) ||
 			!slices.Equal(a.FallbackDNS, b.FallbackDNS) ||
-			a.ECS != b.ECS {
+			a.ECS != b.ECS ||
+			a.CloudReplace != b.CloudReplace {
 			return true
 		}
 	}
@@ -889,15 +893,22 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	}
 
 	if isCloud && detection != nil {
+		rc := h.effectiveReplaceConfig(clientDecision)
+		effectiveDomain := rc.CFDomain
+		if CloudType(detection.Type) == CloudTypeAWS {
+			effectiveDomain = rc.AWSDomain
+		}
 		h.Logger.Debug("☁️ [云域名检测到，开始替换处理] ", map[string]interface{}{
 			"domain":         domain,
 			"cloud_type":     detection.Type,
-			"replace_domain": detection.ReplaceDomain,
+			"replace_domain": effectiveDomain,
+			"scope":          scope,
+			"group_override": clientDecision.CloudReplace.Override,
 		})
 
 		// 云替换内部会自行写响应（与查询路径一致的缓存与出口处理）
 		finalResp, _ := h.cloudHandler.HandleCloudReplacement(w, req, domain, qtype, int(detection.Type), resp,
-			effectiveIPPrefer(h.getConfig().IPPrefer, decision))
+			effectiveIPPrefer(h.getConfig().IPPrefer, decision), scope, rc)
 		totalTime := totalTimer.End()
 		h.Logger.Debug("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
 			"domain":        domain,
@@ -1100,6 +1111,25 @@ func (h *RefactoredHandler) upstreamsFor(domain string, d SplitDecision) []strin
 	return h.getConfig().Upstream
 }
 
+// effectiveReplaceConfig 计算本次生效的云替换目标：命中分组且开启覆写时用分组自带值，否则用全局
+func (h *RefactoredHandler) effectiveReplaceConfig(cd ClientDecision) ReplaceConfig {
+	if cd.CloudReplace.Override {
+		return ReplaceConfig{
+			CFDomain:  cd.CloudReplace.CFDomain,
+			AWSDomain: cd.CloudReplace.AWSDomain,
+			CFAPI:     cd.CloudReplace.CFAPI,
+			APICount:  cd.CloudReplace.APICount,
+		}
+	}
+	cfg := h.getConfig()
+	return ReplaceConfig{
+		CFDomain:  cfg.ReplaceCFDomain,
+		AWSDomain: cfg.ReplaceAWSDomain,
+		CFAPI:     cfg.ReplaceCFAPI,
+		APICount:  cfg.ReplaceAPICount,
+	}
+}
+
 // resolveRoute 计算本次查询最终使用的「分流决策 + 上游列表」。
 //
 //  1. 客户端未命中分组 → 走全局域名分流（原有行为）
@@ -1115,9 +1145,9 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 	// a. 按分组引用顺序匹配域名分流：命中即复用该分流列表的 DNS/模式/ECS/偏好/云检测
 	if len(cd.SplitRefs) > 0 {
 		if d := h.matcherHandler.MatchDomainWithin(domain, cd.SplitRefs); d.Matched {
-			// 命中引用分流：列表走加密协议(DoH/DoT/DoH3)时，用分组的 ECS 覆写列表自带 ECS，
-			// 保证按分组的线路解析；纯明文 udp/tcp 上游则保留列表自身的 ECS 策略。
-			if hasEncryptedUpstream(d.DNS) && cd.ECS.Enabled {
+			// 命中引用分流：分组配了 ECS 即统一用分组 ECS 覆写列表自带 ECS，
+			// 保证按分组的线路解析（不区分明文/加密上游）；分组未开 ECS 则保留列表自身策略。
+			if cd.ECS.Enabled {
 				d.ECS = cd.ECS
 			}
 			h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
@@ -1137,13 +1167,15 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 		upstreams = h.getConfig().Upstream
 	}
 	// 兜底查询按分组配置的解析模式 / A-AAAA 偏好 / ECS 策略处理
+	// EnableCloudCheck 置 true：分组兜底路径默认执行云检测（不与分流列表的云检测开关相关）
 	d := SplitDecision{
-		Matched:  true,
-		DNS:      upstreams,
-		DNSMode:  normDNSMode(cd.DNSMode),
-		ListName: cd.Label,
-		IPPrefer: cd.IPPrefer,
-		ECS:      cd.ECS,
+		Matched:          true,
+		DNS:              upstreams,
+		DNSMode:          normDNSMode(cd.DNSMode),
+		ListName:         cd.Label,
+		EnableCloudCheck: true,
+		IPPrefer:         cd.IPPrefer,
+		ECS:              cd.ECS,
 	}
 	h.Logger.Debug("🎯 [客户端分组命中，分流未命中走兜底 DNS] ", map[string]interface{}{
 		"rule":   "CLIENT_GROUP_FALLBACK",

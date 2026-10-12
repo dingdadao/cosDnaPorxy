@@ -188,32 +188,45 @@ func ValidISPKey(k ISPKey) bool {
 	return false
 }
 
+// CloudReplacePolicy 云替换线路策略：分组级覆写全局云 IP 替换目标。
+// Override 为 false 时本组完全跟随全局 replace_cf_domain / replace_aws_domain / replace_cf_api；
+// 为 true 时用本组字段（空值的类型等同该类型不替换，走既有降级逻辑返回上游真实 IP）。
+type CloudReplacePolicy struct {
+	Override  bool   // 是否覆写全局云替换目标
+	CFDomain  string // Cloudflare 替换域名
+	AWSDomain string // AWS 替换域名
+	CFAPI     string // CF 替换 IP 接口（非空时改从接口取 IP）
+	APICount  int    // 从替换接口取前 N 条 IP
+}
+
 // ISPGroup 运营商固定分组：来源运营商自动决定分组。
 // 命中分组后先按 SplitRefs 引用的域名分流列表匹配（命中哪条复用哪条的策略）；
 // 全部未命中时用 FallbackDNS 兜底（覆盖全局上游），兜底查询按 DNSMode/IPPrefer/ECS 处理。
 type ISPGroup struct {
-	ISP         ISPKey    // 固定标识（唯一键，决定缓存 scope）
-	Enabled     bool      // 未启用 = 不干预，走全局默认
-	SplitRefs   []string  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序（命中复用该列表 DNS/模式/ECS/偏好/云检测）
-	FallbackDNS []string  // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
-	DNSMode     string    // race / failover，仅作用于 FallbackDNS
-	IPPrefer    string    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
-	ECS         ECSPolicy // 兜底查询的 EDNS Client Subnet 策略
+	ISP          ISPKey             // 固定标识（唯一键，决定缓存 scope）
+	Enabled      bool               // 未启用 = 不干预，走全局默认
+	SplitRefs    []string           // 引用「上游与域名分流」里的列表名，顺序即匹配顺序（命中复用该列表 DNS/模式/ECS/偏好/云检测）
+	FallbackDNS  []string           // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
+	DNSMode      string             // race / failover，仅作用于 FallbackDNS
+	IPPrefer     string             // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
+	ECS          ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
+	CloudReplace CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
 }
 
 // CustomGroup 自定义分组：按 IP/CIDR 匹配，覆盖"非运营商"需求（机房出口、专线等）。
 // 路由语义与运营商分组一致：先按 SplitRefs 匹配域名分流，未命中走 FallbackDNS 兜底。
 // 越级（Priority 大的优先）排于 ISP 组之前。
 type CustomGroup struct {
-	Name        string // 展示名
-	Enabled     bool
-	Priority    int       // 大者优先（仅自定义组之间排序；整体优先于运营商组）
-	Match       []string  // 裸 IP / CIDR（v4/v6）
-	SplitRefs   []string  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
-	FallbackDNS []string  // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
-	DNSMode     string    // race / failover，仅作用于 FallbackDNS
-	IPPrefer    string    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
-	ECS         ECSPolicy // 兜底查询的 EDNS Client Subnet 策略
+	Name         string // 展示名
+	Enabled      bool
+	Priority     int                // 大者优先（仅自定义组之间排序；整体优先于运营商组）
+	Match        []string           // 裸 IP / CIDR（v4/v6）
+	SplitRefs    []string           // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
+	FallbackDNS  []string           // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
+	DNSMode      string             // race / failover，仅作用于 FallbackDNS
+	IPPrefer     string             // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
+	ECS          ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
+	CloudReplace CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
 }
 
 // CustomScope 自定义分组的缓存 scope（前缀 c: 与内置 ISP key 区分，避免重名串味）
@@ -402,6 +415,9 @@ func ValidateConfig(cfg *Config) error {
 			return err
 		}
 		cfg.ISPGroups[i].SplitRefs = normalizeRefs(cfg.ISPGroups[i].SplitRefs)
+		if err := normalizeCloudReplacePolicy(fmt.Sprintf("isp_groups[%d]", i), &cfg.ISPGroups[i].CloudReplace); err != nil {
+			return err
+		}
 	}
 	for i := range cfg.CustomGroups {
 		if err := normalizeUpstreamList(fmt.Sprintf("custom_groups[%d].fallback_dns", i), cfg.CustomGroups[i].FallbackDNS); err != nil {
@@ -409,6 +425,9 @@ func ValidateConfig(cfg *Config) error {
 		}
 		cfg.CustomGroups[i].SplitRefs = normalizeRefs(cfg.CustomGroups[i].SplitRefs)
 		cfg.CustomGroups[i].Match = normalizeRefs(cfg.CustomGroups[i].Match)
+		if err := normalizeCloudReplacePolicy(fmt.Sprintf("custom_groups[%d]", i), &cfg.CustomGroups[i].CloudReplace); err != nil {
+			return err
+		}
 	}
 
 	if cfg.WebAddr == "" {
@@ -594,6 +613,21 @@ func normalizeRefs(refs []string) []string {
 		}
 	}
 	return out
+}
+
+// normalizeCloudReplacePolicy 归一化分组级云替换策略：去空白、APICount 兜底、
+// CFAPI 非空时校验协议前缀（对齐全局 replace_cf_api 的校验）
+func normalizeCloudReplacePolicy(prefix string, p *CloudReplacePolicy) error {
+	p.CFDomain = strings.TrimSpace(p.CFDomain)
+	p.AWSDomain = strings.TrimSpace(p.AWSDomain)
+	p.CFAPI = strings.TrimSpace(p.CFAPI)
+	if p.APICount <= 0 {
+		p.APICount = 1
+	}
+	if p.CFAPI != "" && !strings.HasPrefix(p.CFAPI, "http://") && !strings.HasPrefix(p.CFAPI, "https://") {
+		return fmt.Errorf("invalid %s.cloud_replace.cf_api: %s", prefix, p.CFAPI)
+	}
+	return nil
 }
 
 // ValidIPOrCIDR 判断字符串是否为合法的裸 IP（v4/v6）或 CIDR 网段

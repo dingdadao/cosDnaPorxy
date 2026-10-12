@@ -54,14 +54,6 @@ func NewReplaceAPIClient(url string, count int, ttl time.Duration, logger *utils
 	}
 }
 
-// match 判断客户端是否仍对应当前配置（URL 或条数变化时需要重建）
-func (c *ReplaceAPIClient) match(url string, count int) bool {
-	if count <= 0 {
-		count = 1
-	}
-	return c != nil && c.url == url && c.count == count
-}
-
 // IPs 返回接口给出的替换 IP：有缓存立即返回；缓存过期则返回旧值并后台刷新；无缓存才同步取
 func (c *ReplaceAPIClient) IPs() ([]netip.Addr, error) {
 	c.mu.RLock()

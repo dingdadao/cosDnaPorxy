@@ -77,7 +77,7 @@ func TestCloudReplacementFallback(t *testing.T) {
 			}}
 
 			if _, err := ch.HandleCloudReplacement(nopWriter{}, req, "cloud.example.com", dns.TypeA,
-				int(CloudTypeCloudflare), original, ""); err != nil {
+				int(CloudTypeCloudflare), original, "", "-", ReplaceConfig{CFDomain: cfg.ReplaceCFDomain}); err != nil {
 				t.Fatalf("HandleCloudReplacement 返回错误: %v", err)
 			}
 			if written == nil {

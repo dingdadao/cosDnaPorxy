@@ -36,14 +36,15 @@ func GroupForISP(isp source.ISP, ok bool) config.ISPKey {
 // （命中哪条复用哪条的策略），全部未命中时用 FallbackDNS 兜底（覆盖全局上游）。
 // FallbackDNS 为空时调用方回退全局 upstream。
 type ClientDecision struct {
-	Matched     bool
-	Scope       string           // 缓存隔离标识：内置分组为 ISP key，自定义组为 "c:<name>"
-	Label       string           // 日志/展示用名称
-	SplitRefs   []string         // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
-	FallbackDNS []string         // 兜底上游：引用分流全部未命中时使用
-	DNSMode     string           // race / failover，仅作用于兜底查询
-	IPPrefer    string           // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
-	ECS         config.ECSPolicy // 兜底查询的 EDNS Client Subnet 策略
+	Matched      bool
+	Scope        string                    // 缓存隔离标识：内置分组为 ISP key，自定义组为 "c:<name>"
+	Label        string                    // 日志/展示用名称
+	SplitRefs    []string                  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
+	FallbackDNS  []string                  // 兜底上游：引用分流全部未命中时使用
+	DNSMode      string                    // race / failover，仅作用于兜底查询
+	IPPrefer     string                    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
+	ECS          config.ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
+	CloudReplace config.CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
 }
 
 // ClientGroupMatcher 客户端分组匹配器
@@ -99,14 +100,15 @@ func (m *ClientGroupMatcher) Match(clientIP netip.Addr) ClientDecision {
 		}
 		if matchAddrList(g.Match, clientIP) {
 			return ClientDecision{
-				Matched:     true,
-				Scope:       config.CustomScope(g.Name),
-				Label:       g.Name,
-				SplitRefs:   g.SplitRefs,
-				FallbackDNS: g.FallbackDNS,
-				DNSMode:     normDNSMode(g.DNSMode),
-				IPPrefer:    g.IPPrefer,
-				ECS:         g.ECS,
+				Matched:      true,
+				Scope:        config.CustomScope(g.Name),
+				Label:        g.Name,
+				SplitRefs:    g.SplitRefs,
+				FallbackDNS:  g.FallbackDNS,
+				DNSMode:      normDNSMode(g.DNSMode),
+				IPPrefer:     g.IPPrefer,
+				ECS:          g.ECS,
+				CloudReplace: g.CloudReplace,
 			}
 		}
 	}
@@ -124,14 +126,15 @@ func (m *ClientGroupMatcher) Match(clientIP netip.Addr) ClientDecision {
 		return ClientDecision{}
 	}
 	return ClientDecision{
-		Matched:     true,
-		Scope:       string(key),
-		Label:       config.ISPGroupLabel(key),
-		SplitRefs:   g.SplitRefs,
-		FallbackDNS: g.FallbackDNS,
-		DNSMode:     normDNSMode(g.DNSMode),
-		IPPrefer:    g.IPPrefer,
-		ECS:         g.ECS,
+		Matched:      true,
+		Scope:        string(key),
+		Label:        config.ISPGroupLabel(key),
+		SplitRefs:    g.SplitRefs,
+		FallbackDNS:  g.FallbackDNS,
+		DNSMode:      normDNSMode(g.DNSMode),
+		IPPrefer:     g.IPPrefer,
+		ECS:          g.ECS,
+		CloudReplace: g.CloudReplace,
 	}
 }
 
@@ -144,14 +147,15 @@ func (m *ClientGroupMatcher) DecisionForScope(scope string) ClientDecision {
 		for _, g := range m.custom {
 			if g.Name == name && g.Enabled {
 				return ClientDecision{
-					Matched:     true,
-					Scope:       config.CustomScope(g.Name),
-					Label:       g.Name,
-					SplitRefs:   g.SplitRefs,
-					FallbackDNS: g.FallbackDNS,
-					DNSMode:     normDNSMode(g.DNSMode),
-					IPPrefer:    g.IPPrefer,
-					ECS:         g.ECS,
+					Matched:      true,
+					Scope:        config.CustomScope(g.Name),
+					Label:        g.Name,
+					SplitRefs:    g.SplitRefs,
+					FallbackDNS:  g.FallbackDNS,
+					DNSMode:      normDNSMode(g.DNSMode),
+					IPPrefer:     g.IPPrefer,
+					ECS:          g.ECS,
+					CloudReplace: g.CloudReplace,
 				}
 			}
 		}
@@ -163,14 +167,15 @@ func (m *ClientGroupMatcher) DecisionForScope(scope string) ClientDecision {
 		return ClientDecision{}
 	}
 	return ClientDecision{
-		Matched:     true,
-		Scope:       string(key),
-		Label:       config.ISPGroupLabel(key),
-		SplitRefs:   g.SplitRefs,
-		FallbackDNS: g.FallbackDNS,
-		DNSMode:     normDNSMode(g.DNSMode),
-		IPPrefer:    g.IPPrefer,
-		ECS:         g.ECS,
+		Matched:      true,
+		Scope:        string(key),
+		Label:        config.ISPGroupLabel(key),
+		SplitRefs:    g.SplitRefs,
+		FallbackDNS:  g.FallbackDNS,
+		DNSMode:      normDNSMode(g.DNSMode),
+		IPPrefer:     g.IPPrefer,
+		ECS:          g.ECS,
+		CloudReplace: g.CloudReplace,
 	}
 }
 

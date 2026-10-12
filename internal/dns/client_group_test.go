@@ -190,6 +190,38 @@ func TestDecisionForScope(t *testing.T) {
 	}
 }
 
+// 命中分组时，决策须携带该分组的云替换覆写策略（否则多线路云替换失效）
+func TestMatcherCarriesCloudReplace(t *testing.T) {
+	ispCR := config.CloudReplacePolicy{Override: true, CFDomain: "cm.cf.example", APICount: 2}
+	ig := ispGroups(map[config.ISPKey]bool{config.ISPGroupCMCC: true})
+	for i := range ig {
+		if ig[i].ISP == config.ISPGroupCMCC {
+			ig[i].CloudReplace = ispCR
+		}
+	}
+	customCR := config.CloudReplacePolicy{Override: true, CFDomain: "idc.cf.example"}
+	custom := []config.CustomGroup{{
+		Name: "机房", Enabled: true, Priority: 9, Match: []string{"10.0.0.0/8"},
+		FallbackDNS: []string{"udp://1.1.1.1:53"}, CloudReplace: customCR,
+	}}
+	m := NewClientGroupMatcherWithISPLookup(ig, custom, fakeISP{})
+
+	// Match：运营商组 / 自定义组
+	if d := m.Match(netip.MustParseAddr("3.3.3.3")); d.CloudReplace != ispCR {
+		t.Errorf("运营商组 Match 应携带云替换策略，得到 %+v", d.CloudReplace)
+	}
+	if d := m.Match(netip.MustParseAddr("10.1.1.1")); d.CloudReplace != customCR {
+		t.Errorf("自定义组 Match 应携带云替换策略，得到 %+v", d.CloudReplace)
+	}
+	// DecisionForScope：运营商 / 自定义
+	if d := m.DecisionForScope(string(config.ISPGroupCMCC)); d.CloudReplace != ispCR {
+		t.Errorf("运营商组 DecisionForScope 应携带云替换策略，得到 %+v", d.CloudReplace)
+	}
+	if d := m.DecisionForScope(config.CustomScope("机房")); d.CloudReplace != customCR {
+		t.Errorf("自定义组 DecisionForScope 应携带云替换策略，得到 %+v", d.CloudReplace)
+	}
+}
+
 func TestMatchAddrList(t *testing.T) {
 	items := []string{"10.0.0.1", "192.168.0.0/16", "  ", "2001:db8::1", "2001:db8:1::/48"}
 	cases := []struct {

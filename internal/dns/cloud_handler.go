@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,14 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// ReplaceConfig 生效的云替换目标：全局配置，或命中的客户端分组覆写后的目标
+type ReplaceConfig struct {
+	CFDomain  string // CF 替换域名
+	AWSDomain string // AWS 替换域名
+	CFAPI     string // CF 替换接口（非空则从接口取 IP）
+	APICount  int    // 接口取前 N 条
+}
 
 // CloudHandler 处理云服务相关功能
 type CloudHandler struct {
@@ -25,8 +34,8 @@ type CloudHandler struct {
 	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error)   // 代理查询函数
 	respond       func(dns.ResponseWriter, *dns.Msg, *dns.Msg) // 统一响应出口（保证EDNS/TC处理一致）
 
-	apiMu sync.RWMutex      // 保护 cfAPI 指针
-	cfAPI *ReplaceAPIClient // CF 替换 IP 接口客户端（ReplaceCFAPI 为空时为 nil）
+	apiMu      sync.RWMutex                 // 保护 apiClients
+	apiClients map[string]*ReplaceAPIClient // 按 (url,count) 索引的 CF 替换接口客户端
 }
 
 // getConfig 获取当前配置（web保存后热切换）
@@ -36,42 +45,78 @@ func (ch *CloudHandler) getConfig() *config.Config {
 	return ch.config
 }
 
-// UpdateConfig 热更新配置引用
+// UpdateConfig 热更新配置引用，并预建/预取所有用到的 CF 替换接口客户端
 func (ch *CloudHandler) UpdateConfig(cfg *config.Config) {
 	ch.cfgMu.Lock()
 	ch.config = cfg
 	ch.cfgMu.Unlock()
-	ch.syncReplaceAPI()
+	ch.WarmReplaceAPIs(cfg)
 }
 
-// replaceAPIClient 返回当前的 CF 接口客户端（未配置接口时为 nil）
-func (ch *CloudHandler) replaceAPIClient() *ReplaceAPIClient {
+// replaceAPIKey 生成接口客户端的索引键
+func replaceAPIKey(url string, count int) string {
+	if count <= 0 {
+		count = 1
+	}
+	return url + "|" + strconv.Itoa(count)
+}
+
+// apiClientFor 按 (url,count) 惰性获取/创建 CF 接口客户端；首次创建时后台预取
+func (ch *CloudHandler) apiClientFor(url string, count int) *ReplaceAPIClient {
+	if url == "" {
+		return nil
+	}
+	key := replaceAPIKey(url, count)
+
 	ch.apiMu.RLock()
-	defer ch.apiMu.RUnlock()
-	return ch.cfAPI
-}
-
-// syncReplaceAPI 按当前配置重建 CF 接口客户端（地址/条数变化时），并做一次提前预取
-func (ch *CloudHandler) syncReplaceAPI() {
-	cfg := ch.getConfig()
-	if cfg.ReplaceCFAPI == "" {
-		ch.apiMu.Lock()
-		ch.cfAPI = nil
-		ch.apiMu.Unlock()
-		return
+	c := ch.apiClients[key]
+	ch.apiMu.RUnlock()
+	if c != nil {
+		return c
 	}
 
 	ch.apiMu.Lock()
-	if ch.cfAPI.match(cfg.ReplaceCFAPI, cfg.ReplaceAPICount) {
-		ch.apiMu.Unlock()
-		return
+	if c = ch.apiClients[key]; c == nil {
+		if ch.apiClients == nil {
+			ch.apiClients = make(map[string]*ReplaceAPIClient)
+		}
+		c = NewReplaceAPIClient(url, count, ch.getConfig().ReplaceCacheTime, ch.logger)
+		ch.apiClients[key] = c
+		go c.Prefetch() // 提前预取：查询路径无需等 HTTP
 	}
-	ch.cfAPI = NewReplaceAPIClient(cfg.ReplaceCFAPI, cfg.ReplaceAPICount, cfg.ReplaceCacheTime, ch.logger)
-	client := ch.cfAPI
 	ch.apiMu.Unlock()
+	return c
+}
 
-	// 提前预取：启动/配置变更后立即取一次，查询路径无需等 HTTP
-	client.Prefetch()
+// WarmReplaceAPIs 依据配置预建并预取所有用到的接口客户端（全局 + 各分组覆写），
+// 并清理不再使用的客户端，避免配置反复变更导致条目堆积
+func (ch *CloudHandler) WarmReplaceAPIs(cfg *config.Config) {
+	targets := []ReplaceConfig{{CFAPI: cfg.ReplaceCFAPI, APICount: cfg.ReplaceAPICount}}
+	for _, g := range cfg.ISPGroups {
+		if g.CloudReplace.Override {
+			targets = append(targets, ReplaceConfig{CFAPI: g.CloudReplace.CFAPI, APICount: g.CloudReplace.APICount})
+		}
+	}
+	for _, g := range cfg.CustomGroups {
+		if g.CloudReplace.Override {
+			targets = append(targets, ReplaceConfig{CFAPI: g.CloudReplace.CFAPI, APICount: g.CloudReplace.APICount})
+		}
+	}
+	keep := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		if t.CFAPI == "" {
+			continue
+		}
+		keep[replaceAPIKey(t.CFAPI, t.APICount)] = struct{}{}
+		ch.apiClientFor(t.CFAPI, t.APICount)
+	}
+	ch.apiMu.Lock()
+	for k := range ch.apiClients {
+		if _, ok := keep[k]; !ok {
+			delete(ch.apiClients, k)
+		}
+	}
+	ch.apiMu.Unlock()
 }
 
 // NewCloudHandler 创建新的云服务处理器
@@ -84,7 +129,7 @@ func NewCloudHandler(config *config.Config, logger *utils.EnhancedLogger, cacheM
 		proxyQuery:    proxyQuery,
 		respond:       respond,
 	}
-	ch.syncReplaceAPI()
+	ch.WarmReplaceAPIs(config)
 	return ch
 }
 
@@ -93,8 +138,9 @@ func NewCloudHandler(config *config.Config, logger *utils.EnhancedLogger, cacheM
 // 云检测已在processQuery完成，此处不再重复检测；
 // 替换不可用（替换域名解析失败/无可用IP）时降级返回上游原始应答，不整条请求失败
 // ipPrefer 为生效的 A/AAAA 偏好档位：prefer_aaaa 时 AAAA 不再被置空，降级返回上游真实 AAAA
+// scope 为客户端线路的缓存隔离标识；rc 为本次生效的云替换目标（全局或分组覆写）
 // 返回值是实际写给客户端的响应（供解析日志记录结果），失败时为 nil
-func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int, originalResp *dns.Msg, ipPrefer string) (*dns.Msg, error) {
+func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int, originalResp *dns.Msg, ipPrefer string, scope string, rc ReplaceConfig) (*dns.Msg, error) {
 	var cloudTypeName string
 	switch CloudType(cloudType) {
 	case CloudTypeCloudflare:
@@ -116,7 +162,7 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 	})
 
 	// 查询替换域名IP（含缓存与CNAME链解析）
-	v4, v6, err := ch.ResolveReplaceIPs(req.Id, domain, qtype, cloudType)
+	v4, v6, err := ch.ResolveReplaceIPs(req.Id, domain, qtype, cloudType, rc)
 	if err != nil {
 		return ch.respondFallback(w, req, domain, qtype, originalResp, "替换域名查询失败: "+err.Error())
 	}
@@ -156,11 +202,11 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 		return ch.respondFallback(w, req, domain, qtype, originalResp, "构建云替换响应失败")
 	}
 
-	// 缓存云替换响应（使用替换缓存时间）
+	// 缓存云替换响应（使用替换缓存时间，按客户端线路 scope 隔离）
 	if ch.getConfig().ReplaceCacheTime > 0 {
-		ch.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType, ch.getConfig().ReplaceCacheTime)
+		ch.cacheManager.SetCloudResponseScoped(scope, domain, qtype, finalResp, cloudType, ch.getConfig().ReplaceCacheTime)
 	} else {
-		ch.cacheManager.SetCloudResponse(domain, qtype, finalResp, cloudType)
+		ch.cacheManager.SetCloudResponseScoped(scope, domain, qtype, finalResp, cloudType)
 	}
 
 	ch.logger.Info("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
@@ -202,10 +248,10 @@ func (ch *CloudHandler) respondFallback(w dns.ResponseWriter, req *dns.Msg, doma
 }
 
 // ResolveReplaceIPs 获取替换IP：CF 配置了接口时直接从接口取（缓存+预取），否则查询替换域名
-// （先查缓存，未命中回源并缓存），返回去重后的A/AAAA记录
-func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uint16, cloudType int) ([]*dns.A, []*dns.AAAA, error) {
+// （先查缓存，未命中回源并缓存），返回去重后的A/AAAA记录；替换目标取自 rc（全局或分组覆写）
+func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uint16, cloudType int, rc ReplaceConfig) ([]*dns.A, []*dns.AAAA, error) {
 	// CF 走接口：跳过替换域名的 DNS 解析（接口只提供 IPv4，AAAA 交由上层按无 v6 替换处理）
-	if apiClient := ch.replaceAPIClient(); apiClient != nil && CloudType(cloudType) == CloudTypeCloudflare {
+	if apiClient := ch.apiClientFor(rc.CFAPI, rc.APICount); apiClient != nil && CloudType(cloudType) == CloudTypeCloudflare {
 		if qtype != dns.TypeA {
 			return nil, nil, nil
 		}
@@ -234,9 +280,9 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 	var replaceDomain string
 	switch CloudType(cloudType) {
 	case CloudTypeCloudflare:
-		replaceDomain = ch.getConfig().ReplaceCFDomain
+		replaceDomain = rc.CFDomain
 	case CloudTypeAWS:
-		replaceDomain = ch.getConfig().ReplaceAWSDomain
+		replaceDomain = rc.AWSDomain
 	default:
 		return nil, nil, fmt.Errorf("unknown cloud type %d", cloudType)
 	}

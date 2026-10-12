@@ -66,6 +66,8 @@ type CloudDetector struct {
 	// 替换域名配置
 	cfReplaceDomain  string
 	awsReplaceDomain string
+	// replaceDomains 全部替换域名集合（全局 + 各分组覆写），用于跳过替换域名自身的云检测
+	replaceDomains map[string]struct{}
 
 	mu sync.RWMutex
 }
@@ -243,15 +245,32 @@ func (cd *CloudDetector) IsReplaceDomain(domain string) bool {
 	domain = strings.TrimSuffix(domain, ".")
 	cd.mu.RLock()
 	defer cd.mu.RUnlock()
+	if _, ok := cd.replaceDomains[domain]; ok {
+		return true
+	}
 	return domain == cd.cfReplaceDomain || domain == cd.awsReplaceDomain
 }
 
-// SetReplaceDomains 设置替换域名配置
+// SetReplaceDomains 设置全局替换域名配置
 func (cd *CloudDetector) SetReplaceDomains(cfReplaceDomain, awsReplaceDomain string) {
 	cd.mu.Lock()
 	defer cd.mu.Unlock()
 	cd.cfReplaceDomain = cfReplaceDomain
 	cd.awsReplaceDomain = awsReplaceDomain
+}
+
+// SetReplaceDomainsAll 登记全部替换域名（全局 + 各分组覆写），供跳过替换域名自检使用
+func (cd *CloudDetector) SetReplaceDomainsAll(domains []string) {
+	set := make(map[string]struct{}, len(domains))
+	for _, d := range domains {
+		d = strings.TrimSuffix(strings.TrimSpace(d), ".")
+		if d != "" {
+			set[d] = struct{}{}
+		}
+	}
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	cd.replaceDomains = set
 }
 
 // DetectCloudService 检测DNS响应中的云服务IP

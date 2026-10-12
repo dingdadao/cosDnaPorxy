@@ -165,7 +165,9 @@ func TestResolveReplaceIPsFromAPI(t *testing.T) {
 	}
 	ch := NewCloudHandler(cfg, logger, cm, nil, proxy, func(dns.ResponseWriter, *dns.Msg, *dns.Msg) {})
 
-	v4, v6, err := ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare))
+	rc := ReplaceConfig{CFDomain: cfg.ReplaceCFDomain, CFAPI: cfg.ReplaceCFAPI, APICount: cfg.ReplaceAPICount}
+
+	v4, v6, err := ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare), rc)
 	if err != nil {
 		t.Fatalf("A 查询失败: %v", err)
 	}
@@ -177,7 +179,7 @@ func TestResolveReplaceIPsFromAPI(t *testing.T) {
 	}
 
 	// 接口只有 IPv4：AAAA 查询不返回替换 IP，交由上层按无 v6 替换处理
-	v4, v6, err = ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeAAAA, int(CloudTypeCloudflare))
+	v4, v6, err = ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeAAAA, int(CloudTypeCloudflare), rc)
 	if err != nil {
 		t.Fatalf("AAAA 查询失败: %v", err)
 	}
@@ -212,7 +214,8 @@ func TestResolveReplaceIPsFallsBackToDomainWhenAPIFails(t *testing.T) {
 	}
 	ch := NewCloudHandler(cfg, logger, cm, nil, proxy, func(dns.ResponseWriter, *dns.Msg, *dns.Msg) {})
 
-	v4, _, err := ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare))
+	v4, _, err := ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare),
+		ReplaceConfig{CFDomain: cfg.ReplaceCFDomain, CFAPI: cfg.ReplaceCFAPI, APICount: cfg.ReplaceAPICount})
 	if err != nil {
 		t.Fatalf("接口失败应回退替换域名解析，实际报错: %v", err)
 	}

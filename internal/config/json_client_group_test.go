@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +156,101 @@ func TestLegacyConfigEnablesSourceRecognition(t *testing.T) {
 	}
 	if cfg.SourceEnabled {
 		t.Fatal("显式关闭运营商识别不应被默认值覆盖")
+	}
+}
+
+// 分组级云替换覆写：字段双向往返一致，序列化字段名为 cloud_replace
+func TestGroupCloudReplaceRoundTrip(t *testing.T) {
+	orig := DefaultConfig()
+	orig.ISPGroups = []ISPGroup{{
+		ISP: ISPGroupCMCC, Enabled: true, FallbackDNS: []string{"udp://223.5.5.5:53"},
+		CloudReplace: CloudReplacePolicy{
+			Override: true, CFDomain: "cm.cf.example", AWSDomain: "cm.aws.example",
+			CFAPI: "https://cm.example/api?select=cm", APICount: 3,
+		},
+	}}
+	orig.CustomGroups = []CustomGroup{{
+		Name: "机房", Enabled: true, Priority: 1, Match: []string{"10.0.0.0/8"},
+		FallbackDNS:  []string{"udp://1.1.1.1:53"},
+		CloudReplace: CloudReplacePolicy{Override: true, CFDomain: "idc.cf.example", APICount: 2},
+	}}
+
+	got, err := orig.ToJSON().ToConfig()
+	if err != nil {
+		t.Fatalf("往返转换失败: %v", err)
+	}
+	if !reflect.DeepEqual(got.ISPGroups[0].CloudReplace, orig.ISPGroups[0].CloudReplace) {
+		t.Errorf("ISP 组云替换往返不一致:\n orig=%+v\n got =%+v", orig.ISPGroups[0].CloudReplace, got.ISPGroups[0].CloudReplace)
+	}
+	if !reflect.DeepEqual(got.CustomGroups[0].CloudReplace, orig.CustomGroups[0].CloudReplace) {
+		t.Errorf("自定义组云替换往返不一致:\n orig=%+v\n got =%+v", orig.CustomGroups[0].CloudReplace, got.CustomGroups[0].CloudReplace)
+	}
+
+	raw, err := json.Marshal(orig.ToJSON())
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	if !strings.Contains(string(raw), `"cloud_replace":{"override":true`) {
+		t.Errorf("序列化应输出 cloud_replace.override 字段: %s", raw)
+	}
+}
+
+// 缺省（无 cloud_replace）应解析为零值＝不覆写，旧配置行为不变
+func TestGroupCloudReplaceDefaultsOff(t *testing.T) {
+	raw := []byte(`{
+		"listen_port": 15353,
+		"upstream": ["udp://223.5.5.5:53"],
+		"isp_groups": [{"isp":"cmcc","enabled":true,"fallback_dns":["udp://223.5.5.5:53"]}],
+		"custom_groups": [{"name":"机房","enabled":true,"match":["10.0.0.0/8"],"fallback_dns":["udp://1.1.1.1:53"]}]
+	}`)
+
+	var j ConfigJSON
+	if err := json.Unmarshal(raw, &j); err != nil {
+		t.Fatalf("解析配置失败: %v", err)
+	}
+	cfg, err := j.ToConfig()
+	if err != nil {
+		t.Fatalf("ToConfig 失败: %v", err)
+	}
+	if cfg.ISPGroups[0].CloudReplace.Override || cfg.CustomGroups[0].CloudReplace.Override {
+		t.Fatalf("缺省云替换应为不覆写: isp=%+v custom=%+v", cfg.ISPGroups[0].CloudReplace, cfg.CustomGroups[0].CloudReplace)
+	}
+}
+
+// 分组云替换校验：api_count 归一化、接口地址前缀校验、覆写空值放行
+func TestGroupCloudReplaceValidation(t *testing.T) {
+	base := func(cr CloudReplacePolicy) *Config {
+		cfg := DefaultConfig()
+		cfg.ISPGroups = []ISPGroup{{
+			ISP: ISPGroupCMCC, Enabled: true, FallbackDNS: []string{"udp://223.5.5.5:53"}, CloudReplace: cr,
+		}}
+		return cfg
+	}
+
+	// 覆写但只填域名：合法，且 api_count 缺省兜底为 1
+	cfg := base(CloudReplacePolicy{Override: true, CFDomain: " cm.cf.example "})
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("覆写仅填域名应合法: %v", err)
+	}
+	if cfg.ISPGroups[0].CloudReplace.APICount != 1 {
+		t.Errorf("api_count 缺省应兜底为 1，实际 %d", cfg.ISPGroups[0].CloudReplace.APICount)
+	}
+	if cfg.ISPGroups[0].CloudReplace.CFDomain != "cm.cf.example" {
+		t.Errorf("域名应被 trim，实际 %q", cfg.ISPGroups[0].CloudReplace.CFDomain)
+	}
+
+	// 接口缺 http(s):// 前缀：拒绝
+	if err := ValidateConfig(base(CloudReplacePolicy{Override: true, CFAPI: "cm.example/api"})); err == nil {
+		t.Error("分组接口地址缺少 http(s):// 前缀应被拒绝")
+	}
+
+	// 合法接口：通过
+	cfg = base(CloudReplacePolicy{Override: true, CFAPI: "https://cm.example/api?select=cm", APICount: 3})
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("合法接口应通过: %v", err)
+	}
+	if cfg.ISPGroups[0].CloudReplace.APICount != 3 {
+		t.Errorf("显式条数应保留，实际 %d", cfg.ISPGroups[0].CloudReplace.APICount)
 	}
 }
 

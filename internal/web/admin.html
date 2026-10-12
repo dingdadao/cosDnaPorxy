@@ -1028,7 +1028,19 @@ function asArray(v) {
   return s ? [s] : [];
 }
 
-/* 分组的引用分流列表 / 兜底 DNS / 解析偏好 / ECS 公共归一化 */
+/* 分组云替换策略归一化（override=false 时跟随全局） */
+function normCloudReplace(cr) {
+  const c = cr || {};
+  return {
+    override: !!c.override,
+    cf_domain: String(c.cf_domain || "").trim(),
+    aws_domain: String(c.aws_domain || "").trim(),
+    cf_api: String(c.cf_api || "").trim(),
+    api_count: Number(c.api_count) || 1,
+  };
+}
+
+/* 分组的引用分流列表 / 兜底 DNS / 解析偏好 / ECS / 云替换公共归一化 */
 function normGroupAdvanced(g) {
   const ecs = g.ecs || {};
   return {
@@ -1041,6 +1053,7 @@ function normGroupAdvanced(g) {
       isp_type: String(ecs.isp_type || "").trim() || "telecom",
       subnet: String(ecs.subnet || "").trim(),
     },
+    cloud_replace: normCloudReplace(g.cloud_replace),
   };
 }
 
@@ -1186,6 +1199,43 @@ function groupECSHTML(kind, i, ecs) {
   </div>`;
 }
 
+/* 分组的云 IP 替换编辑器：开启后本线路覆写全局 CF/AWS 替换目标 */
+function groupCloudReplaceHTML(kind, i, cr) {
+  const c = normCloudReplace(cr);
+  return `<div class="group-ecs">
+    <div class="sl-opt">
+      <div class="txt">
+        <span>云 IP 替换（覆写全局，按线路）</span>
+        <small>开启后本线路使用下方替换目标；关闭则跟随全局 CF/AWS 替换配置</small>
+      </div>
+      <button type="button" role="switch" aria-checked="${c.override}" class="switch"
+        data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.override" aria-label="云替换覆写开关"></button>
+    </div>
+    ${c.override ? `<div class="grid">
+      <div class="field">
+        <label><span class="dirty-dot"></span>CF 替换域名</label>
+        <input type="text" class="mono" value="${esc(c.cf_domain)}" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.cf_domain" placeholder="cmcf.example.com">
+        <div class="err" data-cg-err="${kind}${i}.cloud_replace.cf_domain"></div>
+      </div>
+      <div class="field">
+        <label><span class="dirty-dot"></span>CF 替换接口（优先于域名）</label>
+        <input type="text" class="mono" value="${esc(c.cf_api)}" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.cf_api" placeholder="https://cf.niao.fun/api/results?select=cm">
+        <div class="err" data-cg-err="${kind}${i}.cloud_replace.cf_api"></div>
+      </div>
+      <div class="field">
+        <label><span class="dirty-dot"></span>接口取前 N 条</label>
+        <input type="number" value="${c.api_count}" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.api_count" aria-label="接口取前 N 条">
+        <div class="err" data-cg-err="${kind}${i}.cloud_replace.api_count"></div>
+      </div>
+      <div class="field">
+        <label><span class="dirty-dot"></span>AWS 替换域名</label>
+        <input type="text" class="mono" value="${esc(c.aws_domain)}" data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.aws_domain" placeholder="留空则该线路不做 AWS 替换">
+        <div class="err" data-cg-err="${kind}${i}.cloud_replace.aws_domain"></div>
+      </div>
+    </div>` : ""}
+  </div>`;
+}
+
 /* 分组内的一个字段块（含错误位，键名 <kind><i>.<key>） */
 function grpField(i, kind, key, label, control, help) {
   return `<div class="field span-2">
@@ -1231,6 +1281,7 @@ function ispGroupEditorHTML(items) {
           "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
       </div>
       ${groupECSHTML("isp", i, g.ecs)}
+      ${groupCloudReplaceHTML("isp", i, g.cloud_replace)}
     </div>`;
   }).join("");
   return `<div class="sl-editor" data-cg-group="isp_groups">${rows}
@@ -1276,6 +1327,7 @@ function customGroupEditorHTML(items) {
           "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
       </div>
       ${groupECSHTML("custom", i, g.ecs)}
+      ${groupCloudReplaceHTML("custom", i, g.cloud_replace)}
     </div>`;
   }).join("");
   return `<div class="sl-editor" data-cg-group="custom_groups">${rows}
@@ -1468,6 +1520,10 @@ function validateClientGroups(errors) {
     if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
       errors[`isp${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
     }
+    const api = String((g.cloud_replace || {}).cf_api || "").trim();
+    if ((g.cloud_replace || {}).override && api && !/^https?:\/\//i.test(api)) {
+      errors[`isp${i}.cloud_replace.cf_api`] = "接口地址须以 http:// 或 https:// 开头";
+    }
   });
 
   (CFG.custom_groups || []).forEach((g, i) => {
@@ -1483,6 +1539,10 @@ function validateClientGroups(errors) {
     else checkDNS("custom", i, fb);
     if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
       errors[`custom${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
+    }
+    const api = String((g.cloud_replace || {}).cf_api || "").trim();
+    if ((g.cloud_replace || {}).override && api && !/^https?:\/\//i.test(api)) {
+      errors[`custom${i}.cloud_replace.cf_api`] = "接口地址须以 http:// 或 https:// 开头";
     }
   });
 }
@@ -1546,6 +1606,7 @@ async function saveSections(secs) {
       isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
       subnet: String((g.ecs || {}).subnet || "").trim(),
     },
+    cloud_replace: normCloudReplace(g.cloud_replace),
   }));
   CFG.custom_groups = (CFG.custom_groups || []).map(g => ({
     name: String(g.name || "").trim(),
@@ -1561,6 +1622,7 @@ async function saveSections(secs) {
       isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
       subnet: String((g.ecs || {}).subnet || "").trim(),
     },
+    cloud_replace: normCloudReplace(g.cloud_replace),
   }));
   ["client_ip_sources","client_ip_headers","trusted_proxies"].forEach(k => {
     CFG[k] = (CFG[k] || []).map(s => String(s || "").trim()).filter(Boolean);
@@ -2006,7 +2068,9 @@ function syncClientGroupInput(el) {
   if (!item) return;
   let v = el.value;
   if (key === "priority") v = Number(v) || 0;
+  if (key === "cloud_replace.api_count") v = Number(v) || 1;
   if (key.startsWith("ecs.") && !item.ecs) item.ecs = {};
+  if (key.startsWith("cloud_replace.") && !item.cloud_replace) item.cloud_replace = {};
   setPath(item, key, v);
   el.closest(".sl-item")?.classList.toggle("is-dirty", groupDirty(kind, item));
   const errEl = $(`[data-cg-err="${kind}${i}.${key}"]`);
@@ -2279,14 +2343,14 @@ document.addEventListener("click", async e => {
         const used = new Set(CFG.isp_groups.map(g => String((g || {}).isp || "").trim().toLowerCase()));
         const next = ISP_GROUP_DEFS.find(d => !used.has(d.v));
         if (!next) { toast("四个运营商都已配置", "warn"); return; }
-        CFG.isp_groups.push({ isp: next.v, enabled: false, split_refs: [], fallback_dns: [""], dns_mode: "race", ip_prefer: "", ecs: { enabled: false, isp_type: "telecom", subnet: "" } });
+        CFG.isp_groups.push({ isp: next.v, enabled: false, split_refs: [], fallback_dns: [""], dns_mode: "race", ip_prefer: "", ecs: { enabled: false, isp_type: "telecom", subnet: "" }, cloud_replace: { override: false, cf_domain: "", aws_domain: "", cf_api: "", api_count: 1 } });
         renderRoute();
         const rows = $$(`[data-cg-field="isp"][data-cg-kind="isp"]`);
         if (rows.length) rows[rows.length-1].focus();
         return;
       }
       CFG.custom_groups = CFG.custom_groups || [];
-      CFG.custom_groups.push({ name:"", enabled:true, priority:0, match:[""], split_refs: [], fallback_dns:[""], dns_mode:"race", ip_prefer:"", ecs:{ enabled:false, isp_type:"telecom", subnet:"" } });
+      CFG.custom_groups.push({ name:"", enabled:true, priority:0, match:[""], split_refs: [], fallback_dns:[""], dns_mode:"race", ip_prefer:"", ecs:{ enabled:false, isp_type:"telecom", subnet:"" }, cloud_replace:{ override:false, cf_domain:"", aws_domain:"", cf_api:"", api_count:1 } });
       renderRoute();
       const names = $$('[data-cg-field="name"]');
       if (names.length) names[names.length-1].focus();
@@ -2337,6 +2401,17 @@ document.addEventListener("click", async e => {
     if (item) {
       item.ecs = item.ecs || {};
       item.ecs.enabled = !item.ecs.enabled;
+      renderRoute();
+    }
+    return;
+  }
+  /* 分组「云替换覆写」开关：按钮只触发 click，需单独处理 */
+  const crBtn = e.target.closest('button[data-cg-field="cloud_replace.override"]');
+  if (crBtn) {
+    const item = groupAt(crBtn.dataset.cgKind, Number(crBtn.dataset.cgIdx));
+    if (item) {
+      item.cloud_replace = item.cloud_replace || {};
+      item.cloud_replace.override = !item.cloud_replace.override;
       renderRoute();
     }
     return;
