@@ -353,10 +353,10 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 							})
 
 							// 智能快速返回策略：
-							// 1. 如果响应时间非常快（小于100ms），立即返回
-							// 2. 如果已经有多个有效结果，选择最快的返回
-							if result.ResponseTime < 100*time.Millisecond {
-								// 响应时间非常快，立即返回
+							// 1. 首个有效应答立即返回，避免被挂起的慢上游拖到整体超时
+							// 2. 若未提前返回，则在收尾时选择最快的有效结果
+							if result.ResponseTime < qo.getModernTimeout() {
+								// 竞速中所有上游同时发起，先到者即最快者，立即返回
 								select {
 								case quickReturnChan <- result:
 									// 发现快速有效结果后，取消上下文以停止其他查询
@@ -368,6 +368,21 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 								return
 							}
 						}
+					} else if !hasValidResponse {
+						// NOERROR 但无应答（NODATA，RFC 2308）：海外权威对不存在的子域常返回
+						// NODATA。它和 NXDOMAIN 一样是终态有效结果，必须立即收尾，
+						// 否则会一直等到 modern_timeout（曾把境外域名查询拖满 3s）
+						result.IsSuccess = true
+						qo.logger.Debug("📭 收到 NOERROR 空应答 NODATA", map[string]interface{}{
+							"server": result.Server,
+							"time":   result.ResponseTime.String(),
+						})
+						select {
+						case quickReturnChan <- result:
+							cancel()
+						default:
+						}
+						return
 					}
 				} else if result.Response.Rcode == dns.RcodeNameError && !hasValidResponse {
 					// NXDOMAIN 是权威否定答案（RFC 2308）：本身就是终态有效结果。

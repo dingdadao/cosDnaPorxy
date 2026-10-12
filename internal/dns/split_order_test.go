@@ -486,6 +486,42 @@ func TestQueryRaceReturnsNXDOMAINWithoutWaiting(t *testing.T) {
 	}
 }
 
+// 竞速模式下收到 NOERROR 空应答（NODATA）也应立即收尾，不等慢台上游超时。
+// 回归：海外权威对不存在的子域常返回 NODATA，旧逻辑既不满足“有 Answer”也不是 NXDOMAIN，
+// 会一直挂到 modern_timeout（线上曾把境外域名查询拖满 3s）。
+func TestQueryRaceReturnsNODATAWithoutWaiting(t *testing.T) {
+	logger := utils.NewEnhancedLogger("error", "test", false)
+	req := new(dns.Msg)
+	req.SetQuestion("nodata.example.com.", dns.TypeAAAA)
+
+	fast, slow := "udp://10.0.0.2:53", "udp://10.0.0.1:53"
+	qo := NewSimpleModernOptimizer(logger, 2*time.Second)
+	t.Cleanup(qo.Close)
+	qo.udpQueryFunc = func(_ *dns.Msg, server string) (*dns.Msg, error) {
+		if server == slow {
+			time.Sleep(1500 * time.Millisecond) // 慢台：收尾若等它，耗时必然超过 1.5s
+			return nil, errors.New("mock timeout")
+		}
+		m := new(dns.Msg)
+		m.SetReply(req) // Rcode=NOERROR 且无 Answer，即 NODATA
+		return m, nil
+	}
+
+	start := time.Now()
+	res := qo.Query(req, []string{slow, fast})
+	elapsed := time.Since(start)
+
+	if !res.HasSuccess || res.SuccessResult == nil || res.SuccessResult.Response == nil {
+		t.Fatalf("NODATA 应作为终态结果返回: %+v", res)
+	}
+	if res.SuccessResult.Response.Rcode != dns.RcodeSuccess {
+		t.Errorf("rcode 应为 NOERROR，实际 %s", dns.RcodeToString[res.SuccessResult.Response.Rcode])
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("收到 NODATA 后应立即返回，实际耗时 %v", elapsed)
+	}
+}
+
 // A/AAAA 路径：上游返回 NXDOMAIN 时原样返回，不得回退 BackupDNS（否则会被劫持成垃圾IP）
 func TestProcessQueryNXDOMAINDoesNotFallbackToBackup(t *testing.T) {
 	neg := startNegativeUpstream(t)
