@@ -48,18 +48,21 @@ type DoTConn struct {
 	server   string
 }
 
-// dotConnLifetime 单条 DoT 连接的最大寿命。
-// 实测阿里 DoT 服务器会对连接做生命周期管理（空闲约 60s 到点统一断开，EOF），
-// 正在使用该连接的查询会同时报"读取响应失败"。客户端主动在到期前轮换连接，
-// 可把这类失败降到接近零。40s 比服务器断开阈值（约 60s）留足余量。
+// dotConnLifetime 单条 DoT 连接的最大寿命（安全轮换上限）。
+// 实测阿里 DoT 对空闲连接约 5s 即 EOF 断开（由 timeout 控制），
+// 但对持续使用的连接可存活 30s 以上；40s 上限用于主动轮换长期连续使用的连接。
 const dotConnLifetime = 40 * time.Second
+
+// maxDoTConnsPerServer 单个上游允许保留的最大空闲 DoT 连接数。
+// 仅用于裁剪「空闲」连接：在用连接既不计入该上限，也不会被关闭。
+const maxDoTConnsPerServer = 5
 
 // NewDoTConnPool 创建新的DoT连接池
 func NewDoTConnPool() *DoTConnPool {
 	pool := &DoTConnPool{
 		conns:    make(map[string][]*DoTConn),
-		maxConns: 20,               // 增加每个服务器的最大连接数到20
-		timeout:  45 * time.Second, // 空闲连接过期时间：阿里 DoT 约 60s 断开空闲连接，45s 过期可赶在断开前清理，减少死连接复用
+		maxConns: 20,              // 增加每个服务器的最大连接数到20
+		timeout:  4 * time.Second, // 空闲连接过期时间：实测阿里 DoT 空闲约 5s 即 EOF 断开，取 4s 保证只复用仍然存活的连接，避免复用死连接
 	}
 
 	// 启动健康检查协程
@@ -92,47 +95,117 @@ func (p *DoTConnPool) SetBootstrapResolver(upstreams []string) {
 	}
 }
 
-// GetConn 获取DoT连接
+// GetConn 获取DoT连接（优先复用池中仍存活的空闲连接）
 func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, error) {
+	return p.getConn(ctx, server, true)
+}
+
+// GetFreshConn 强制新建一条 DoT 连接，不复用池中空闲连接。
+// 用于复用连接失败后的重试：池中可能还残留其它同样已被服务端断开的死连接，
+// 若继续走 GetConn 复用它们，重试会以完全相同的方式再次失败。
+func (p *DoTConnPool) GetFreshConn(ctx context.Context, server string) (*DoTConn, error) {
+	return p.getConn(ctx, server, false)
+}
+
+// getConn 取连接：reusePooled 为 true 时优先复用空闲连接，为 false 时跳过复用直接新建。
+// 无论是否复用，都会顺带清理池中过期的空闲连接。
+//
+// 实现上分三段，确保网络 I/O 不持锁：
+//  1. 锁内查找可复用连接、清理过期空闲连接（纯簿记）；
+//  2. 锁外进行 TCP 拨号 + TLS 握手（慢操作，并发时互不阻塞）；
+//  3. 锁内登记新连接并按上限裁剪「空闲」连接（绝不关闭在用连接）。
+//
+// 旧实现在一把全局锁内完成建连，任何一次慢握手都会把全部并发查询串行拖死。
+func (p *DoTConnPool) getConn(ctx context.Context, server string, reusePooled bool) (*DoTConn, error) {
+	if reusePooled {
+		if conn := p.acquireIdleConn(server); conn != nil {
+			return conn, nil
+		}
+	} else {
+		p.pruneExpiredIdle(server)
+	}
+
+	conn, err := p.dialAndHandshake(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+
+	p.registerConn(conn)
+	return conn, nil
+}
+
+// acquireIdleConn 在锁内查找一条可复用的空闲连接；找不到则返回 nil（调用方转去新建）。
+// 命中复用时会标记在用并更新 lastUsed；未命中时顺带清理过期空闲连接。
+func (p *DoTConnPool) acquireIdleConn(server string) *DoTConn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// 检查现有连接
-	if connList, ok := p.conns[server]; ok {
-		// 先找可复用连接（过期连接放到循环外统一关闭清理，
-		// 否则边 range 边删元素会让后续迭代下标越界 panic）
-		for _, conn := range connList {
-			if !conn.inUse && time.Since(conn.lastUsed) < p.timeout &&
-				time.Since(conn.created) < dotConnLifetime {
-				conn.inUse = true
-				conn.lastUsed = time.Now()
-				p.metrics.TotalConnsReused++
-				p.metrics.ActiveConns++
-				log.Printf("[DoT连接池] 复用现有连接: %s", server)
-				return conn, nil
-			}
+	for _, conn := range p.conns[server] {
+		if !conn.inUse && time.Since(conn.lastUsed) < p.timeout &&
+			time.Since(conn.created) < dotConnLifetime {
+			conn.inUse = true
+			conn.lastUsed = time.Now()
+			p.metrics.TotalConnsReused++
+			p.metrics.ActiveConns++
+			log.Printf("[DoT连接池] 复用现有连接: %s", server)
+			return conn
 		}
-		// 关闭并移除过期的空闲连接（空闲超时或超过最大寿命的都清理，
-		// 寿命到期前主动轮换，避免阿里 DoT 到点统一断开导致查询失败）
-		alive := connList[:0]
-		for _, conn := range connList {
-			if !conn.inUse && (time.Since(conn.lastUsed) >= p.timeout ||
-				time.Since(conn.created) >= dotConnLifetime) {
-				log.Printf("[DoT连接池] 连接已过期，关闭: %s", server)
-				conn.Close()
-				p.metrics.TotalConnsClosed++
-				p.metrics.ActiveConns--
-				continue
-			}
-			alive = append(alive, conn)
-		}
-		p.conns[server] = alive
 	}
 
+	p.pruneExpiredIdleLocked(server)
+	return nil
+}
+
+// pruneExpiredIdle 清理指定服务器上过期的空闲连接（自行加锁）。
+func (p *DoTConnPool) pruneExpiredIdle(server string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pruneExpiredIdleLocked(server)
+}
+
+// pruneExpiredIdleLocked 关闭并移除空闲超时或超过最大寿命的空闲连接（寿命到期前主动轮换，
+// 避免阿里 DoT 到点统一断开导致查询失败）。只处理空闲连接，在用连接不动。调用方须持 p.mu。
+func (p *DoTConnPool) pruneExpiredIdleLocked(server string) {
+	connList, ok := p.conns[server]
+	if !ok {
+		return
+	}
+	alive := connList[:0]
+	for _, conn := range connList {
+		if !conn.inUse && (time.Since(conn.lastUsed) >= p.timeout ||
+			time.Since(conn.created) >= dotConnLifetime) {
+			log.Printf("[DoT连接池] 连接已过期，关闭: %s", server)
+			conn.Close()
+			p.metrics.TotalConnsClosed++
+			if p.metrics.ActiveConns > 0 {
+				p.metrics.ActiveConns--
+			}
+			continue
+		}
+		alive = append(alive, conn)
+	}
+	if len(alive) == 0 {
+		delete(p.conns, server)
+		return
+	}
+	p.conns[server] = alive
+}
+
+// bootstrapResolver 在锁内取当前的 bootstrap resolver（可能为 nil，此时走系统 DNS）。
+func (p *DoTConnPool) bootstrapResolver() *net.Resolver {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.resolver
+}
+
+// dialAndHandshake 建立一条新的 DoT 连接（TCP 拨号 + TLS 握手）。
+// 不访问连接池状态、无需持锁，因此并发建连互不阻塞。返回的连接处于在用状态。
+func (p *DoTConnPool) dialAndHandshake(ctx context.Context, server string) (*DoTConn, error) {
 	// 创建TCP连接（优先用 bootstrap resolver 解析主机名，避免依赖系统 DNS；
 	// bootstrap 解析失败时回退到系统 resolver，保证 tls:// 上游不被单点拖死）
 	// 归一化为 host:port：tls://dns.google → dns.google:853（缺端口时 dial 会报 missing port）
 	serverAddr := config.UpstreamDialAddr(server)
+	resolver := p.bootstrapResolver()
 	log.Printf("[DoT连接池] 开始连接TCP: %s", serverAddr)
 	var tcpConn net.Conn
 	var err error
@@ -142,8 +215,8 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 	dialNetworks := []string{"tcp4", "tcp6"}
 	for _, network := range dialNetworks {
 		dialer := &net.Dialer{Timeout: 5 * time.Second}
-		if p.resolver != nil {
-			dialer.Resolver = p.resolver
+		if resolver != nil {
+			dialer.Resolver = resolver
 		}
 		tcpConn, err = dialer.DialContext(ctx, network, serverAddr)
 		if err == nil {
@@ -152,7 +225,7 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 		log.Printf("[DoT连接池] TCP连接失败(%s): %s, 错误: %v", network, serverAddr, err)
 	}
 	// 前两轮都失败且系统解析可用时，最后再按系统默认网络试一次
-	if err != nil && p.resolver != nil {
+	if err != nil && resolver != nil {
 		dialer := &net.Dialer{Timeout: 5 * time.Second}
 		tcpConn, err = dialer.DialContext(ctx, "tcp", serverAddr)
 	}
@@ -195,84 +268,106 @@ func (p *DoTConnPool) GetConn(ctx context.Context, server string) (*DoTConn, err
 	}
 	log.Printf("[DoT连接池] TLS握手成功: %s", serverAddr)
 
-	// 检查服务器连接数，如果超过限制则清理旧连接
-	if connList, ok := p.conns[server]; ok && len(connList) >= 5 { // 每个服务器最多5个连接
-		// 清理最旧的连接
-		oldestIdx := 0
-		oldestTime := connList[0].lastUsed
-		for i, conn := range connList {
-			if conn.lastUsed.Before(oldestTime) {
-				oldestIdx = i
-				oldestTime = conn.lastUsed
-			}
-		}
-		log.Printf("[DoT连接池] 服务器连接数达到上限，清理最旧连接: %s", server)
-		connList[oldestIdx].Close()
-		connList = append(connList[:oldestIdx], connList[oldestIdx+1:]...)
-		p.conns[server] = connList
-	}
-
-	// 检查总连接池大小，如果超过限制则清理旧连接
-	totalConns := 0
-	for _, connList := range p.conns {
-		totalConns += len(connList)
-	}
-	if totalConns >= p.maxConns {
-		p.cleanupOldConnections()
-	}
-
-	// 创建新的连接对象
-	conn := &DoTConn{
+	return &DoTConn{
 		conn:     tcpConn,
 		tlsConn:  tlsConn,
 		lastUsed: time.Now(),
 		created:  time.Now(),
 		inUse:    true,
 		server:   server,
-	}
-
-	// 添加到连接列表
-	if _, ok := p.conns[server]; !ok {
-		p.conns[server] = []*DoTConn{}
-	}
-	p.conns[server] = append(p.conns[server], conn)
-	p.metrics.TotalConnsCreated++
-	p.metrics.ActiveConns++
-	return conn, nil
+	}, nil
 }
 
-// cleanupOldConnections 清理旧连接
-func (p *DoTConnPool) cleanupOldConnections() {
-	var oldestConn *DoTConn
-	var oldestServer string
-	var oldestIdx int
-	var oldestTime time.Time
+// registerConn 把新建连接登记进池（自行加锁），并按上限裁剪空闲连接。
+func (p *DoTConnPool) registerConn(conn *DoTConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	for server, connList := range p.conns {
-		for i, conn := range connList {
-			if oldestConn == nil || conn.lastUsed.Before(oldestTime) {
-				oldestConn = conn
-				oldestServer = server
-				oldestIdx = i
-				oldestTime = conn.lastUsed
+	p.conns[conn.server] = append(p.conns[conn.server], conn)
+	p.metrics.TotalConnsCreated++
+	p.metrics.ActiveConns++
+
+	p.trimServerIdleLocked(conn.server, maxDoTConnsPerServer)
+	p.trimTotalIdleLocked()
+}
+
+// trimServerIdleLocked 把指定服务器的空闲连接裁剪到 keep 条，多余的关闭。
+// 只统计/关闭空闲连接：在用连接既不计入上限，也不会被关闭。调用方须持 p.mu。
+func (p *DoTConnPool) trimServerIdleLocked(server string, keep int) {
+	connList, ok := p.conns[server]
+	if !ok {
+		return
+	}
+	idle := 0
+	for _, conn := range connList {
+		if !conn.inUse {
+			idle++
+		}
+	}
+	if idle <= keep {
+		return
+	}
+
+	excess := idle - keep
+	alive := connList[:0]
+	for _, conn := range connList {
+		if excess > 0 && !conn.inUse {
+			log.Printf("[DoT连接池] 空闲连接超上限，关闭空闲连接: %s", server)
+			conn.Close()
+			p.metrics.TotalConnsClosed++
+			if p.metrics.ActiveConns > 0 {
+				p.metrics.ActiveConns--
+			}
+			excess--
+			continue
+		}
+		alive = append(alive, conn)
+	}
+	if len(alive) == 0 {
+		delete(p.conns, server)
+		return
+	}
+	p.conns[server] = alive
+}
+
+// trimTotalIdleLocked 全局空闲连接数超过 p.maxConns 时，跨服务器关闭多余的空闲连接。
+// 在用连接数不受 p.maxConns 约束，避免把在途查询的连接误杀。调用方须持 p.mu。
+func (p *DoTConnPool) trimTotalIdleLocked() {
+	totalIdle := 0
+	for _, connList := range p.conns {
+		for _, conn := range connList {
+			if !conn.inUse {
+				totalIdle++
 			}
 		}
 	}
+	if totalIdle <= p.maxConns {
+		return
+	}
 
-	if oldestConn != nil {
-		log.Printf("[DoT连接池] 清理最旧连接: %s", oldestConn.server)
-		oldestConn.Close()
-		p.metrics.TotalConnsClosed++
-		if p.metrics.ActiveConns > 0 {
-			p.metrics.ActiveConns--
+	excess := totalIdle - p.maxConns
+	for server, connList := range p.conns {
+		if excess <= 0 {
+			break
 		}
-		// 从连接列表中移除
-		connList := p.conns[oldestServer]
-		connList = append(connList[:oldestIdx], connList[oldestIdx+1:]...)
-		if len(connList) == 0 {
-			delete(p.conns, oldestServer)
+		alive := connList[:0]
+		for _, conn := range connList {
+			if excess > 0 && !conn.inUse {
+				log.Printf("[DoT连接池] 总空闲连接超上限，关闭空闲连接: %s", server)
+				conn.Close()
+				p.metrics.TotalConnsClosed++
+				if p.metrics.ActiveConns > 0 {
+					p.metrics.ActiveConns--
+				}
+				excess--
+				continue
+			}
+			alive = append(alive, conn)
+		}
+		if len(alive) == 0 {
+			delete(p.conns, server)
 		} else {
-			p.conns[oldestServer] = connList
+			p.conns[server] = alive
 		}
 	}
 }

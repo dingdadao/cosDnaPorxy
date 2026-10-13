@@ -396,12 +396,12 @@ func (h *RefactoredHandler) queryDoH(req *dns.Msg, server string) (*dns.Msg, err
 
 // queryDoT 执行DoT DNS查询
 func (h *RefactoredHandler) queryDoT(req *dns.Msg, server string) (*dns.Msg, error) {
-	// 单次尝试：取连接→写入→读取。阿里 DoT 服务器会对连接做生命周期管理
-	//（约 60s 到点统一断开），复用被断开的连接会报写入/读取失败；
-	// 失败时自动丢弃死连接并用新连接重试一次，客户端无感，错误日志大幅减少。
-	tryOnce := func() (*dns.Msg, error) {
-		// 使用连接池获取DoT连接
-		conn, err := h.dotConnPool.GetConn(context.Background(), server)
+	// 单次尝试：取连接→写入→读取。实测阿里 DoT 空闲约 5s 即 EOF 断开连接，
+	// 复用已被断开的连接会报写入/读取失败；失败时丢弃死连接并强制新建连接重试一次，
+	// 客户端无感，错误日志大幅减少。
+	tryOnce := func(getConn func(context.Context, string) (*DoTConn, error)) (*dns.Msg, error) {
+		// 从连接池获取DoT连接
+		conn, err := getConn(context.Background(), server)
 		if err != nil {
 			return nil, err
 		}
@@ -435,12 +435,14 @@ func (h *RefactoredHandler) queryDoT(req *dns.Msg, server string) (*dns.Msg, err
 		return resp, nil
 	}
 
-	resp, err := tryOnce()
+	resp, err := tryOnce(h.dotConnPool.GetConn)
 	if err == nil {
 		return resp, nil
 	}
-	// 首次失败（连接被服务器端周期性断开），丢弃死连接后用新连接重试一次
-	resp, err2 := tryOnce()
+	// 首次失败（复用的连接已被服务端断开），丢弃死连接后重试一次。
+	// 重试必须用 GetFreshConn 强制新建：池中可能还残留其它同样已死的连接，
+	// 若继续复用它们，重试会以相同方式再次失败。
+	resp, err2 := tryOnce(h.dotConnPool.GetFreshConn)
 	if err2 == nil {
 		return resp, nil
 	}
