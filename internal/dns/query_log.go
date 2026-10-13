@@ -26,9 +26,24 @@ func (h *RefactoredHandler) recordQuery(e querylog.Entry) {
 	h.queryLog.Append(e)
 }
 
-// clientAddr 客户端地址（测试等场景可能拿不到 RemoteAddr）
+// clientInfoProvider 携带已解析客户端信息的 writer（DoH/DoH3 经代理透传 header）
+type clientInfoProvider interface {
+	clientInfo() clientInfo
+}
+
+// clientAddr 解析日志中的客户端地址。
+// 经代理的 DoH/DoH3 优先记录已解析出的真实客户端 IP（来自 header），避免只记录到前置代理地址；
+// 直连 UDP/TCP/DoT 无代理层，socket 对端地址即真实 IP，保持原样（含端口）。
 func clientAddr(w dns.ResponseWriter) string {
-	if w == nil || w.RemoteAddr() == nil {
+	if w == nil {
+		return ""
+	}
+	if p, ok := w.(clientInfoProvider); ok {
+		if info := p.clientInfo(); info.ip.IsValid() && info.source == "header" {
+			return info.ip.String()
+		}
+	}
+	if w.RemoteAddr() == nil {
 		return ""
 	}
 	return w.RemoteAddr().String()
