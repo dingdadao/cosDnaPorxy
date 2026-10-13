@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +34,28 @@ const (
 	ActionError    = "error"    // 解析失败或错误响应
 )
 
+// 来源维度取值（source_kind / via / protocol 字段）
+const (
+	SourceOuter   = "outer"   // 外网：客户端 IP 为公网地址
+	SourceInner   = "inner"   // 内网：客户端 IP 命中内网网段
+	SourceUnknown = "unknown" // 未知：客户端 IP 缺失或无法解析
+
+	ViaProxy  = "proxy"  // 经代理：客户端 IP 取自前置代理透传的请求头
+	ViaDirect = "direct" // 直连：客户端 IP 取自连接对端地址或静态映射
+
+	ProtoUDP  = "UDP"
+	ProtoTCP  = "TCP"
+	ProtoDoT  = "DoT"
+	ProtoDoH  = "DoH"
+	ProtoDoH3 = "DoH3"
+)
+
+// 来源维度相关的统计算法上限
+const (
+	defaultTopClients = 20  // 统计页 Top 客户端来源默认条数
+	maxTopClients     = 100 // 统计页 Top 客户端来源条数上限
+)
+
 const (
 	queueSize  = 8192        // 异步写入队列长度，打满即丢弃并计数
 	batchSize  = 256         // 单次事务最大条数
@@ -54,19 +77,23 @@ const (
 
 // Entry 单条解析日志（全量明细：每次客户端查询一行）
 type Entry struct {
-	ID        int64  `json:"id"`
-	Time      int64  `json:"time"` // Unix 秒
-	Domain    string `json:"domain"`
-	QType     string `json:"qtype"`
-	Client    string `json:"client"`
-	Action    string `json:"action"`
-	ListName  string `json:"list_name"` // 命中的分流列表名称（篡改/缓存/上游为空）
-	DNS       string `json:"dns"`       // 实际应答的上游服务器
-	DNSMode   string `json:"dns_mode"`  // race/failover
-	ECS       string `json:"ecs"`       // ECS 处理说明（注入 xxx / 剥离客户端 ECS）
-	Rcode     string `json:"rcode"`
-	Answers   string `json:"answers"` // 应答记录摘要
-	ElapsedMS int64  `json:"elapsed_ms"`
+	ID         int64  `json:"id"`
+	Time       int64  `json:"time"` // Unix 秒
+	Domain     string `json:"domain"`
+	QType      string `json:"qtype"`
+	Client     string `json:"client"`      // 归一化客户端 IP（不含端口）
+	ClientISP  string `json:"client_isp"`  // 客户端 IP 归属运营商（telecom/unicom/... 空为未识别）
+	Protocol   string `json:"protocol"`    // 接入协议 UDP/TCP/DoT/DoH/DoH3
+	SourceKind string `json:"source_kind"` // 来源类型 外网 outer / 内网 inner / 未知 unknown
+	Via        string `json:"via"`         // 接入方式 经代理 proxy / 直连 direct
+	Action     string `json:"action"`
+	ListName   string `json:"list_name"` // 命中的分流列表名称（篡改/缓存/上游为空）
+	DNS        string `json:"dns"`       // 实际应答的上游服务器
+	DNSMode    string `json:"dns_mode"`  // race/failover
+	ECS        string `json:"ecs"`       // ECS 处理说明（注入 xxx / 剥离客户端 ECS）
+	Rcode      string `json:"rcode"`
+	Answers    string `json:"answers"` // 应答记录摘要
+	ElapsedMS  int64  `json:"elapsed_ms"`
 }
 
 // GroupStat 单维度聚合结果（来源 / 类型 / 结果分布）
@@ -99,6 +126,16 @@ type DayStat struct {
 	Count int64  `json:"count"`
 }
 
+// ClientStat Top 客户端来源条目
+type ClientStat struct {
+	Client       string  `json:"client"`      // 归一化客户端 IP
+	ISP          string  `json:"isp"`         // 归属运营商（空为未识别）
+	SourceKind   string  `json:"source_kind"` // 该客户端的主要来源类型
+	Count        int64   `json:"count"`
+	AvgElapsedMS float64 `json:"avg_elapsed_ms"`
+	Action       string  `json:"action"` // 主要来源路径
+}
+
 // Summary 统计汇总：窗口由 Filter 决定，默认保留期内全部记录（不设条数上限）
 type Summary struct {
 	Total        int64        `json:"total"`
@@ -112,6 +149,12 @@ type Summary struct {
 	ByRcode      []GroupStat  `json:"by_rcode"`
 	TopDomains   []DomainStat `json:"top_domains"`
 	ByDay        []DayStat    `json:"by_day"`
+
+	// 来源维度分布（来源类型 / 接入协议 / 接入方式）与 Top 客户端来源
+	BySourceKind []GroupStat  `json:"by_source_kind"`
+	ByProtocol   []GroupStat  `json:"by_protocol"`
+	ByVia        []GroupStat  `json:"by_via"`
+	TopClients   []ClientStat `json:"top_clients"`
 
 	// 超时口径：elapsed_ms >= TimeoutMS 的记录视作超时，不计入任何平均耗时，
 	// 单独汇总为 Timeouts / TimeoutAvgElapsedMS（TimeoutMS 为 0 表示未判定）
@@ -129,13 +172,18 @@ type Options struct {
 
 // Filter 查询条件（零值表示不限）
 type Filter struct {
-	Keyword string // 模糊匹配域名/应答/客户端/列表名/DNS
-	Action  string
-	QType   string
-	Start   int64 // Unix 秒
-	End     int64
-	Limit   int
-	Offset  int
+	Keyword    string // 模糊匹配域名/应答/客户端/列表名/DNS
+	Action     string
+	QType      string
+	Client     string // 精确客户端 IP 或 CIDR 网段
+	Protocol   string // 接入协议 UDP/TCP/DoT/DoH/DoH3
+	SourceKind string // 来源类型 outer/inner/unknown
+	Via        string // 接入方式 proxy/direct
+	ClientISP  string // 运营商归属 telecom/unicom/cmcc/...（空为不限）
+	Start      int64  // Unix 秒
+	End        int64
+	Limit      int
+	Offset     int
 }
 
 // Store 解析日志存储
@@ -198,25 +246,46 @@ func (s *Store) initSchema() error {
 
 	schema := `
 CREATE TABLE IF NOT EXISTS query_logs (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	ts         INTEGER NOT NULL,
-	domain     TEXT NOT NULL,
-	qtype      TEXT NOT NULL,
-	client     TEXT NOT NULL DEFAULT '',
-	action     TEXT NOT NULL,
-	list_name  TEXT NOT NULL DEFAULT '',
-	dns        TEXT NOT NULL DEFAULT '',
-	dns_mode   TEXT NOT NULL DEFAULT '',
-	ecs        TEXT NOT NULL DEFAULT '',
-	rcode      TEXT NOT NULL DEFAULT '',
-	answers    TEXT NOT NULL DEFAULT '',
-	elapsed_ms INTEGER NOT NULL DEFAULT 0
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts            INTEGER NOT NULL,
+	domain        TEXT NOT NULL,
+	qtype         TEXT NOT NULL,
+	client        TEXT NOT NULL DEFAULT '',
+	client_isp    TEXT NOT NULL DEFAULT '',
+	protocol      TEXT NOT NULL DEFAULT '',
+	source_kind   TEXT NOT NULL DEFAULT '',
+	via           TEXT NOT NULL DEFAULT '',
+	client_ip_num INTEGER NOT NULL DEFAULT 0,
+	action        TEXT NOT NULL,
+	list_name     TEXT NOT NULL DEFAULT '',
+	dns           TEXT NOT NULL DEFAULT '',
+	dns_mode      TEXT NOT NULL DEFAULT '',
+	ecs           TEXT NOT NULL DEFAULT '',
+	rcode         TEXT NOT NULL DEFAULT '',
+	answers       TEXT NOT NULL DEFAULT '',
+	elapsed_ms    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_query_logs_ts ON query_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_query_logs_domain ON query_logs(domain);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化解析日志表结构失败: %w", err)
+	}
+
+	// 兼容旧库：为缺失的来源维度列补列（已存在时忽略 duplicate column 错误）
+	for _, ddl := range []string{
+		`ALTER TABLE query_logs ADD COLUMN client_isp TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE query_logs ADD COLUMN protocol TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE query_logs ADD COLUMN source_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE query_logs ADD COLUMN via TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE query_logs ADD COLUMN client_ip_num INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("迁移解析日志表结构失败: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_query_logs_ip ON query_logs(client_ip_num)`); err != nil {
+		return fmt.Errorf("初始化解析日志索引失败: %w", err)
 	}
 	return nil
 }
@@ -299,7 +368,7 @@ func (s *Store) Query(f Filter) ([]Entry, int64, error) {
 		offset = 0
 	}
 
-	rows, err := s.db.Query(`SELECT id, ts, domain, qtype, client, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms
+	rows, err := s.db.Query(`SELECT id, ts, domain, qtype, client, client_isp, protocol, source_kind, via, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms
 		FROM query_logs`+where+` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`,
 		append(args, limit, offset)...)
 	if err != nil {
@@ -310,7 +379,8 @@ func (s *Store) Query(f Filter) ([]Entry, int64, error) {
 	list := make([]Entry, 0, limit)
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.ID, &e.Time, &e.Domain, &e.QType, &e.Client, &e.Action,
+		if err := rows.Scan(&e.ID, &e.Time, &e.Domain, &e.QType, &e.Client, &e.ClientISP,
+			&e.Protocol, &e.SourceKind, &e.Via, &e.Action,
 			&e.ListName, &e.DNS, &e.DNSMode, &e.ECS, &e.Rcode, &e.Answers, &e.ElapsedMS); err != nil {
 			return nil, 0, fmt.Errorf("读取解析日志失败: %w", err)
 		}
@@ -337,6 +407,31 @@ func buildWhere(f Filter) (string, []interface{}) {
 		conds = append(conds, `qtype = ?`)
 		args = append(args, f.QType)
 	}
+	if f.Protocol != "" {
+		conds = append(conds, `protocol = ?`)
+		args = append(args, f.Protocol)
+	}
+	if f.SourceKind != "" {
+		conds = append(conds, `source_kind = ?`)
+		args = append(args, f.SourceKind)
+	}
+	if f.Via != "" {
+		conds = append(conds, `via = ?`)
+		args = append(args, f.Via)
+	}
+	if f.ClientISP != "" {
+		conds = append(conds, `client_isp = ?`)
+		args = append(args, f.ClientISP)
+	}
+	if c := strings.TrimSpace(f.Client); c != "" {
+		if cond, cargs, ok := clientCond(c); ok {
+			conds = append(conds, cond)
+			args = append(args, cargs...)
+		} else {
+			// 非法 IP / CIDR：不匹配任何记录（上层已做校验并返回 400）
+			conds = append(conds, `1 = 0`)
+		}
+	}
 	if f.Start > 0 {
 		conds = append(conds, `ts >= ?`)
 		args = append(args, f.Start)
@@ -352,18 +447,66 @@ func buildWhere(f Filter) (string, []interface{}) {
 	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
+// clientCond 生成客户端筛选条件：精确 IP 用等值匹配；IPv4 CIDR 用整数区间（走索引）；
+// IPv6 CIDR 退化为前缀 LIKE。返回值 ok=false 表示输入非法。
+func clientCond(c string) (string, []interface{}, bool) {
+	if !strings.Contains(c, "/") {
+		if _, err := netip.ParseAddr(c); err != nil {
+			return "", nil, false
+		}
+		return `client = ?`, []interface{}{c}, true
+	}
+	pfx, err := netip.ParsePrefix(c)
+	if err != nil {
+		return "", nil, false
+	}
+	pfx = pfx.Masked()
+	if pfx.Addr().Is4() {
+		lo := ipv4ToUint32(pfx.Addr())
+		hi := lo | (^uint32(0) >> uint(pfx.Bits()))
+		return `client_ip_num BETWEEN ? AND ?`, []interface{}{int64(lo), int64(hi)}, true
+	}
+	if like := ipv6PrefixLike(pfx); like != "" {
+		return `client LIKE ?`, []interface{}{like + "%"}, true
+	}
+	return `1 = 0`, nil, true
+}
+
+// ipv4ToUint32 IPv4 地址转无符号整数（用于 CIDR 区间筛选）
+func ipv4ToUint32(ip netip.Addr) uint32 {
+	b := ip.As4()
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// ipv6PrefixLike 生成 IPv6 CIDR 的字符串前缀（按完整 16 位片段向下取整），用于退化的前缀 LIKE 匹配
+func ipv6PrefixLike(p netip.Prefix) string {
+	hextets := p.Bits() / 16
+	if hextets <= 0 {
+		return ""
+	}
+	parts := strings.Split(p.Addr().String(), ":")
+	if hextets > len(parts) {
+		hextets = len(parts)
+	}
+	return strings.Join(parts[:hextets], ":") + ":"
+}
+
 // Summary 聚合统计（topN 为 Top 域名条数，<=0 用默认值，超过上限按上限截断；
 // timeoutMS 为超时判定阈值（毫秒），elapsed_ms >= 该值的记录不计入任何平均耗时，
 // 单独汇总到 Timeouts；<=0 表示不判定超时）
 func (s *Store) Summary(f Filter, topN int, timeoutMS int64) (*Summary, error) {
 	where, args := buildWhere(f)
 	sum := &Summary{
-		ByAction:   []GroupStat{},
-		ByList:     []ListStat{},
-		ByQType:    []GroupStat{},
-		ByRcode:    []GroupStat{},
-		TopDomains: []DomainStat{},
-		ByDay:      []DayStat{},
+		ByAction:     []GroupStat{},
+		ByList:       []ListStat{},
+		ByQType:      []GroupStat{},
+		ByRcode:      []GroupStat{},
+		TopDomains:   []DomainStat{},
+		ByDay:        []DayStat{},
+		BySourceKind: []GroupStat{},
+		ByProtocol:   []GroupStat{},
+		ByVia:        []GroupStat{},
+		TopClients:   []ClientStat{},
 	}
 	// 归一化阈值：不判定时取最大值，使 SQL 中的 </>= 条件自然退化为「全部计入 / 无超时」
 	thr := timeoutMS
@@ -397,6 +540,18 @@ func (s *Store) Summary(f Filter, topN int, timeoutMS int64) (*Summary, error) {
 		return nil, err
 	}
 	if sum.ByList, err = s.listStats(where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.BySourceKind, err = s.groupStats("source_kind", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByProtocol, err = s.groupStats("protocol", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.ByVia, err = s.groupStats("via", where, args, thr); err != nil {
+		return nil, err
+	}
+	if sum.TopClients, err = s.clientStats(where, args, topN, thr); err != nil {
 		return nil, err
 	}
 	if sum.TopDomains, err = s.topDomains(where, args, topN, thr); err != nil {
@@ -528,6 +683,47 @@ func (s *Store) topDomains(where string, args []interface{}, topN int, thr int64
 	return out, rows.Err()
 }
 
+// clientStats Top 客户端来源：按客户端 IP 聚合次数、平均耗时与主要来源路径，
+// 并附客户端归属运营商与主要来源类型。次数为全量，平均耗时剔除超时记录。
+// 相关子查询自带分组且不带参数，故不影响 buildWhere 参数与 LIMIT 参数的顺序。
+func (s *Store) clientStats(where string, args []interface{}, topN int, thr int64) ([]ClientStat, error) {
+	if topN <= 0 {
+		topN = defaultTopClients
+	}
+	if topN > maxTopClients {
+		topN = maxTopClients
+	}
+	// 仅统计有客户端 IP 的记录
+	if where == "" {
+		where = " WHERE client <> ''"
+	} else {
+		where += " AND client <> ''"
+	}
+	qargs := append(append([]interface{}{thr}, args...), topN)
+
+	rows, err := s.db.Query(`SELECT q.client, MAX(q.client_isp), MAX(q.source_kind), COUNT(*),
+		COALESCE(AVG(CASE WHEN q.elapsed_ms < ? THEN q.elapsed_ms END),0),
+		(SELECT action FROM query_logs x WHERE x.client = q.client
+			GROUP BY action ORDER BY COUNT(*) DESC, action ASC LIMIT 1)
+		FROM query_logs q`+where+` GROUP BY q.client ORDER BY COUNT(*) DESC, q.client ASC LIMIT ?`, qargs...)
+	if err != nil {
+		return nil, fmt.Errorf("统计 Top 客户端来源失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ClientStat{}
+	for rows.Next() {
+		var c ClientStat
+		var isp, kind, action sql.NullString
+		if err := rows.Scan(&c.Client, &isp, &kind, &c.Count, &c.AvgElapsedMS, &action); err != nil {
+			return nil, fmt.Errorf("读取 Top 客户端来源失败: %w", err)
+		}
+		c.ISP, c.SourceKind, c.Action = isp.String, kind.String, action.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // dailyStats 按本地自然日统计：SQL 只做小时分桶，再由 Go 按本地时区归并并补零，
 // 避免 SQLite 'localtime' 与 Go 侧时区不一致导致日期错位。
 func (s *Store) dailyStats(where string, args []interface{}, firstTS, lastTS int64) ([]DayStat, error) {
@@ -628,8 +824,8 @@ func (s *Store) insertBatch(batch []Entry) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare(`INSERT INTO query_logs(ts, domain, qtype, client, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO query_logs(ts, domain, qtype, client, client_isp, protocol, source_kind, via, client_ip_num, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -637,13 +833,23 @@ func (s *Store) insertBatch(batch []Entry) error {
 	defer stmt.Close()
 
 	for _, e := range batch {
-		if _, err := stmt.Exec(e.Time, e.Domain, e.QType, e.Client, e.Action,
+		if _, err := stmt.Exec(e.Time, e.Domain, e.QType, e.Client, e.ClientISP,
+			e.Protocol, e.SourceKind, e.Via, clientIPNum(e.Client), e.Action,
 			e.ListName, e.DNS, e.DNSMode, e.ECS, e.Rcode, e.Answers, e.ElapsedMS); err != nil {
 			tx.Rollback()
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// clientIPNum 归一化客户端 IP 的 IPv4 整数形式（IPv6 或非法值记 0），用于 CIDR 区间筛选
+func clientIPNum(client string) int64 {
+	ip, err := netip.ParseAddr(client)
+	if err != nil || !ip.Is4() {
+		return 0
+	}
+	return int64(ipv4ToUint32(ip))
 }
 
 // pruneLoop 周期性清理超期与超量日志

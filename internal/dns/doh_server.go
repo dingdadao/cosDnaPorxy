@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"cosDnaPorxy/internal/querylog"
 	"cosDnaPorxy/internal/utils"
 )
 
@@ -52,7 +53,7 @@ func (s *DoHServer) Start() error {
 	}
 
 	mux := http.NewServeMux()
-	handler := newDoHHandler(s.path, s.altSvc, s.handler)
+	handler := newDoHHandler(s.path, s.altSvc, querylog.ProtoDoH, s.handler)
 	mux.Handle("GET "+s.path, handler)
 	mux.Handle("POST "+s.path, handler)
 

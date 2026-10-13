@@ -20,14 +20,15 @@ const (
 type dohHandler struct {
 	path    string
 	altSvc  string
+	proto   string // 接入协议标记：DoH 或 DoH3
 	handler *RefactoredHandler
 }
 
-func newDoHHandler(path, altSvc string, handler *RefactoredHandler) *dohHandler {
+func newDoHHandler(path, altSvc, proto string, handler *RefactoredHandler) *dohHandler {
 	if path == "" {
 		path = "/dns-query"
 	}
-	return &dohHandler{path: path, altSvc: altSvc, handler: handler}
+	return &dohHandler{path: path, altSvc: altSvc, proto: proto, handler: handler}
 }
 
 // ServeHTTP 实现 http.Handler
@@ -77,17 +78,18 @@ func (h *dohHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析客户端 IP 并包装 ResponseWriter
-	clientIP, _ := h.handler.ResolveClientIPFromRequest(r)
-	dw := newDoHResponseWriter(w, r, clientIP)
-
-	// 调用 DNS handler
-	h.handler.ServeDNS(dw, msg)
+	// 解析客户端 IP 并包装 ResponseWriter（保留来源名，供日志区分经代理/直连）
+	clientIP, clientSrc := h.handler.ResolveClientIPFromRequest(r)
+	dw := newDoHResponseWriter(w, r, clientIP, clientSrc, h.proto)
 
 	// 设置 Alt-Svc 头（引导客户端使用 DoH3）
+	// 必须在 ServeDNS 写入响应头之前设置，否则头信息已被发出，设置无效
 	if h.altSvc != "" {
 		w.Header().Set("Alt-Svc", h.altSvc)
 	}
+
+	// 调用 DNS handler
+	h.handler.ServeDNS(dw, msg)
 }
 
 // dohResponseWriter 把 http.ResponseWriter 适配为 dns.ResponseWriter
@@ -97,11 +99,12 @@ type dohResponseWriter struct {
 	remoteAddr string
 	clientIP   netip.Addr
 	info       clientInfo
+	proto      string // 接入协议标记：DoH 或 DoH3
 	written    bool
 }
 
-func newDoHResponseWriter(w http.ResponseWriter, req *http.Request, clientIP netip.Addr) *dohResponseWriter {
-	info := clientInfo{ip: clientIP, source: "header"}
+func newDoHResponseWriter(w http.ResponseWriter, req *http.Request, clientIP netip.Addr, source, proto string) *dohResponseWriter {
+	info := clientInfo{ip: clientIP, source: source}
 	if !clientIP.IsValid() {
 		info = clientInfo{ip: parseAddr(req.RemoteAddr), source: "socket"}
 	}
@@ -111,6 +114,7 @@ func newDoHResponseWriter(w http.ResponseWriter, req *http.Request, clientIP net
 		remoteAddr: req.RemoteAddr,
 		clientIP:   clientIP,
 		info:       info,
+		proto:      proto,
 	}
 }
 
@@ -154,6 +158,11 @@ func (d *dohResponseWriter) LocalAddr() net.Addr {
 // clientInfo 返回携带的客户端信息，供 ResolveClientIP 优先读取
 func (d *dohResponseWriter) clientInfo() clientInfo {
 	return d.info
+}
+
+// protocol 返回接入协议标记（DoH 或 DoH3），供解析日志记录
+func (d *dohResponseWriter) protocol() string {
+	return d.proto
 }
 
 // tcpAddr 是 net.Addr 的最小实现

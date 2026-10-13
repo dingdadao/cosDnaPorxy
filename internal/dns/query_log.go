@@ -15,15 +15,52 @@ const maxLoggedAnswers = 8
 // maxLoggedTextLen 应答摘要最大长度
 const maxLoggedTextLen = 400
 
-// recordQuery 记录一条解析日志（未启用或未初始化时直接跳过）
-func (h *RefactoredHandler) recordQuery(e querylog.Entry) {
-	if h.queryLog == nil {
+// recordQuery 记录一条解析日志并补齐来源维度（未启用或未初始化时直接跳过）
+func (h *RefactoredHandler) recordQuery(w dns.ResponseWriter, e querylog.Entry) {
+	if h.queryLog == nil || !h.queryLog.Enabled() {
 		return
 	}
 	if e.Time == 0 {
 		e.Time = time.Now().Unix()
 	}
+	e.Client, e.SourceKind, e.Via, e.ClientISP = h.logSource(w)
+	e.Protocol = protocolOf(w)
 	h.queryLog.Append(e)
+}
+
+// protocolProvider 携带接入协议标记的 writer（DoH/DoH3 与直连协议包装）
+type protocolProvider interface {
+	protocol() string
+}
+
+// protocolOf 取响应对应的接入协议（无法识别时返回空串）
+func protocolOf(w dns.ResponseWriter) string {
+	if w == nil {
+		return ""
+	}
+	if p, ok := w.(protocolProvider); ok {
+		return p.protocol()
+	}
+	return ""
+}
+
+// protocolTagWriter 为直连协议（UDP/TCP/DoT）的库 writer 标注接入协议
+type protocolTagWriter struct {
+	dns.ResponseWriter
+	proto string
+}
+
+func (w *protocolTagWriter) protocol() string { return w.proto }
+
+// protocolTagHandler 包装 dns.Handler，为直连协议（UDP/TCP/DoT）的每次查询标注接入协议
+type protocolTagHandler struct {
+	proto string
+	next  dns.Handler
+}
+
+// ServeDNS 在调用下游处理器前，为 writer 附加协议标记
+func (h protocolTagHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
+	h.next.ServeDNS(&protocolTagWriter{ResponseWriter: w, proto: h.proto}, req)
 }
 
 // clientInfoProvider 携带已解析客户端信息的 writer（DoH/DoH3 经代理透传 header）

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cosDnaPorxy/internal/config"
+	"cosDnaPorxy/internal/querylog"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
@@ -81,7 +82,7 @@ func (s *Server) Start() error {
 		// 创建DNS服务器
 		s.server = &dns.Server{
 			PacketConn: conn,
-			Handler:    s.handler,
+			Handler:    protocolTagHandler{proto: querylog.ProtoUDP, next: s.handler},
 			Net:        "udp",
 		}
 
@@ -101,7 +102,7 @@ func (s *Server) Start() error {
 		// 创建DNS服务器
 		s.server = &dns.Server{
 			Listener: listener,
-			Handler:  s.handler,
+			Handler:  protocolTagHandler{proto: querylog.ProtoTCP, next: s.handler},
 			Net:      "tcp",
 		}
 

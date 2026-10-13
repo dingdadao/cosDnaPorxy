@@ -63,7 +63,7 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 	})
 
 	e := querylog.Entry{
-		Domain: domain, QType: dns.TypeToString[dns.TypeAAAA], Client: clientAddr(w),
+		Domain: domain, QType: dns.TypeToString[dns.TypeAAAA],
 		Action: querylog.ActionFiltered, ListName: d.ListName,
 		Rcode: dns.RcodeToString[dns.RcodeSuccess], Answers: reason,
 		ElapsedMS: time.Since(start).Milliseconds(),
@@ -73,7 +73,7 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 		e.DNS = lookupDNS
 		e.DNSMode = d.DNSMode
 	}
-	h.recordQuery(e)
+	h.recordQuery(w, e)
 	return true
 }
 

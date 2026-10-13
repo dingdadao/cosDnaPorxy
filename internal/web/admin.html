@@ -323,6 +323,20 @@
   .day-col .n { font-size:10.5px; color:var(--text-2); }
   .day-col .lbl { font-size:10px; color:var(--text-3); font-family:var(--mono); white-space:nowrap; }
 
+  /* ---------- 来源维度徽章（来源类型 / 接入协议 / 接入方式 / 运营商） ---------- */
+  .kind { display:inline-block; font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:9px; border:1px solid transparent; white-space:nowrap; }
+  .kind.outer { color:var(--purple); background:rgba(188,140,255,.13); }
+  .kind.inner { color:var(--cyan); background:rgba(57,197,207,.12); }
+  .kind.unknown { color:var(--text-2); background:rgba(154,167,180,.10); border-color:var(--border); }
+  .via-tag { display:inline-block; font-family:var(--mono); font-size:10.5px; color:var(--text-2); border:1px solid var(--border); border-radius:9px; padding:0 7px; white-space:nowrap; }
+  .isp-tag { display:inline-block; font-family:var(--mono); font-size:10.5px; color:var(--cyan); border:1px solid var(--border); border-radius:9px; padding:0 7px; white-space:nowrap; }
+  .src-block { display:flex; flex-direction:column; gap:3px; line-height:1.5; }
+  .src-block .tags { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+  .src-block .ip-line { display:flex; align-items:center; gap:5px; min-width:0; }
+  .field-err { font-size:11px; color:var(--danger); display:none; }
+  .field-err.show { display:inline; }
+  .rules-toolbar input.invalid { border-color:var(--danger); }
+
   /* ---------- 抽屉 ---------- */
   .overlay-backdrop { position:fixed; inset:0; background:rgba(3,6,10,.55); z-index:60; animation:fade .15s; }
   @keyframes fade { from{opacity:0} to{opacity:1} }
@@ -626,7 +640,7 @@ function humanDur(s) {
   return String(+(ms/1000).toFixed(3)) + "s";
 }
 function humanizeConfig(c) {
-  const durs = ["timeout","modern_timeout","replace_cache_time","network_refresh"];
+  const durs = ["timeout","modern_timeout","replace_cache_time","network_refresh","doh3_quic_max_idle","doh3_quic_keepalive"];
   durs.forEach(k => { if (c[k]) c[k] = humanDur(c[k]); });
   if (c.cache && c.cache.ttl) c.cache.ttl = humanDur(c.cache.ttl);
   if (c.query_log && c.query_log.retention) c.query_log.retention = humanDur(c.query_log.retention);
@@ -2194,15 +2208,16 @@ document.addEventListener("click", async e => {
     return;
   }
 
-  /* 解析日志页工具条 */
+  /* 日志 / 统计页共享工具条 */
   const logAct = e.target.closest('[data-action^="log-"]');
   if (logAct) {
     const a = logAct.dataset.action;
-    if (a === "log-refresh") { loadLogs(); return; }
-    if (a === "log-reset") {
-      logState.q = ""; logState.action = ""; logState.qtype = ""; logState.start = ""; logState.end = "";
-      logState.page = 0;
-      renderQueryLogs();
+    if (a === "log-refresh") { refreshLogView(); return; }
+    if (a === "log-reset") { resetLogFilter(); return; }
+    if (a === "log-outer") {
+      /* 外网访问：来源类型=外网，并清空与之冲突的接入方式（FR-3） */
+      logState.source_kind = "outer"; logState.via = ""; logState.page = 0;
+      if (currentRoute().type === "stats") renderStats(); else renderQueryLogs();
       return;
     }
     if (a === "log-prev") { logState.page = Math.max(0, logState.page - 1); loadLogs(); return; }
@@ -2668,11 +2683,79 @@ const LOG_ACTIONS = [
   { v:"error", label:"错误" },
 ];
 const LOG_QTYPES = ["", "A", "AAAA", "CNAME", "NS", "MX", "TXT", "PTR", "SRV", "SOA", "CAA", "HTTPS", "OTHER"];
+const LOG_PROTOCOLS = ["", "UDP", "TCP", "DoT", "DoH", "DoH3"];
+const LOG_KINDS = [{ v:"", label:"全部来源类型" }, { v:"outer", label:"外网" }, { v:"inner", label:"内网" }, { v:"unknown", label:"未知" }];
+const LOG_VIAS = [{ v:"", label:"全部接入方式" }, { v:"proxy", label:"经代理" }, { v:"direct", label:"直连" }];
 const LOG_SRC_LABEL = {};
 LOG_ACTIONS.forEach(a => { LOG_SRC_LABEL[a.v] = a.label; });
+const LOG_KIND_LABEL = { outer:"外网", inner:"内网", unknown:"未知" };
+const LOG_VIA_LABEL = { proxy:"经代理", direct:"直连" };
+const LOG_ISP_LABEL = { telecom:"电信", unicom:"联通", cmcc:"移动", cernet:"教育网", chinabtn:"广电", gwbn:"长城宽带", other:"其他" };
+const LOG_ISPS = [{ v:"", label:"全部运营商" }].concat(
+  Object.keys(LOG_ISP_LABEL).map(k => ({ v:k, label:LOG_ISP_LABEL[k] })));
 /* LOG_QTYPES 仅用于筛选下拉，服务端按 dns.TypeToString 存字符串 */
-let logState = { q:"", action:"", qtype:"", start:"", end:"", page:0, limit:50, total:0, resp:null };
+/* 来源维度筛选条件由日志页与统计页共享，保证两页同口径（FR-3） */
+let logState = { q:"", action:"", qtype:"", start:"", end:"", client:"", protocol:"", source_kind:"", via:"", client_isp:"", page:0, limit:50, total:0, resp:null };
 let logDebounce = null;
+
+/* 客户端 IP / CIDR 前端校验（非法时提示且不发起查询，与后端 validateClientFilter 口径一致） */
+function logValidClient(v) {
+  v = (v || "").trim();
+  if (!v) return true;
+  let addr = v, bits = null;
+  const i = v.lastIndexOf("/");
+  if (i >= 0) {
+    addr = v.slice(0, i);
+    bits = v.slice(i + 1);
+    const isV6 = addr.indexOf(":") >= 0;
+    if (!/^\d{1,3}$/.test(bits) || Number(bits) > (isV6 ? 128 : 32)) return false;
+  }
+  if (addr.indexOf(":") >= 0) return /^[0-9a-fA-F:.]+$/.test(addr) && addr.split(":").length >= 3;
+  const p = addr.split(".");
+  return p.length === 4 && p.every(x => /^\d{1,3}$/.test(x) && Number(x) <= 255 && (x === "0" || x[0] !== "0"));
+}
+
+/* 共享筛选条：日志页与统计页复用同一组控件 id，改动即刷新当前页（FR-1/FR-2/FR-3） */
+function logFilterBar(refreshAction) {
+  const outer = logState.source_kind === "outer";
+  return `<div class="rules-toolbar">
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      <input type="text" id="log-q" placeholder="搜索域名 / 应答 / 客户端 / 列表 / DNS…" value="${esc(logState.q)}">
+    </div>
+    <select id="log-action" aria-label="来源路径筛选">${LOG_ACTIONS.map(a =>
+      `<option value="${a.v}"${logState.action===a.v?" selected":""}>${esc(a.label)}</option>`).join("")}</select>
+    <select id="log-qtype" aria-label="类型筛选">${LOG_QTYPES.map(t =>
+      `<option value="${t}"${logState.qtype===t?" selected":""}>${t || "全部类型"}</option>`).join("")}</select>
+    <select id="log-source-kind" aria-label="来源类型筛选">${LOG_KINDS.map(k =>
+      `<option value="${k.v}"${logState.source_kind===k.v?" selected":""}>${esc(k.label)}</option>`).join("")}</select>
+    <select id="log-protocol" aria-label="接入协议筛选">${LOG_PROTOCOLS.map(p =>
+      `<option value="${p}"${logState.protocol===p?" selected":""}>${p || "全部协议"}</option>`).join("")}</select>
+    <select id="log-via" aria-label="接入方式筛选">${LOG_VIAS.map(v =>
+      `<option value="${v.v}"${logState.via===v.v?" selected":""}>${esc(v.label)}</option>`).join("")}</select>
+    <select id="log-isp" aria-label="运营商筛选">${LOG_ISPS.map(s =>
+      `<option value="${s.v}"${logState.client_isp===s.v?" selected":""}>${esc(s.label)}</option>`).join("")}</select>
+    <input type="text" id="log-client" placeholder="客户端 IP / CIDR" value="${esc(logState.client)}" aria-label="客户端 IP 或网段">
+    <span class="field-err" id="log-client-err"></span>
+    <input type="datetime-local" id="log-start" value="${esc(logState.start)}" aria-label="开始时间">
+    <span style="color:var(--text-3)">~</span>
+    <input type="datetime-local" id="log-end" value="${esc(logState.end)}" aria-label="结束时间">
+    <button class="btn ${outer ? "btn-primary" : "btn-ghost"} small" data-action="log-outer">外网访问</button>
+    <button class="btn btn-ghost small" data-action="log-reset">重置</button>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost small" data-action="${refreshAction}">刷新</button>
+  </div>`;
+}
+
+/* 按当前路由决定刷新日志表还是统计（两页共享筛选条件） */
+function refreshLogView() {
+  if (currentRoute().type === "stats") loadStats(); else loadLogs();
+}
+/* 重置共享筛选条件后整页重渲染，使筛选条高亮同步还原 */
+function resetLogFilter() {
+  Object.assign(logState, { q:"", action:"", qtype:"", start:"", end:"", client:"", protocol:"", source_kind:"", via:"", client_isp:"", page:0 });
+  if (currentRoute().type === "stats") renderStats(); else renderQueryLogs();
+}
 
 function logFmtTime(ts) {
   const d = new Date(ts * 1000), p = n => String(n).padStart(2, "0");
@@ -2689,24 +2772,9 @@ function renderQueryLogs() {
   $("#view").innerHTML = `<div class="view-inner wide">
     <div class="page-head">
       <h1>解析日志</h1>
-      <p>每次查询走的路径：本地篡改 / 域名分流 / 缓存 / 全局上游 / 云 IP 替换 / 偏好拦截，含命中的列表、实际应答的 DNS 与解析模式、ECS 处理与最终结果。日志存于独立库，按「常规服务 → 日志」的保留策略自动清理。</p>
+      <p>每次查询走的路径：本地篡改 / 域名分流 / 缓存 / 全局上游 / 云 IP 替换 / 偏好拦截，并标注来源维度（来源类型、接入协议、接入方式、归一化客户端 IP 及运营商）。日志存于独立库，按「常规服务 → 日志」的保留策略自动清理。</p>
     </div>
-    <div class="rules-toolbar">
-      <div class="search">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        <input type="text" id="log-q" placeholder="搜索域名 / 应答 / 客户端 / 列表 / DNS…" value="${esc(logState.q)}">
-      </div>
-      <select id="log-action" aria-label="来源筛选">${LOG_ACTIONS.map(a =>
-        `<option value="${a.v}"${logState.action===a.v?" selected":""}>${esc(a.label)}</option>`).join("")}</select>
-      <select id="log-qtype" aria-label="类型筛选">${LOG_QTYPES.map(t =>
-        `<option value="${t}"${logState.qtype===t?" selected":""}>${t || "全部类型"}</option>`).join("")}</select>
-      <input type="datetime-local" id="log-start" value="${esc(logState.start)}" aria-label="开始时间">
-      <span style="color:var(--text-3)">~</span>
-      <input type="datetime-local" id="log-end" value="${esc(logState.end)}" aria-label="结束时间">
-      <button class="btn btn-ghost small" data-action="log-reset">重置</button>
-      <span class="spacer"></span>
-      <button class="btn btn-ghost small" data-action="log-refresh">刷新</button>
-    </div>
+    ${logFilterBar("log-refresh")}
     <div id="log-table"></div>
   </div>`;
   updateChrome();
@@ -2721,6 +2789,11 @@ async function loadLogs() {
   if (logState.q) p.set("q", logState.q);
   if (logState.action) p.set("action", logState.action);
   if (logState.qtype) p.set("qtype", logState.qtype);
+  if (logState.client) p.set("client", logState.client);
+  if (logState.protocol) p.set("protocol", logState.protocol);
+  if (logState.source_kind) p.set("source_kind", logState.source_kind);
+  if (logState.via) p.set("via", logState.via);
+  if (logState.client_isp) p.set("client_isp", logState.client_isp);
   if (logState.start) p.set("start", logState.start);
   /* datetime-local 精确到分钟：结束时间补到该分钟末尾，避免漏掉当分钟的记录 */
   if (logState.end) p.set("end", logState.end.length === 16 ? logState.end + ":59" : logState.end);
@@ -2741,12 +2814,14 @@ function renderLogTable() {
   const box = $("#log-table"), r = logState.resp;
   if (!box || !r) return;
   const logs = r.logs || [];
-  const filtered = !!(logState.q || logState.action || logState.qtype || logState.start || logState.end);
+  const filtered = !!(logState.q || logState.action || logState.qtype || logState.start || logState.end || logState.client || logState.protocol || logState.source_kind || logState.via);
 
   if (!logs.length) {
     box.innerHTML = `<div class="table-wrap"><div class="empty">
       <div class="big">${filtered ? "没有匹配的日志" : "暂无解析日志"}</div>
-      <div class="sub">${filtered ? "试试调整关键词、来源或时间区间。"
+      <div class="sub">${filtered ? (logState.source_kind === "outer"
+          ? "当前无外网（公网客户端）请求，或与其它筛选条件叠加后无命中。"
+          : "试试调整关键词、来源或时间区间。")
         : "产生查询后，这里会显示每次解析的路径与结果；可在「常规服务 → 日志」里开关与调整保留策略。"}</div>
     </div></div>`;
     return;
@@ -2755,6 +2830,15 @@ function renderLogTable() {
   const tbody = logs.map(e => {
     const strat = (e.list_name ? `<span class="log-list-name">${esc(e.list_name)}</span>` : "")
       + (e.dns_mode ? ` <span class="mode-badge">${e.dns_mode === "failover" ? "串行" : "竞速"}</span>` : "");
+    const isp = e.client_isp ? `<span class="isp-tag">${esc(LOG_ISP_LABEL[e.client_isp] || e.client_isp)}</span>` : "";
+    const srcCell = `<div class="src-block">
+      <div class="ip-line">${e.client ? rv(e.client, "mono") : '<span style="color:var(--text-3)">—</span>'}${isp}</div>
+      <div class="tags">
+        <span class="kind ${esc(e.source_kind || "unknown")}">${esc(LOG_KIND_LABEL[e.source_kind] || "未知")}</span>
+        ${e.protocol ? `<span class="via-tag">${esc(e.protocol)}</span>` : ""}
+        <span class="via-tag">${esc(LOG_VIA_LABEL[e.via] || "—")}</span>
+      </div>
+    </div>`;
     return `<tr>
       <td class="mono" data-label="时间">${logFmtTime(e.time)}</td>
       <td class="mono" data-label="域名">${rv(e.domain)}</td>
@@ -2766,7 +2850,7 @@ function renderLogTable() {
       <td data-label="上游">${e.dns ? rv(e.dns, "mono") : '<span style="color:var(--text-3)">—</span>'}
         ${e.ecs ? `<div class="help">${rv(e.ecs)}</div>` : ""}</td>
       <td data-label="耗时">${e.elapsed_ms} ms</td>
-      <td class="mono" data-label="客户端">${rv(e.client || "")}</td>
+      <td data-label="来源明细">${srcCell}</td>
     </tr>`;
   }).join("");
 
@@ -2780,9 +2864,9 @@ function renderLogTable() {
   box.innerHTML = `<div class="table-wrap">
       <table class="rules log-table">
         <thead><tr>
-          <th style="width:13.5%">时间</th><th style="width:17%">域名</th><th style="width:6%">类型</th>
-          <th style="width:7.5%">来源</th><th style="width:9.5%">分流策略</th><th>结果</th>
-          <th style="width:11%">上游 / ECS</th><th style="width:6.5%">耗时</th><th style="width:8.5%">客户端</th>
+          <th style="width:12.5%">时间</th><th style="width:15%">域名</th><th style="width:5.5%">类型</th>
+          <th style="width:7.5%">来源</th><th style="width:9%">分流策略</th><th>结果</th>
+          <th style="width:10%">上游 / ECS</th><th style="width:6%">耗时</th><th style="width:14%">来源明细</th>
         </tr></thead>
         <tbody>${tbody}</tbody>
       </table>
@@ -2803,13 +2887,21 @@ function syncCertInput(el) {
 }
 
 function syncLogInput(el) {
-  const map = { "log-q":"q", "log-action":"action", "log-qtype":"qtype", "log-start":"start", "log-end":"end" };
+  const map = { "log-q":"q", "log-action":"action", "log-qtype":"qtype", "log-start":"start", "log-end":"end",
+    "log-client":"client", "log-protocol":"protocol", "log-source-kind":"source_kind", "log-via":"via", "log-isp":"client_isp" };
   const key = map[el.id];
   if (!key) return;
+  if (key === "client") {
+    const ok = logValidClient(el.value);
+    const err = $("#log-client-err");
+    el.classList.toggle("invalid", !ok);
+    if (err) { err.classList.toggle("show", !ok); err.textContent = ok ? "" : "IP / CIDR 无效"; }
+    if (!ok) return; /* 非法输入不发起查询（FR-1） */
+  }
   logState[key] = el.value;
   logState.page = 0;
-  if (el.id === "log-q") { clearTimeout(logDebounce); logDebounce = setTimeout(loadLogs, 300); }
-  else loadLogs();
+  if (el.id === "log-q") { clearTimeout(logDebounce); logDebounce = setTimeout(refreshLogView, 300); }
+  else refreshLogView();
 }
 
 /* ================= 统计报表页 ================= */
@@ -2820,12 +2912,9 @@ function renderStats() {
   $("#view").innerHTML = `<div class="view-inner wide">
     <div class="page-head">
       <h1>统计报表</h1>
-      <p>按解析日志库当前保留期内的全部记录聚合，<b>日志有多少就统计多少</b>，不设条数上限。统计窗口取决于「常规服务 → 日志」的保留时长与条数上限，超出保留期的日志被清理后即不再计入。平均耗时一律剔除超时记录（耗时 ≥ 查询超时阈值），超时单独计入「超时」。</p>
+      <p>按解析日志库当前保留期内的全部记录聚合，<b>日志有多少就统计多少</b>，不设条数上限。筛选条件与解析日志页<b>同口径共享</b>（来源类型 / 接入协议 / 接入方式 / 运营商 / 客户端 IP / 域名关键字 / 时间区间），切换页面时保持一致。平均耗时一律剔除超时记录（耗时 ≥ 查询超时阈值），超时单独计入「超时」。</p>
     </div>
-    <div class="rules-toolbar">
-      <span class="spacer"></span>
-      <button class="btn btn-ghost small" data-action="stat-refresh">刷新</button>
-    </div>
+    ${logFilterBar("stat-refresh")}
     <div id="stat-body"></div>
   </div>`;
   updateChrome();
@@ -2837,8 +2926,21 @@ async function loadStats() {
   if (!box) return;
   box.innerHTML = `<div class="table-wrap"><div class="empty">
     <div class="big">统计中…</div><div class="sub">正在聚合库内全部记录</div></div></div>`;
+  /* 与日志页共享同一组来源筛选条件（FR-2/FR-3） */
+  const p = new URLSearchParams();
+  if (logState.q) p.set("q", logState.q);
+  if (logState.action) p.set("action", logState.action);
+  if (logState.qtype) p.set("qtype", logState.qtype);
+  if (logState.client) p.set("client", logState.client);
+  if (logState.protocol) p.set("protocol", logState.protocol);
+  if (logState.source_kind) p.set("source_kind", logState.source_kind);
+  if (logState.via) p.set("via", logState.via);
+  if (logState.client_isp) p.set("client_isp", logState.client_isp);
+  if (logState.start) p.set("start", logState.start);
+  if (logState.end) p.set("end", logState.end.length === 16 ? logState.end + ":59" : logState.end);
+  const qs = p.toString();
   try {
-    statState.resp = await api("GET", "/api/logs/stats");
+    statState.resp = await api("GET", "/api/logs/stats" + (qs ? "?" + qs : ""));
     renderStatBody();
   } catch (e) {
     box.innerHTML = `<div class="table-wrap"><div class="empty">
@@ -2890,10 +2992,14 @@ function renderStatBody() {
   const s = r.summary || {}, st = r.stats || {}, total = s.total || 0;
 
   if (!total) {
+    const hasFilter = !!(logState.q || logState.action || logState.qtype || logState.client || logState.protocol || logState.source_kind || logState.via || logState.start || logState.end);
+    const sub = st.enabled === false ? "解析日志记录已关闭，开启并产生查询后这里会有数据。"
+      : logState.source_kind === "outer" ? "当前无外网（公网客户端）请求，或与其它筛选条件叠加后无命中。"
+      : hasFilter ? "当前筛选条件下无数据，试试放宽来源类型 / 接入协议 / 时间区间。"
+      : "产生查询后，这里会按来源、分流列表、域名等维度汇总；可在「常规服务 → 日志」调整保留策略。";
     box.innerHTML = `<div class="table-wrap"><div class="empty">
       <div class="big">暂无统计数据</div>
-      <div class="sub">${st.enabled === false ? "解析日志记录已关闭，开启并产生查询后这里会有数据。"
-        : "产生查询后，这里会按来源、分流列表、域名等维度汇总；可在「常规服务 → 日志」调整保留策略。"}</div>
+      <div class="sub">${sub}</div>
     </div></div>`;
     return;
   }
@@ -2915,7 +3021,50 @@ function renderStatBody() {
     ${st.queued ? ` · 待落库 ${st.queued} 条` : ""}
     · 保留策略 ${statDur(st.retention_seconds)} / 上限 ${st.max_rows ?? "—"} 条</div>`;
 
-  /* 2. 来源分布（表尾追加「超时」行：跨来源统计，不参与上方各行平均耗时） */
+  /* 2. 来源与协议（FR-2）：来源类型 / 接入协议 / 接入方式占比与明细 */
+  const kindRow = s.by_source_kind || [], protoRow = s.by_protocol || [], viaRow = s.by_via || [];
+  const kindCount = k => (kindRow.find(r => (r.key || "") === k) || {}).count || 0;
+  const unknownKind = kindRow.filter(r => r.key !== "outer" && r.key !== "inner").reduce((a, r) => a + r.count, 0);
+  const kindCls = k => (k === "outer" ? "outer" : k === "inner" ? "inner" : "unknown");
+  const kindCards = `<div class="stat-grid">
+    ${statCard("外网", kindCount("outer"), `占 ${statPct(kindCount("outer"), total)} · 公网客户端`)}
+    ${statCard("内网", kindCount("inner"), `占 ${statPct(kindCount("inner"), total)} · 10.0.0.0/24`)}
+    ${statCard("未知", unknownKind, `占 ${statPct(unknownKind, total)} · 含旧数据 / IP 缺失`, true)}
+  </div>`;
+  const kindHTML = statGroupTable(kindRow, total, "无来源类型数据",
+    k => `<span class="kind ${kindCls(k)}">${esc(LOG_KIND_LABEL[k] || "未知")}</span>`, "来源类型");
+  const protoHTML = statGroupTable(protoRow, total, "无接入协议数据",
+    k => `<span class="via-tag">${esc(k || "—")}</span>`, "接入协议");
+  const viaHTML = statGroupTable(viaRow, total, "无接入方式数据",
+    k => `<span class="via-tag">${esc(LOG_VIA_LABEL[k] || k || "—")}</span>`, "接入方式");
+  const sourceHTML = kindCards + `<div style="height:14px"></div>` + kindHTML
+    + `<div style="height:14px"></div>` + protoHTML
+    + `<div style="height:14px"></div>` + viaHTML;
+
+  /* 3. Top 客户端来源（FR-2/FR-3）：按客户端 IP 聚合，附运营商归属 */
+  const topClients = s.top_clients || [];
+  const topClientHTML = !topClients.length
+    ? `<div class="empty" style="padding:26px 0"><div class="sub">保留期内没有可归属的客户端 IP 记录</div></div>`
+    : (() => {
+      const max = Math.max(...topClients.map(c => c.count));
+      const tr = topClients.map(c => `<tr>
+        <td class="mono">${rv(c.client, "mono")}</td>
+        <td>${c.isp ? `<span class="isp-tag">${esc(LOG_ISP_LABEL[c.isp] || c.isp)}</span>` : '<span style="color:var(--text-3)">—</span>'}</td>
+        <td><span class="kind ${kindCls(c.source_kind)}">${esc(LOG_KIND_LABEL[c.source_kind] || "未知")}</span></td>
+        <td class="mono">${c.count}</td>
+        <td class="mono">${statPct(c.count, total)}</td>
+        <td style="width:18%">${statBar(c.count, max)}</td>
+        <td class="mono">${statMs(c.avg_elapsed_ms)}</td>
+        <td><span class="src ${esc(c.action)}">${esc(LOG_SRC_LABEL[c.action] || c.action || "—")}</span></td>
+      </tr>`).join("");
+      return `<table class="rules log-table"><thead><tr>
+        <th style="width:15%">客户端 IP</th><th style="width:9%">运营商</th><th style="width:8%">来源类型</th>
+        <th style="width:9%">次数</th><th style="width:9%">占比</th><th style="width:18%">分布</th>
+        <th style="width:11%">平均耗时</th><th>主要来源路径</th>
+      </tr></thead><tbody>${tr}</tbody></table>`;
+    })();
+
+  /* 4. 来源分布（表尾追加「超时」行：跨来源统计，不参与上方各行平均耗时） */
   const actionRows = s.by_action || [];
   const timeoutRow = s.timeouts ? `<tr>
     <td><span class="src timeout">超时</span></td>
@@ -2927,7 +3076,7 @@ function renderStatBody() {
   const actionHTML = statGroupTable(actionRows, total, "无来源数据",
     k => `<span class="src ${esc(k)}">${esc(LOG_SRC_LABEL[k] || k)}</span>`, "来源", timeoutRow);
 
-  /* 3. 分流列表命中明细 */
+  /* 5. 分流列表命中明细 */
   const lists = s.by_list || [];
   let listHTML;
   if (!lists.length) {
@@ -2949,7 +3098,7 @@ function renderStatBody() {
     </tr></thead><tbody>${tr}</tbody></table>`;
   }
 
-  /* 4. Top 域名 */
+  /* 6. Top 域名 */
   const tops = s.top_domains || [];
   const topHTML = !tops.length ? `<div class="empty" style="padding:26px 0"><div class="sub">暂无数据</div></div>`
     : (() => {
@@ -2969,7 +3118,7 @@ function renderStatBody() {
       </tr></thead><tbody>${tr}</tbody></table>`;
     })();
 
-  /* 5. 按天趋势 */
+  /* 7. 按天趋势 */
   const days = s.by_day || [];
   const dayMax = Math.max(1, ...days.map(d => d.count));
   const dayHTML = days.length ? `<div class="day-chart">${days.map(d => `<div class="day-col" title="${esc(d.day)}：${d.count} 条">
@@ -2978,13 +3127,15 @@ function renderStatBody() {
       <span class="lbl">${esc(d.day.slice(5))}</span>
     </div>`).join("")}</div>` : `<div class="empty" style="padding:26px 0"><div class="sub">暂无数据</div></div>`;
 
-  /* 6. 结果与类型分布 */
+  /* 8. 结果与类型分布 */
   const rcodeHTML = statGroupTable(s.by_rcode || [], total, "无数据",
     k => `<span class="log-rcode ${logRcodeClass(k)}">${esc(k || "—")}</span>`, "结果");
   const qtypeHTML = statGroupTable(s.by_qtype || [], total, "无数据",
     k => `<span class="qtype ${esc(k)}">${esc(k)}</span>`, "类型");
 
   box.innerHTML = overview
+    + statSection("来源与协议", "来源类型=客户端 IP 性质（外网 / 内网 / 未知）；接入协议=请求到达本服务的传输方式；接入方式=客户端 IP 取自前置代理请求头（经代理）还是连接对端（直连）。占比分母为当前筛选窗口内的总查询数；平均耗时已剔除超时记录。", sourceHTML)
+    + statSection("Top 客户端来源", "按客户端 IP 聚合查询量最高的来源，附运营商归属（未识别显示 —）与主要来源路径；平均耗时已剔除超时记录。", topClientHTML)
     + statSection("来源分布", "每次查询最终走的路径。分流=命中域名分流列表；偏好拦截=被 A/AAAA 偏好策略置空。表尾「超时」行跨来源统计（耗时达超时阈值），已从各行平均耗时中剔除。", actionHTML)
     + statSection("分流列表命中明细", "按分流列表聚合命中次数，来源构成显示该列表内的路径占比；平均耗时已剔除超时记录。", listHTML)
     + statSection("Top 域名", "保留期内查询量最高的域名及其主导来源、命中的分流列表；平均耗时已剔除超时记录。", topHTML)

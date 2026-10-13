@@ -618,8 +618,8 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 					"qtype":  dns.TypeToString[q.Qtype],
 				})
 				h.sendErrorResponse(w, req, dns.RcodeServerFailure)
-				h.recordQuery(querylog.Entry{
-					Domain: domain, QType: dns.TypeToString[q.Qtype], Client: clientAddr(w),
+				h.recordQuery(w, querylog.Entry{
+					Domain: domain, QType: dns.TypeToString[q.Qtype],
 					Action: querylog.ActionError, Rcode: "SERVFAIL", Answers: "篡改记录全部无效",
 				})
 				return
@@ -632,8 +632,8 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 				"client_addr": w.RemoteAddr().String(),
 				"records":     len(overrideResp.Answer),
 			})
-			h.recordQuery(querylog.Entry{
-				Domain: domain, QType: dns.TypeToString[q.Qtype], Client: clientAddr(w),
+			h.recordQuery(w, querylog.Entry{
+				Domain: domain, QType: dns.TypeToString[q.Qtype],
 				Action: querylog.ActionOverride, Rcode: dns.RcodeToString[overrideResp.Rcode],
 				Answers: answersSummary(overrideResp),
 			})
@@ -649,8 +649,8 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			"qtype":       dns.TypeToString[q.Qtype],
 			"client_addr": w.RemoteAddr().String(),
 		})
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[q.Qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[q.Qtype],
 			Action: querylog.ActionOverride, Rcode: dns.RcodeToString[dns.RcodeSuccess],
 			Answers: "NODATA（域名已篡改，无该类型记录）",
 		})
@@ -665,16 +665,16 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, q.Qtype)
 		if !hit {
 			h.sendErrorResponse(w, req, dns.RcodeRefused)
-			h.recordQuery(querylog.Entry{
-				Domain: domain, QType: dns.TypeToString[q.Qtype], Client: clientAddr(w),
+			h.recordQuery(w, querylog.Entry{
+				Domain: domain, QType: dns.TypeToString[q.Qtype],
 				Action: querylog.ActionRefused, Rcode: dns.RcodeToString[dns.RcodeRefused],
 				Answers: "RD=0 且缓存未命中",
 			})
 			return
 		}
 		h.writeResponse(w, req, resp)
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[q.Qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[q.Qtype],
 			Action: querylog.ActionCache, Rcode: dns.RcodeToString[resp.Rcode],
 			Answers: answersSummary(resp),
 		})
@@ -714,8 +714,8 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 			"client_addr": w.RemoteAddr().String(),
 			"source":      "cache_non_ip",
 		})
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionCache, Rcode: dns.RcodeToString[resp.Rcode],
 			Answers: answersSummary(resp), ElapsedMS: time.Since(start).Milliseconds(),
 		})
@@ -735,8 +735,8 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 			"error":       err,
 		})
 		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, Rcode: "SERVFAIL",
 			Answers: "上游查询失败", ElapsedMS: time.Since(start).Milliseconds(),
 		})
@@ -752,8 +752,8 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 			"rcode":       dns.RcodeToString[resp.Rcode],
 		})
 		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, Rcode: "SERVFAIL",
 			Answers: "上游响应无效: " + dns.RcodeToString[resp.Rcode], ElapsedMS: time.Since(start).Milliseconds(),
 		})
@@ -774,8 +774,8 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	})
 
 	action, listName, mode := splitLogFields(decision)
-	h.recordQuery(querylog.Entry{
-		Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+	h.recordQuery(w, querylog.Entry{
+		Domain: domain, QType: dns.TypeToString[qtype],
 		Action: action, ListName: listName, DNS: server, DNSMode: mode,
 		Rcode: dns.RcodeToString[resp.Rcode], Answers: answersSummary(resp),
 		ElapsedMS: time.Since(start).Milliseconds(),
@@ -806,8 +806,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 					"source":      "cache_cloud",
 					"total_time":  totalTime,
 				})
-				h.recordQuery(querylog.Entry{
-					Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+				h.recordQuery(w, querylog.Entry{
+					Domain: domain, QType: dns.TypeToString[qtype],
 					Action: querylog.ActionCache, Rcode: dns.RcodeToString[cloudResp.Rcode],
 					Answers: answersSummary(cloudResp), ElapsedMS: totalTime.Milliseconds(),
 				})
@@ -824,8 +824,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				"source":      "cache_normal",
 				"total_time":  totalTime,
 			})
-			h.recordQuery(querylog.Entry{
-				Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+			h.recordQuery(w, querylog.Entry{
+				Domain: domain, QType: dns.TypeToString[qtype],
 				Action: querylog.ActionCache, Rcode: dns.RcodeToString[resp.Rcode],
 				Answers: answersSummary(resp), ElapsedMS: totalTime.Milliseconds(),
 			})
@@ -856,8 +856,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"upstream_time": upstreamTime,
 		})
 		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, ListName: decision.ListName, DNSMode: decision.DNSMode,
 			ECS: ecs, Rcode: "SERVFAIL", Answers: "上游查询失败", ElapsedMS: totalTime.Milliseconds(),
 		})
@@ -918,8 +918,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"total_time":    totalTime,
 			"upstream_time": upstreamTime,
 		})
-		h.recordQuery(querylog.Entry{
-			Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionCloud, ListName: decision.ListName, DNS: server, DNSMode: decision.DNSMode,
 			ECS: ecs, Rcode: rcodeName(finalResp), Answers: answersSummary(finalResp),
 			ElapsedMS: totalTime.Milliseconds(),
@@ -955,8 +955,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 	// 记录解析日志：命中的分流列表、实际应答的上游、解析模式与最终结果
 	action, listName, mode := splitLogFields(decision)
-	h.recordQuery(querylog.Entry{
-		Domain: domain, QType: dns.TypeToString[qtype], Client: clientAddr(w),
+	h.recordQuery(w, querylog.Entry{
+		Domain: domain, QType: dns.TypeToString[qtype],
 		Action: action, ListName: listName, DNS: server, DNSMode: mode,
 		ECS: ecs, Rcode: rcodeName(resp), Answers: answersSummary(resp),
 		ElapsedMS: totalTime.Milliseconds(),

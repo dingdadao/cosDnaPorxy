@@ -7,9 +7,53 @@ import (
 	"strings"
 
 	"cosDnaPorxy/internal/config"
+	"cosDnaPorxy/internal/querylog"
 
 	"github.com/miekg/dns"
 )
+
+// logSource 派生日志来源维度：归一化客户端 IP、来源类型、接入方式与运营商归属。
+//   - 客户端 IP：统一取 IP 主机部分（经代理为公网 IP，直连剥离端口）
+//   - 来源类型：IP 为公网地址记外网，否则记内网（含固定内网段 10.0.0.0/24、回环、
+//     其它私网、链路本地、未指定等非公网地址）；IP 缺失记未知
+//   - 接入方式：IP 取自请求头记经代理，取自连接对端/静态映射记直连
+//   - 运营商：按运营商段库匹配，未命中或未启用记空串
+func (h *RefactoredHandler) logSource(w dns.ResponseWriter) (clientIP, kind, via, isp string) {
+	ip, source := h.ResolveClientIP(w)
+	via = querylog.ViaDirect
+	if source == "header" {
+		via = querylog.ViaProxy
+	}
+	if !ip.IsValid() {
+		return "", querylog.SourceUnknown, via, ""
+	}
+	clientIP = ip.String()
+	if isPublicIP(ip) {
+		kind = querylog.SourceOuter
+	} else {
+		kind = querylog.SourceInner
+	}
+	if h.ispDB != nil {
+		if v, ok := h.ispDB.Lookup(ip); ok {
+			isp = string(v)
+		}
+	}
+	return clientIP, kind, via, isp
+}
+
+// isPublicIP 判定客户端地址是否为公网可路由地址。
+// 回环、私网（含 10/8、172.16/12、192.168/16、fc00::/7）、链路本地、组播与未指定
+// 均视为非公网，归入内网，避免 127.0.0.1 之类被误判为外网。
+func isPublicIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	return true
+}
 
 // clientInfo 包装 ResponseWriter 携带已解析的客户端信息
 type clientInfo struct {

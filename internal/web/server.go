@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -309,7 +311,8 @@ func (s *Server) handleRefreshSplitList(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleQueryLogs 按条件分页查询解析日志
-// 参数：q（关键字）、action（来源）、qtype、start/end（Unix 秒或本地时间）、limit、offset
+// 参数：q（关键字）、action（来源路径）、qtype、client（精确 IP/CIDR）、protocol（接入协议）、
+// source_kind（来源类型）、via（接入方式）、start/end（Unix 秒或本地时间）、limit、offset
 func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 	if s.queryLog == nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("解析日志库不可用"))
@@ -317,18 +320,9 @@ func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	f := querylog.Filter{
-		Keyword: strings.TrimSpace(q.Get("q")),
-		Action:  strings.TrimSpace(q.Get("action")),
-		QType:   strings.ToUpper(strings.TrimSpace(q.Get("qtype"))),
-	}
-	var err error
-	if f.Start, err = parseTimeParam(q.Get("start")); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("start 参数无效: %w", err))
-		return
-	}
-	if f.End, err = parseTimeParam(q.Get("end")); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("end 参数无效: %w", err))
+	f, err := parseLogFilter(q)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	f.Limit = parsePositiveInt(q.Get("limit"), 100)
@@ -349,7 +343,8 @@ func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleQueryLogStats 解析日志聚合统计（窗口默认保留期内全部记录，不设条数上限）
-// 参数：start/end（Unix 秒或本地时间）、top（Top 域名条数，默认 20，上限 100）
+// 参数：与日志页同口径的来源筛选条件（q/action/qtype/client/protocol/source_kind/via/start/end），
+// top（Top 域名与 Top 客户端来源条数，默认 20，上限 100）
 func (s *Server) handleQueryLogStats(w http.ResponseWriter, r *http.Request) {
 	if s.queryLog == nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("解析日志库不可用"))
@@ -357,14 +352,9 @@ func (s *Server) handleQueryLogStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	var f querylog.Filter
-	var err error
-	if f.Start, err = parseTimeParam(q.Get("start")); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("start 参数无效: %w", err))
-		return
-	}
-	if f.End, err = parseTimeParam(q.Get("end")); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("end 参数无效: %w", err))
+	f, err := parseLogFilter(q)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -377,6 +367,62 @@ func (s *Server) handleQueryLogStats(w http.ResponseWriter, r *http.Request) {
 		"summary": summary,
 		"stats":   s.queryLog.Stats(),
 	})
+}
+
+// parseLogFilter 解析日志页与统计页共用的筛选条件（两页口径一致）
+func parseLogFilter(v url.Values) (querylog.Filter, error) {
+	f := querylog.Filter{
+		Keyword:    strings.TrimSpace(v.Get("q")),
+		Action:     strings.TrimSpace(v.Get("action")),
+		QType:      strings.ToUpper(strings.TrimSpace(v.Get("qtype"))),
+		Client:     strings.TrimSpace(v.Get("client")),
+		Protocol:   normalizeProtocol(v.Get("protocol")),
+		SourceKind: strings.ToLower(strings.TrimSpace(v.Get("source_kind"))),
+		Via:        strings.ToLower(strings.TrimSpace(v.Get("via"))),
+		ClientISP:  strings.ToLower(strings.TrimSpace(v.Get("client_isp"))),
+	}
+	if err := validateClientFilter(f.Client); err != nil {
+		return f, err
+	}
+	var err error
+	if f.Start, err = parseTimeParam(v.Get("start")); err != nil {
+		return f, fmt.Errorf("start 参数无效: %w", err)
+	}
+	if f.End, err = parseTimeParam(v.Get("end")); err != nil {
+		return f, fmt.Errorf("end 参数无效: %w", err)
+	}
+	return f, nil
+}
+
+// normalizeProtocol 归一化接入协议取值（大小写不敏感），无法识别时原样返回
+func normalizeProtocol(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, p := range []string{querylog.ProtoUDP, querylog.ProtoTCP, querylog.ProtoDoT, querylog.ProtoDoH, querylog.ProtoDoH3} {
+		if strings.EqualFold(s, p) {
+			return p
+		}
+	}
+	return s
+}
+
+// validateClientFilter 校验客户端筛选：空串不限；否则必须是合法 IP 或 CIDR 网段
+func validateClientFilter(c string) error {
+	if c == "" {
+		return nil
+	}
+	if strings.Contains(c, "/") {
+		if _, err := netip.ParsePrefix(c); err != nil {
+			return fmt.Errorf("客户端 CIDR 网段无效: %s", c)
+		}
+		return nil
+	}
+	if _, err := netip.ParseAddr(c); err != nil {
+		return fmt.Errorf("客户端 IP 无效: %s", c)
+	}
+	return nil
 }
 
 // resolveTimeoutMS 统计页「超时」判定阈值（毫秒）：取配置中较宽松的查询超时

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"cosDnaPorxy/internal/querylog"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
@@ -64,7 +65,7 @@ func (s *DoTServer) Start() error {
 
 	s.server = &dns.Server{
 		Listener: ln,
-		Handler:  s.handler,
+		Handler:  protocolTagHandler{proto: querylog.ProtoDoT, next: s.handler},
 		Net:      "tcp-tls",
 	}
 

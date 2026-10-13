@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"cosDnaPorxy/internal/querylog"
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/quic-go/quic-go"
@@ -66,7 +67,7 @@ func (s *DoH3Server) Start() error {
 	}
 	s.conn = conn
 
-	handler := newDoHHandler(s.path, "", s.handler)
+	handler := newDoHHandler(s.path, "", querylog.ProtoDoH3, s.handler)
 	s.server = &http3.Server{
 		Addr:      s.addr,
 		Handler:   handler,
