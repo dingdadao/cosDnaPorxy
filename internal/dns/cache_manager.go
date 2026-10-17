@@ -145,6 +145,20 @@ func (cm *CacheManager) GetScoped(scope, domain string, qtype uint16) (*dns.Msg,
 	return resp, hit, isCloud, cloudType
 }
 
+// GetServeScoped 命中快路径：返回预打包字节，供处理器直接打补丁写出。
+// 仅在「未过期 + 非云条目 + 有可用预打包字节」时返回 true；
+// 云条目、过期陈旧响应、打包失败一律返回 false，由调用方回退到 GetScoped 的重建路径。
+func (cm *CacheManager) GetServeScoped(scope, domain string, qtype uint16) (Serve, bool) {
+	timer := cm.logger.StartTimer("cache_get", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+		"scope":  scope,
+	})
+	defer timer.End()
+
+	return cm.cache.GetServe(scope, domain, qtype)
+}
+
 // GetCloudResponse 获取云域名的替换响应缓存（默认 scope "-"）
 func (cm *CacheManager) GetCloudResponse(domain string, qtype uint16) (*dns.Msg, bool, int) {
 	return cm.GetCloudResponseScoped("-", domain, qtype)
@@ -553,28 +567,15 @@ func (cm *CacheManager) shouldRefresh(domain string, qtype uint16) bool {
 
 // shouldRefreshOnDemand 检查是否应该按需刷新（缓存已过期）
 func (cm *CacheManager) shouldRefreshOnDemand(domain string, qtype uint16) bool {
-	// 检查缓存是否已过期
-	_, hit, _, _ := cm.cache.Get("-", domain, qtype)
+	// 直接看过期时间即可：存在且已过期才需要按需刷新（省掉多余的响应反解）
+	expireAt := cm.cache.GetExpireTime("-", domain, qtype)
+	shouldRefresh := !expireAt.IsZero() && time.Until(expireAt) <= 0
 
-	// 只有当缓存命中且已过期时才需要按需刷新
-	shouldRefresh := false
-	if hit {
-		// 检查缓存项是否已过期（使用微小的正数作为阈值，以捕获已过期或即将过期的条目）
-		// 当remainingTTL <= 0时，ShouldRefreshWithThreshold返回false，所以我们需要特殊处理
-		_, exists, _, _ := cm.cache.Get("-", domain, qtype)
-		if exists {
-			// 直接检查是否已过期
-			remainingTTL := time.Until(cm.cache.GetExpireTime("-", domain, qtype))
-			shouldRefresh = remainingTTL <= 0
-		}
-	}
-
-	// 添加调试日志
 	cm.logger.Debug("🔍 shouldRefreshOnDemand检查", map[string]interface{}{
 		"domain":         domain,
 		"qtype":          dns.TypeToString[qtype],
 		"should_refresh": shouldRefresh,
-		"hit":            hit,
+		"hit":            !expireAt.IsZero(),
 		"async_enabled":  true, // 异步刷新默认启用
 	})
 

@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"encoding/binary"
 	"sort"
 	"strings"
 	"sync"
@@ -13,15 +14,49 @@ import (
 
 // CacheEntry 缓存条目
 type CacheEntry struct {
-	Response         *dns.Msg
 	ExpireAt         time.Time
 	StoredAt         time.Time     // 写入缓存的时间，用于命中时递减TTL（RFC 1035 §4.3.1）
 	IsCloud          bool          // 标记是否为云服务域名
 	CloudType        int           // 云服务类型（0-无，1-Cloudflare，2-AWS）
 	CloudResponse    *dns.Msg      // 云域名的替换响应缓存
 	RefreshThreshold time.Duration // 异步刷新阈值
-	LastAccess       time.Time
+	lastAccess       atomic.Int64  // 最后访问时间（UnixNano）：命中路径原子写，避免抢分片写锁
+	wire             []byte        // 预打包响应字节（已剔除OPT、已压缩），命中时直接打补丁写出
+	wmeta            wireMeta      // wire 的补丁元信息；wire 无效时为 ok=false
+
+	// 以下为普通（非云）条目的预计算结果：命中快路径的日志与统计需要，避免每次从 wire 反解
+	rcode       int    // 响应 RCODE
+	answers     string // 预计算的 answersSummary
+	answerCount int    // Answer 段记录数
+	ipv4Count   int    // Answer 段 A 记录数
+	ipv6Count   int    // Answer 段 AAAA 记录数
+
+	// Response 仅作为 buildWire 失败（极少数不可预打包响应）时的兜底对象树，正常条目为 nil
+	Response *dns.Msg
 }
+
+// ttlField 一个 RR 的 TTL 字段在 wire 中的偏移及其写入缓存时的原始值
+type ttlField struct {
+	off uint16
+	ttl uint32
+}
+
+// wireMeta 预打包响应的补丁元信息
+type wireMeta struct {
+	ok       bool       // 扫描成功才可用于直写
+	qnameOff int        // Question 段 NAME 的起始偏移
+	qnameLen int        // Question 段 NAME 的编码长度（含结尾的 0x00）
+	ttls     []ttlField // 全部 RR（Answer/Ns/Extra）的 TTL 字段位置
+}
+
+// touch 记录一次访问（原子写，命中路径无需持锁）
+func (e *CacheEntry) touch() { e.touchAt(time.Now()) }
+
+// touchAt 用给定时刻记录一次访问
+func (e *CacheEntry) touchAt(t time.Time) { e.lastAccess.Store(t.UnixNano()) }
+
+// lastAccessTime 读取最后访问时间
+func (e *CacheEntry) lastAccessTime() time.Time { return time.Unix(0, e.lastAccess.Load()) }
 
 // CacheShard 缓存分片
 type CacheShard struct {
@@ -56,12 +91,19 @@ func (p *CacheEntryPool) Put(entry *CacheEntry) {
 	// 重置字段
 	entry.Response = nil
 	entry.CloudResponse = nil
+	entry.wire = nil
+	entry.wmeta = wireMeta{}
+	entry.rcode = 0
+	entry.answers = ""
+	entry.answerCount = 0
+	entry.ipv4Count = 0
+	entry.ipv6Count = 0
 	entry.ExpireAt = time.Time{}
 	entry.StoredAt = time.Time{}
 	entry.IsCloud = false
 	entry.CloudType = 0
 	entry.RefreshThreshold = 0
-	entry.LastAccess = time.Time{}
+	entry.lastAccess.Store(0)
 	p.pool.Put(entry)
 }
 
@@ -163,6 +205,214 @@ func decrementTTLs(msg *dns.Msg, elapsed time.Duration) {
 	dec(msg.Extra)
 }
 
+// buildWire 把响应预打包为字节并扫描出补丁元信息。
+// 会就地剥离 Extra 段中的 OPT（响应出口由 writeResponse 按请求回带 OPT），
+// 剥离失败或结构不支持时返回 ok=false，命中时自动回退到深拷贝路径。
+func buildWire(msg *dns.Msg) ([]byte, wireMeta) {
+	if msg == nil {
+		return nil, wireMeta{}
+	}
+
+	// 剥离 OPT：与 writeResponse 的行为保持一致，避免把首个客户端的 EDNS 参数固化进缓存
+	if len(msg.Extra) > 0 {
+		extra := msg.Extra[:0]
+		for _, rr := range msg.Extra {
+			if _, isOPT := rr.(*dns.OPT); !isOPT {
+				extra = append(extra, rr)
+			}
+		}
+		msg.Extra = extra
+	}
+	msg.Compress = true
+
+	data, err := msg.Pack()
+	if err != nil {
+		return nil, wireMeta{}
+	}
+	meta := scanWire(data)
+	if !meta.ok {
+		return nil, wireMeta{}
+	}
+	return data, meta
+}
+
+// storeWire 把响应预打包到条目上，并预计算命中快路径所需的日志/统计字段。
+// 预打包失败（极少数不可直写的响应）时保留对象树兜底，保证缓存语义不变。
+func (e *CacheEntry) storeWire(response *dns.Msg) {
+	e.rcode, e.answers, e.answerCount, e.ipv4Count, e.ipv6Count = entrySummary(response)
+	e.wire, e.wmeta = buildWire(response)
+	if !e.wmeta.ok {
+		e.Response = response
+		e.wire = nil
+		e.wmeta = wireMeta{}
+	}
+}
+
+// scanWire 扫描已打包的响应，记录 Question 段 NAME 位置与所有 RR 的 TTL 字段偏移。
+// 任何超出预期的结构（多问题、Question 段带压缩指针、长度对不上）都判定为不支持。
+func scanWire(b []byte) wireMeta {
+	meta := wireMeta{}
+	if len(b) < 12 {
+		return meta
+	}
+
+	qd := int(binary.BigEndian.Uint16(b[4:6]))
+	an := int(binary.BigEndian.Uint16(b[6:8]))
+	ns := int(binary.BigEndian.Uint16(b[8:10]))
+	ar := int(binary.BigEndian.Uint16(b[10:12]))
+	if qd != 1 {
+		return meta // 命中快路径只支持单问题响应
+	}
+
+	off := 12
+	meta.qnameOff = off
+	// Question 段 NAME：不支持压缩指针
+	for {
+		if off >= len(b) {
+			return wireMeta{}
+		}
+		l := int(b[off])
+		if l == 0 {
+			off++
+			break
+		}
+		if l&0xC0 != 0 {
+			return wireMeta{}
+		}
+		off += 1 + l
+	}
+	meta.qnameLen = off - meta.qnameOff
+
+	// QTYPE + QCLASS
+	if off+4 > len(b) {
+		return wireMeta{}
+	}
+	off += 4
+
+	// 逐个 RR 记录 TTL 偏移（NAME 可能带压缩指针，按指针/标签跳过）
+	meta.ttls = make([]ttlField, 0, an+ns+ar)
+	for i := 0; i < an+ns+ar; i++ {
+		for {
+			if off >= len(b) {
+				return wireMeta{}
+			}
+			c := b[off]
+			if c&0xC0 == 0xC0 {
+				off += 2
+				break
+			}
+			if c == 0 {
+				off++
+				break
+			}
+			off += 1 + int(c)
+		}
+		// TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+		if off+10 > len(b) {
+			return wireMeta{}
+		}
+		ttlOff := off + 4
+		meta.ttls = append(meta.ttls, ttlField{
+			off: uint16(ttlOff),
+			ttl: binary.BigEndian.Uint32(b[ttlOff : ttlOff+4]),
+		})
+		off += 10 + int(binary.BigEndian.Uint16(b[off+8:off+10]))
+		if off > len(b) {
+			return wireMeta{}
+		}
+	}
+
+	if off != len(b) {
+		return wireMeta{} // 没能恰好走完整包，说明扫描逻辑与结构不符
+	}
+	meta.ok = true
+	return meta
+}
+
+// entrySummary 汇总一条响应在缓存里需要预先算好的日志/统计字段
+func entrySummary(resp *dns.Msg) (rcode int, answers string, answerCount, ipv4, ipv6 int) {
+	if resp == nil {
+		return 0, "", 0, 0, 0
+	}
+	rcode = resp.Rcode
+	answerCount = len(resp.Answer)
+	answers = answersSummary(resp)
+	for _, rr := range resp.Answer {
+		switch rr.(type) {
+		case *dns.A:
+			ipv4++
+		case *dns.AAAA:
+			ipv6++
+		}
+	}
+	return rcode, answers, answerCount, ipv4, ipv6
+}
+
+// materialize 用预打包字节重建一份可写响应；不可预打包的兜底条目回退到保留的对象树副本。
+// 返回 nil 表示该条目没有可用的响应内容。
+func materialize(wire []byte, meta wireMeta, fallback *dns.Msg) *dns.Msg {
+	if wire != nil && meta.ok {
+		m := new(dns.Msg)
+		if err := m.Unpack(wire); err == nil {
+			return m
+		}
+	}
+	if fallback != nil {
+		return fallback.Copy()
+	}
+	return nil
+}
+
+// Serve 命中快路径结果：Wire 是缓存内部对象，调用方只能读，不能修改
+type Serve struct {
+	Wire     []byte
+	Meta     wireMeta
+	StoredAt time.Time
+	Rcode    int    // 预计算的响应 RCODE，供命中日志使用
+	Answers  string // 预计算的 answersSummary，供命中日志使用
+}
+
+// GetServe 命中快路径查询：返回预打包字节，供处理器直接打补丁写出。
+// 仅在「未过期 + 非云条目 + 有可用预打包字节」时返回 ok=true，
+// 其余情况（云条目、过期陈旧响应、打包失败）一律返回 false，由调用方回退到 Get 的路径。
+func (c *OptimizedDNSCache) GetServe(scope, domain string, qType uint16) (Serve, bool) {
+	key := c.key(scope, domain, qType)
+	shard := c.getShard(key)
+
+	shard.mu.RLock()
+	entry, exists := shard.store[key]
+	if !exists {
+		shard.mu.RUnlock()
+		return Serve{}, false
+	}
+	isCloud := entry.IsCloud
+	wire := entry.wire
+	meta := entry.wmeta
+	storedAt := entry.StoredAt
+	expireAt := entry.ExpireAt
+	rcode := entry.rcode
+	answers := entry.answers
+	shard.mu.RUnlock()
+
+	if isCloud || wire == nil || !meta.ok {
+		return Serve{}, false
+	}
+
+	now := time.Now()
+	if now.After(expireAt) {
+		return Serve{}, false // 过期陈旧响应仍走原路径（含 TTL 调整与按需刷新）
+	}
+	entry.touchAt(now)
+
+	return Serve{
+		Wire:     wire,
+		Meta:     meta,
+		StoredAt: storedAt,
+		Rcode:    rcode,
+		Answers:  answers,
+	}, true
+}
+
 // GetCloudResponse 获取云域名的替换响应缓存
 func (c *OptimizedDNSCache) GetCloudResponse(scope, domain string, qType uint16) (*dns.Msg, bool, int) {
 	key := c.key(scope, domain, qType)
@@ -187,10 +437,8 @@ func (c *OptimizedDNSCache) GetCloudResponse(scope, domain string, qType uint16)
 		return nil, false, 0
 	}
 
-	// 更新最后访问时间
-	shard.mu.Lock()
-	entry.LastAccess = time.Now()
-	shard.mu.Unlock()
+	// 更新最后访问时间（原子写，无需持锁）
+	entry.touch()
 
 	// 返回云响应缓存（副本，递减TTL）
 	if entry.CloudResponse != nil {
@@ -224,7 +472,7 @@ func (c *OptimizedDNSCache) SetCloudResponse(scope, domain string, qType uint16,
 	entry.IsCloud = true
 	entry.CloudType = cloudType
 	entry.RefreshThreshold = refreshThreshold
-	entry.LastAccess = time.Now()
+	entry.touch()
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -245,68 +493,65 @@ func (c *OptimizedDNSCache) Get(scope, domain string, qType uint16) (*dns.Msg, b
 
 	shard.mu.RLock()
 	entry, exists := shard.store[key]
-	shard.mu.RUnlock()
+	if exists {
+		// StoredAt/IsCloud/CloudResponse 等字段写入后不再变更，可在读锁内安全取出
+		storedAt := entry.StoredAt
+		isCloud := entry.IsCloud
+		cloudType := entry.CloudType
+		wire := entry.wire
+		meta := entry.wmeta
+		fallback := entry.Response
+		rcode := entry.rcode
+		cloudResponse := entry.CloudResponse
+		expireAt := entry.ExpireAt
+		shard.mu.RUnlock()
 
-	if !exists {
-		return nil, false, false, 0
-	}
+		// 命中路径只取一次当前时间，LastAccess 用原子写，不再抢分片写锁
+		now := time.Now()
+		entry.touchAt(now)
 
-	// 检查是否过期
-	isExpired := time.Now().After(entry.ExpireAt)
-	if isExpired {
-		// 检查是否为失败响应（如NXDOMAIN）且已过期，如果是则立即删除并返回未命中
-		if !entry.IsCloud && entry.Response != nil && entry.Response.Rcode != dns.RcodeSuccess {
-			// 失败响应已过期，立即删除缓存项并返回未命中
-			shard.mu.Lock()
-			delete(shard.store, key)
-			shard.mu.Unlock()
+		if now.After(expireAt) {
+			// 失败响应（如NXDOMAIN）过期后立即删除并返回未命中
+			if !isCloud && rcode != dns.RcodeSuccess {
+				shard.mu.Lock()
+				delete(shard.store, key)
+				shard.mu.Unlock()
+				return nil, false, false, 0
+			}
+			// 成功的过期响应先返回客户端，懒惰删除避免缓存雪崩
+			if isCloud && cloudResponse != nil {
+				resp := cloudResponse.Copy()
+				c.adjustExpiredResponseTTL(resp, 5*time.Second)
+				return resp, true, true, cloudType
+			} else if !isCloud {
+				if resp := materialize(wire, meta, fallback); resp != nil {
+					c.adjustExpiredResponseTTL(resp, 5*time.Second)
+					return resp, true, false, 0
+				}
+			}
+			return nil, true, isCloud, cloudType
+		}
+
+		// 命中统一返回副本并按缓存时长递减TTL，避免共享对象竞争（调用方无需再Copy）
+		if isCloud {
+			if cloudResponse != nil {
+				resp := cloudResponse.Copy()
+				decrementTTLs(resp, now.Sub(storedAt))
+				return resp, true, true, cloudType
+			}
+			return nil, true, true, cloudType
+		}
+
+		resp := materialize(wire, meta, fallback)
+		if resp == nil {
 			return nil, false, false, 0
 		}
-
-		// 对于成功的过期响应，先返回给客户端，但不立即删除缓存项
-		// 为了避免并发请求导致的缓存雪崩问题，我们采用懒惰删除策略
-		// 云服务域名特殊处理
-		if entry.IsCloud && entry.CloudResponse != nil {
-			// 创建响应副本并调整TTL
-			resp := entry.CloudResponse.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
-			// 不删除缓存项，而是更新访问时间
-			shard.mu.Lock()
-			entry.LastAccess = time.Now()
-			shard.mu.Unlock()
-			return resp, true, true, entry.CloudType
-		} else if !entry.IsCloud && entry.Response != nil {
-			// 普通域名响应
-			resp := entry.Response.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
-			// 不删除缓存项，而是更新访问时间
-			shard.mu.Lock()
-			entry.LastAccess = time.Now()
-			shard.mu.Unlock()
-			return resp, true, false, 0
-		}
-		return nil, true, entry.IsCloud, entry.CloudType
+		decrementTTLs(resp, now.Sub(storedAt))
+		return resp, true, false, 0
 	}
+	shard.mu.RUnlock()
 
-	// 更新最后访问时间（用于LRU淘汰策略）
-	shard.mu.Lock()
-	entry.LastAccess = time.Now()
-	storedAt := entry.StoredAt
-	shard.mu.Unlock()
-
-	// 命中统一返回副本并按缓存时长递减TTL，避免共享对象竞争（调用方无需再Copy）
-	if entry.IsCloud {
-		if entry.CloudResponse != nil {
-			resp := entry.CloudResponse.Copy()
-			decrementTTLs(resp, time.Since(storedAt))
-			return resp, true, true, entry.CloudType
-		}
-		return nil, true, true, entry.CloudType
-	}
-
-	resp := entry.Response.Copy()
-	decrementTTLs(resp, time.Since(storedAt))
-	return resp, true, false, 0
+	return nil, false, false, 0
 }
 
 // CacheStats 缓存统计信息
@@ -349,78 +594,66 @@ func (c *OptimizedDNSCache) GetWithFlight(scope, domain string, qType uint16) (*
 
 	shard.mu.RLock()
 	entry, exists := shard.store[key]
-	shard.mu.RUnlock()
+	if exists {
+		// StoredAt/IsCloud/CloudResponse 等字段写入后不再变更，可在读锁内安全取出
+		storedAt := entry.StoredAt
+		isCloud := entry.IsCloud
+		cloudType := entry.CloudType
+		wire := entry.wire
+		meta := entry.wmeta
+		fallback := entry.Response
+		rcode := entry.rcode
+		cloudResponse := entry.CloudResponse
+		expireAt := entry.ExpireAt
+		shard.mu.RUnlock()
 
-	if !exists {
-		return nil, false, false, 0
-	}
+		// 命中路径只取一次当前时间，LastAccess 用原子写，不再抢分片写锁
+		now := time.Now()
+		entry.touchAt(now)
 
-	// 检查是否过期
-	isExpired := time.Now().After(entry.ExpireAt)
-	if isExpired {
-		// 检查是否为失败响应（如NXDOMAIN）且已过期，如果是则立即删除并返回未命中
-		if !entry.IsCloud && entry.Response != nil && entry.Response.Rcode != dns.RcodeSuccess {
-			// 失败响应已过期，立即删除缓存项并返回未命中
-			shard.mu.Lock()
-			delete(shard.store, key)
-			shard.mu.Unlock()
+		if now.After(expireAt) {
+			// 失败响应（如NXDOMAIN）过期后立即删除并返回未命中
+			if !isCloud && rcode != dns.RcodeSuccess {
+				shard.mu.Lock()
+				delete(shard.store, key)
+				shard.mu.Unlock()
+				return nil, false, false, 0
+			}
+
+			// 过期的成功响应：返回旧值并由上层通过单飞行触发后台刷新
+			if isCloud && cloudResponse != nil {
+				resp := cloudResponse.Copy()
+				c.adjustExpiredResponseTTL(resp, 5*time.Second)
+				return resp, true, true, cloudType
+			} else if !isCloud {
+				if resp := materialize(wire, meta, fallback); resp != nil {
+					c.adjustExpiredResponseTTL(resp, 5*time.Second)
+					return resp, true, false, 0
+				}
+			}
+			return nil, true, isCloud, cloudType
+		}
+
+		// 命中统一返回副本并按缓存时长递减TTL，避免共享对象竞争（调用方无需再Copy）
+		if isCloud {
+			if cloudResponse != nil {
+				resp := cloudResponse.Copy()
+				decrementTTLs(resp, now.Sub(storedAt))
+				return resp, true, true, cloudType
+			}
+			return nil, true, true, cloudType
+		}
+
+		resp := materialize(wire, meta, fallback)
+		if resp == nil {
 			return nil, false, false, 0
 		}
-
-		// 对于成功的过期响应，我们使用单飞行模式来避免重复查询
-		// 返回当前的过期响应，并在后台刷新
-		var resp *dns.Msg
-		var isCloudResult bool
-		var cloudType int
-		var hit bool
-
-		// 云服务域名特殊处理
-		if entry.IsCloud && entry.CloudResponse != nil {
-			// 创建响应副本并调整TTL
-			resp = entry.CloudResponse.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
-			isCloudResult = true
-			cloudType = entry.CloudType
-			hit = true
-		} else if !entry.IsCloud && entry.Response != nil {
-			// 普通域名响应
-			resp = entry.Response.Copy()
-			c.adjustExpiredResponseTTL(resp, 5*time.Second) // 设置较小的TTL给客户端
-			isCloudResult = false
-			hit = true
-		}
-
-		// 更新访问时间
-		shard.mu.Lock()
-		entry.LastAccess = time.Now()
-		shard.mu.Unlock()
-
-		// 返回过期的响应，但通过单飞行模式触发后台刷新
-		if hit {
-			return resp, true, isCloudResult, cloudType
-		}
-		return nil, true, entry.IsCloud, entry.CloudType
+		decrementTTLs(resp, now.Sub(storedAt))
+		return resp, true, false, 0
 	}
+	shard.mu.RUnlock()
 
-	// 更新最后访问时间（用于LRU淘汰策略）
-	shard.mu.Lock()
-	entry.LastAccess = time.Now()
-	storedAt := entry.StoredAt
-	shard.mu.Unlock()
-
-	// 命中统一返回副本并按缓存时长递减TTL，避免共享对象竞争（调用方无需再Copy）
-	if entry.IsCloud {
-		if entry.CloudResponse != nil {
-			resp := entry.CloudResponse.Copy()
-			decrementTTLs(resp, time.Since(storedAt))
-			return resp, true, true, entry.CloudType
-		}
-		return nil, true, true, entry.CloudType
-	}
-
-	resp := entry.Response.Copy()
-	decrementTTLs(resp, time.Since(storedAt))
-	return resp, true, false, 0
+	return nil, false, false, 0
 }
 
 // adjustExpiredResponseTTL 调整过期响应的TTL值
@@ -506,7 +739,7 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 		entry.IsCloud = true
 		entry.CloudType = cType
 		entry.RefreshThreshold = 6 * time.Hour // 云标记外6小时后刷新
-		entry.LastAccess = time.Now()
+		entry.touch()
 
 		// 存储缓存条目
 		shard.store[key] = entry
@@ -546,14 +779,15 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 
 	// 从对象池获取CacheEntry
 	entry := c.entryPool.Get()
-	entry.Response = responseCopy
 	entry.CloudResponse = nil
+	// 预打包响应字节：命中时原地打补丁写出，省掉每次命中的 dns.Msg 深拷贝
+	entry.storeWire(responseCopy)
 	entry.ExpireAt = expireAt
 	entry.StoredAt = time.Now()
 	entry.IsCloud = isCloud
 	entry.CloudType = 0
 	entry.RefreshThreshold = refreshThreshold
-	entry.LastAccess = time.Now()
+	entry.touch()
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -604,7 +838,7 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 		entry.IsCloud = true
 		entry.CloudType = cType
 		entry.RefreshThreshold = 6 * time.Hour // 云标记外6小时后刷新
-		entry.LastAccess = time.Now()
+		entry.touch()
 
 		// 存储缓存条目
 		shard.store[key] = entry
@@ -628,14 +862,15 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 
 	// 从对象池获取CacheEntry
 	entry := c.entryPool.Get()
-	entry.Response = responseCopy
 	entry.CloudResponse = nil
+	// 预打包响应字节：命中时原地打补丁写出，省掉每次命中的 dns.Msg 深拷贝
+	entry.storeWire(responseCopy)
 	entry.ExpireAt = expireAt
 	entry.StoredAt = time.Now()
 	entry.IsCloud = isCloud
 	entry.CloudType = 0
 	entry.RefreshThreshold = refreshThreshold
-	entry.LastAccess = time.Now()
+	entry.touch()
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -704,7 +939,7 @@ func (c *OptimizedDNSCache) ShouldRefresh(scope, domain string, qType uint16) bo
 		refreshThreshold = entry.RefreshThreshold
 	} else {
 		// 动态计算：使用条目总生存时间的30%作为刷新阈值
-		totalTTL := time.Since(entry.LastAccess.Add(-c.defTTL())) // 计算条目的总生存时间
+		totalTTL := time.Since(entry.lastAccessTime().Add(-c.defTTL())) // 计算条目的总生存时间
 		if totalTTL > 0 {
 			refreshThreshold = time.Duration(float64(totalTTL) * 0.3)
 		} else {
@@ -741,9 +976,10 @@ func (c *OptimizedDNSCache) evictLeastRecentlyUsed(shard *CacheShard) {
 
 	// 找到最久未访问的条目
 	for key, entry := range shard.store {
-		if oldestKey == "" || entry.LastAccess.Before(oldestTime) {
+		la := entry.lastAccessTime()
+		if oldestKey == "" || la.Before(oldestTime) {
 			oldestKey = key
-			oldestTime = entry.LastAccess
+			oldestTime = la
 		}
 	}
 
@@ -887,7 +1123,7 @@ func (c *OptimizedDNSCache) ExtendTTL(scope, domain string, qType uint16, durati
 
 		entry.ExpireAt = time.Now().Add(newTTL)
 		// 更新最后访问时间
-		entry.LastAccess = time.Now()
+		entry.touch()
 	}
 }
 
@@ -936,10 +1172,8 @@ func (c *OptimizedDNSCache) GetStats(includeEntries bool) *CacheStats {
 				qtype = parts[2]
 			}
 
-			answerCount := 0
-			if entry.Response != nil {
-				answerCount = len(entry.Response.Answer)
-			} else if entry.CloudResponse != nil {
+			answerCount := entry.answerCount
+			if entry.IsCloud && entry.CloudResponse != nil {
 				answerCount = len(entry.CloudResponse.Answer)
 			}
 
@@ -950,7 +1184,7 @@ func (c *OptimizedDNSCache) GetStats(includeEntries bool) *CacheStats {
 					IsExpired:   isExpired,
 					IsCloud:     entry.IsCloud,
 					ExpireAt:    entry.ExpireAt,
-					LastAccess:  entry.LastAccess,
+					LastAccess:  entry.lastAccessTime(),
 					AnswerCount: answerCount,
 				}
 			}
@@ -987,7 +1221,7 @@ func (c *OptimizedDNSCache) GetHotEntries(limit int) []HotEntry {
 				Key        string
 				Entry      *CacheEntry
 				LastAccess time.Time
-			}{key, entry, entry.LastAccess})
+			}{key, entry, entry.lastAccessTime()})
 		}
 		shard.mu.RUnlock()
 	}
@@ -1039,22 +1273,26 @@ func (c *OptimizedDNSCache) CountCachedIPs() map[string]int {
 			}
 
 			// 检查响应中的IP记录
-			var response *dns.Msg
-			if entry.IsCloud && entry.CloudResponse != nil {
-				response = entry.CloudResponse
-			} else if !entry.IsCloud && entry.Response != nil {
-				response = entry.Response
-			}
-
-			if response != nil {
-				for _, rr := range response.Answer {
-					switch rr.(type) {
-					case *dns.A:
-						ipCounts["A"]++
-					case *dns.AAAA:
-						ipCounts["AAAA"]++
+			if entry.IsCloud {
+				if entry.CloudResponse != nil {
+					for _, rr := range entry.CloudResponse.Answer {
+						switch rr.(type) {
+						case *dns.A:
+							ipCounts["A"]++
+						case *dns.AAAA:
+							ipCounts["AAAA"]++
+						}
 					}
 				}
+				continue
+			}
+
+			// 普通条目用写入时预计算的 A/AAAA 计数，避免逐条从 wire 反解
+			if entry.ipv4Count > 0 {
+				ipCounts["A"] += entry.ipv4Count
+			}
+			if entry.ipv6Count > 0 {
+				ipCounts["AAAA"] += entry.ipv6Count
 			}
 		}
 		shard.mu.RUnlock()
