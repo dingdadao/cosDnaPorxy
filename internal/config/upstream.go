@@ -64,6 +64,27 @@ func SplitUpstreamScheme(upstream string) (scheme, rest string) {
 	return "", s
 }
 
+// UpstreamWeightSeparator 权重标记：地址末尾以 "#<非负整数>" 指定「权重随机(wrandom)」模式的相对权重
+const UpstreamWeightSeparator = "#"
+
+// SplitUpstreamWeight 拆出上游地址与其权重后缀。
+//   - udp://1.1.1.1:53#70 → ("udp://1.1.1.1:53", 70, true)
+//   - udp://1.1.1.1:53    → ("udp://1.1.1.1:53", 0, false)
+//
+// "#" 后缀不是合法非负整数时视为「未指定权重」，把整串当地址返回，交给地址校验报错。
+func SplitUpstreamWeight(upstream string) (addr string, weight int, hasWeight bool) {
+	s := strings.TrimSpace(upstream)
+	i := strings.LastIndex(s, UpstreamWeightSeparator)
+	if i < 0 {
+		return s, 0, false
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+	if err != nil || w < 0 {
+		return s, 0, false
+	}
+	return strings.TrimSpace(s[:i]), w, true
+}
+
 // UpstreamDialAddr 把上游地址转成可直接 dial 的 host:port（运行时兜底用）
 //   - 自动去掉 udp:// tcp:// tls:// 等前缀
 //   - 缺端口时按 scheme 补默认端口（udp/tcp→53、tls→853）
@@ -71,6 +92,7 @@ func SplitUpstreamScheme(upstream string) (scheme, rest string) {
 //
 // 解析失败时原样返回剩余部分，把报错权留给 dial，便于日志里看到真实地址
 func UpstreamDialAddr(upstream string) string {
+	upstream, _, _ = SplitUpstreamWeight(upstream)
 	scheme, rest := SplitUpstreamScheme(upstream)
 	if rest == "" {
 		return strings.TrimSpace(upstream)
@@ -89,6 +111,35 @@ func UpstreamDialAddr(upstream string) string {
 // 非法值（未知协议前缀、缺主机、端口非法/越界）返回 error
 func NormalizeUpstream(upstream string) (string, error) {
 	s := strings.TrimSpace(upstream)
+	if s == "" {
+		return "", fmt.Errorf("上游地址为空")
+	}
+
+	// 拆出可选的 "#权重" 后缀（仅权重随机模式使用）；非法的 "#后缀" 直接拒绝
+	addr, weight, hasWeight := SplitUpstreamWeight(s)
+	if !hasWeight && strings.Contains(s, UpstreamWeightSeparator) {
+		suffix := s[strings.LastIndex(s, UpstreamWeightSeparator):]
+		return "", fmt.Errorf("非法的权重后缀 %q：应为 #<非负整数>（如 udp://1.1.1.1:53#70）", suffix)
+	}
+
+	normalized, err := normalizeUpstreamAddr(addr)
+	if err != nil {
+		return "", err
+	}
+	if hasWeight {
+		return normalized + UpstreamWeightSeparator + strconv.Itoa(weight), nil
+	}
+	return normalized, nil
+}
+
+// normalizeUpstreamAddr 归一化不含 "#权重" 后缀的单个上游地址
+//   - udp:// / tcp:// / tls:// ：必须有主机，缺端口时补默认端口（53/53/853）
+//   - https:// / h3:// ：完整 URL，保留 path/query，不补端口（由 HTTP 客户端按 443 处理）
+//   - 无 scheme 的旧格式 host:port：保持原样，缺端口时补 53
+//
+// 非法值（未知协议前缀、缺主机、端口非法/越界）返回 error
+func normalizeUpstreamAddr(s string) (string, error) {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", fmt.Errorf("上游地址为空")
 	}

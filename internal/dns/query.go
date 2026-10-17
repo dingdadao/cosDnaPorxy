@@ -77,13 +77,17 @@ func (h *RefactoredHandler) queryBackupDNS(req *dns.Msg) (*dns.Msg, bool) {
 }
 
 // queryUpstream 按解析模式执行上游查询
-// failover 仅现代优化器支持（传统优化器为旧格式 host:port 的兼容路径，不支持模式选择）
+// failover/wrandom 仅现代优化器支持（传统优化器为旧格式 host:port 的兼容路径，不支持模式选择）
 func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode string) *ConcurrentQueryResult {
 	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
-		if mode == config.DNSModeFailover {
+		switch mode {
+		case config.DNSModeFailover:
 			return modernOptimizer.QueryFailover(req, upstreams)
+		case config.DNSModeWRandom:
+			return modernOptimizer.QueryWeightedRandom(req, upstreams)
+		default:
+			return modernOptimizer.Query(req, upstreams)
 		}
-		return modernOptimizer.Query(req, upstreams)
 	}
 	if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
 		return traditionalOptimizer.Query(req, upstreams)
@@ -94,10 +98,37 @@ func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode
 	}
 }
 
-// proxyQueryWithCaching 代理查询并缓存原始上游响应
-// 云检测统一在processQuery中执行（仅一次），此处只做查询+缓存，不再处理CNAME或检测云
+// flightOutcome 单飞行回源的结果载体（resp/server/err 一次性带出）
+type flightOutcome struct {
+	resp   *dns.Msg
+	server string
+	err    error
+}
+
+// proxyQueryWithCaching 代理查询并缓存原始上游响应。
+// 同一（scope、域名、qtype、模式、上游集合）的并发 miss 由 single-flight 合并为一次回源，
+// 避免「并发冷启动的同一域名各自竞速」把对外请求放大为 客户端数 × 上游数。
 // 第二个返回值是实际给出应答的上游服务器（用于解析日志）
 func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string) (*dns.Msg, string, error) {
+	key := fmt.Sprintf("%s|%s|%d|%s|%s", scope, domain, qtype, mode, strings.Join(upstreams, ","))
+
+	v, _, shared := h.upstreamFlight.Do(key, func() (interface{}, error) {
+		resp, server, err := h.doProxyQueryWithCaching(req, upstreams, domain, qtype, mode, scope)
+		return flightOutcome{resp: resp, server: server, err: err}, nil
+	})
+
+	out := v.(flightOutcome)
+	resp := out.resp
+	// 结果被多个并发请求共享时必须复制：调用方随即会用 writeResponse 原地改写
+	// ID/Question/OPT 等字段，直接共享同一 *dns.Msg 会并发污染。
+	if shared && resp != nil {
+		resp = resp.Copy()
+	}
+	return resp, out.server, out.err
+}
+
+// doProxyQueryWithCaching 执行一次真正的回源查询并缓存结果（由 proxyQueryWithCaching 经单飞行调用）
+func (h *RefactoredHandler) doProxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string) (*dns.Msg, string, error) {
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
 

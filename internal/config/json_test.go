@@ -273,3 +273,38 @@ func TestConfigJSONMissingECSDefaultsOff(t *testing.T) {
 		t.Error("缺省 ecs 不应注入")
 	}
 }
+
+// 全局 dns_mode：合法取值往返保持；缺省（旧配置无该字段）回退为 race；非法值被拒绝
+func TestConfigJSONGlobalDNSMode(t *testing.T) {
+	for _, mode := range []string{"", DNSModeRace, DNSModeFailover, DNSModeWRandom} {
+		raw := []byte(`{"listen_port":5354,"upstream":["udp://1.1.1.1:53"],"dns_mode":"` + mode + `"}`)
+		var j ConfigJSON
+		if err := json.Unmarshal(raw, &j); err != nil {
+			t.Fatalf("mode %q: 解析失败: %v", mode, err)
+		}
+		cfg, err := j.ToConfig()
+		if err != nil {
+			t.Fatalf("mode %q: 转换失败: %v", mode, err)
+		}
+		want := mode
+		if want == "" {
+			want = DNSModeRace
+		}
+		if cfg.DNSMode != want {
+			t.Errorf("mode %q: 归一化结果 = %q，期望 %q", mode, cfg.DNSMode, want)
+		}
+		// 写回应保留该模式
+		if cfg.ToJSON().DNSMode != want {
+			t.Errorf("mode %q: 写回丢失: %q", mode, cfg.ToJSON().DNSMode)
+		}
+	}
+
+	raw := []byte(`{"listen_port":5354,"upstream":["udp://1.1.1.1:53"],"dns_mode":"random"}`)
+	var j ConfigJSON
+	if err := json.Unmarshal(raw, &j); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if _, err := j.ToConfig(); err == nil {
+		t.Error("非法全局 dns_mode 应被拒绝")
+	}
+}

@@ -89,7 +89,17 @@ type CacheConfig struct {
 const (
 	DNSModeRace     = "race"     // 并发竞速：同时查询所有 DNS，取最快成功的结果（默认）
 	DNSModeFailover = "failover" // 串行故障转移：按 DNS 顺序依次查询，前一个失败/超时才用下一个
+	DNSModeWRandom  = "wrandom"  // 权重随机：按地址 #权重 随机选一台查询（每次 miss 只发 1 次），失败再从其余选一台
 )
+
+// ValidDNSMode 判断 DNS 解析模式取值是否合法（空串＝默认 race）
+func ValidDNSMode(mode string) bool {
+	switch mode {
+	case "", DNSModeRace, DNSModeFailover, DNSModeWRandom:
+		return true
+	}
+	return false
+}
 
 // A/AAAA 偏好档位：列表未配置时跟随全局默认，全局默认与"不干预"等效
 // 语义前提：客户端 QTYPE 永远被尊重（查A回A、查AAAA回AAAA），"优先"只能靠抑制次优类型（返回空 NODATA）实现
@@ -116,7 +126,7 @@ type SplitList struct {
 	Enabled          bool          // 是否启用该列表
 	Invert           bool          // 取反匹配：域名不在清单内时命中本列表（清单为空时不参与匹配）
 	DNS              []string      // 命中后使用的 DNS 服务器列表（按 DNSMode 解析；支持 udp/tcp/https/tls/h3）
-	DNSMode          string        // DNS 解析模式：race(并发竞速，默认/空值)/failover(串行故障转移)
+	DNSMode          string        // DNS 解析模式：race(并发竞速，默认/空值)/failover(串行故障转移)/wrandom(权重随机)
 	DomainFile       string        // 域名列表本地文件路径
 	DomainURL        string        // 域名列表远程 URL（优先于本地文件）
 	Refresh          time.Duration // 列表刷新间隔
@@ -207,7 +217,7 @@ type ISPGroup struct {
 	Enabled      bool               // 未启用 = 不干预，走全局默认
 	SplitRefs    []string           // 引用「上游与域名分流」里的列表名，顺序即匹配顺序（命中复用该列表 DNS/模式/ECS/偏好/云检测）
 	FallbackDNS  []string           // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
-	DNSMode      string             // race / failover，仅作用于 FallbackDNS
+	DNSMode      string             // race / failover / wrandom，仅作用于 FallbackDNS
 	IPPrefer     string             // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
 	ECS          ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
 	CloudReplace CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
@@ -223,7 +233,7 @@ type CustomGroup struct {
 	Match        []string           // 裸 IP / CIDR（v4/v6）
 	SplitRefs    []string           // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
 	FallbackDNS  []string           // 兜底上游：引用分流全部未命中时使用；为空则回退全局 upstream
-	DNSMode      string             // race / failover，仅作用于 FallbackDNS
+	DNSMode      string             // race / failover / wrandom，仅作用于 FallbackDNS
 	IPPrefer     string             // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
 	ECS          ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
 	CloudReplace CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
@@ -248,6 +258,7 @@ type Config struct {
 	ReplaceCFAPI           string         // CF 替换 IP 接口地址（非空时改从接口取 IP，不再解析 ReplaceCFDomain）
 	ReplaceAPICount        int            // 从替换接口取前 N 条 IP（默认 1）
 	BackupDNS              string         // 所有上游失败后的备用DNS
+	DNSMode                string         // 全局默认解析模式：race(竞速，默认/空值)/failover(串行)/wrandom(权重随机)
 	IPPrefer               string         // 全局默认 A/AAAA 偏好档位（未命中分流列表或列表未配置时生效）
 	SplitLists             []SplitList    // 域名分流列表（按顺序匹配）
 	CloudflareNetFile      string         // Cloudflare IP段数据文件
@@ -318,6 +329,7 @@ func DefaultConfig() *Config {
 		ReplaceCFAPI:        "",
 		ReplaceAPICount:     1,
 		BackupDNS:           "udp://114.114.114.114:53",
+		DNSMode:             DNSModeRace,
 		SplitLists: []SplitList{
 			{
 				Name:       "定向域名",
@@ -393,6 +405,11 @@ func ValidateConfig(cfg *Config) error {
 	}
 	if len(cfg.Upstream) == 0 {
 		return fmt.Errorf("no upstream servers configured")
+	}
+
+	// 全局默认解析模式：非法值直接拒绝，避免静默失效
+	if !ValidDNSMode(cfg.DNSMode) {
+		return fmt.Errorf("dns_mode: 非法取值 %q（可选 race/failover/wrandom）", cfg.DNSMode)
 	}
 
 	// 上游地址归一化：缺端口按协议补默认端口（udp/tcp→53、tls→853），非法值直接拒绝
@@ -549,7 +566,7 @@ func ValidateConfig(cfg *Config) error {
 			return fmt.Errorf("isp_groups: 分组 %q 重复", g.ISP)
 		}
 		seenISP[g.ISP] = true
-		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover {
+		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover && g.DNSMode != DNSModeWRandom {
 			return fmt.Errorf("isp_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
 		}
 		if err := validateGroupRouting(fmt.Sprintf("isp_groups[%d]", i), ISPGroupLabel(g.ISP), g.SplitRefs, g.IPPrefer, g.ECS); err != nil {
@@ -575,7 +592,7 @@ func ValidateConfig(cfg *Config) error {
 			return fmt.Errorf("custom_groups: 名称 %q 重复", g.Name)
 		}
 		seenName[g.Name] = true
-		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover {
+		if g.DNSMode != "" && g.DNSMode != DNSModeRace && g.DNSMode != DNSModeFailover && g.DNSMode != DNSModeWRandom {
 			return fmt.Errorf("custom_groups[%d].dns_mode: 非法取值 %q", i, g.DNSMode)
 		}
 		for _, m := range g.Match {

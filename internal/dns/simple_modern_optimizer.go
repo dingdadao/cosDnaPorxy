@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"runtime/debug"
@@ -593,13 +594,170 @@ func (qo *SimpleModernOptimizer) QueryFailover(req *dns.Msg, upstreams []string)
 	}
 }
 
-// filterValidUpstreams 过滤有效的上游服务器
+// weightedUpstream 加权上游：server 为剥离权重后的净地址，weight 为相对权重
+type weightedUpstream struct {
+	server string
+	weight int
+}
+
+// defaultUpstreamWeight 未显式指定权重时的默认权重（等价于等权）
+const defaultUpstreamWeight = 1
+
+// parseWeightedUpstreams 过滤无效上游并解析 "#权重" 后缀。
+//   - "#<n>"：显式权重（n=0 视为禁用，不参与随机）
+//   - 无后缀：默认权重 defaultUpstreamWeight（等权）
+//
+// 返回的 server 均为剥离权重后的净地址，可直接交给 queryServer。
+func (qo *SimpleModernOptimizer) parseWeightedUpstreams(upstreams []string) []weightedUpstream {
+	out := make([]weightedUpstream, 0, len(upstreams))
+	for _, raw := range upstreams {
+		addr, weight, hasWeight := config.SplitUpstreamWeight(raw)
+		if !qo.isValidUpstream(addr) {
+			qo.logger.Warn("⚠️ 跳过不支持的上游服务器", map[string]interface{}{
+				"server": raw,
+				"reason": "unsupported_protocol_or_format",
+			})
+			continue
+		}
+		if !hasWeight {
+			weight = defaultUpstreamWeight
+		}
+		out = append(out, weightedUpstream{server: addr, weight: weight})
+	}
+	return out
+}
+
+// pickWeightedIndex 按权重随机返回一台上游的下标；weight<=0 的条目不参与。
+// 全部权重<=0 时退化为等权随机，保证仍能选出一台。
+func pickWeightedIndex(ups []weightedUpstream, rnd *rand.Rand) int {
+	total := 0
+	for _, u := range ups {
+		if u.weight > 0 {
+			total += u.weight
+		}
+	}
+	if total <= 0 {
+		return rnd.Intn(len(ups))
+	}
+	n := rnd.Intn(total)
+	for i, u := range ups {
+		if u.weight <= 0 {
+			continue
+		}
+		n -= u.weight
+		if n < 0 {
+			return i
+		}
+	}
+	return 0
+}
+
+// QueryWeightedRandom 权重随机：按 "#权重" 从有效上游中随机选一台发起查询（每次 miss 只发 1 次），
+// 失败/超时后从其余上游再随机选一台重试，最多尝试 2 台，避免单点故障导致解析失败。
+// 返回结构与 Query/QueryFailover 保持一致，便于上层统一处理。
+func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	start := time.Now()
+
+	weighted := qo.parseWeightedUpstreams(upstreams)
+	if len(weighted) == 0 {
+		return &ConcurrentQueryResult{
+			FastestResult: &QueryResult{
+				Error: fmt.Errorf("no valid upstream servers after filtering"),
+			},
+			HasSuccess: false,
+		}
+	}
+
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// 最多尝试 2 台（首选 + 一次回退），候选不足时以实际数量为准
+	const maxAttempts = 2
+	attempts := maxAttempts
+	if len(weighted) < attempts {
+		attempts = len(weighted)
+	}
+
+	remaining := make([]weightedUpstream, len(weighted))
+	copy(remaining, weighted)
+
+	var allResults []*QueryResult
+	var last *QueryResult
+
+	for i := 0; i < attempts; i++ {
+		idx := pickWeightedIndex(remaining, rnd)
+		choice := remaining[idx]
+		// 移除已尝试的项，避免回退时再次选中同一台
+		remaining = append(remaining[:idx], remaining[idx+1:]...)
+
+		result := qo.queryServer(req, choice.server)
+		if result == nil {
+			continue
+		}
+		allResults = append(allResults, result)
+		last = result
+
+		if result.Error == nil && result.Response != nil &&
+			(result.Response.Rcode == dns.RcodeSuccess || result.Response.Rcode == dns.RcodeNameError) {
+			// NOERROR / NXDOMAIN 均为终态答案（RFC 2308），无需回退
+			result.IsSuccess = true
+			qo.logger.Debug("✅ 权重随机模式查询成功", map[string]interface{}{
+				"server":       choice.server,
+				"weight":       choice.weight,
+				"attempt":      i + 1,
+				"time":         result.ResponseTime.String(),
+				"total_time":   time.Since(start).String(),
+				"answer_count": len(result.Response.Answer),
+				"rcode":        dns.RcodeToString[result.Response.Rcode],
+			})
+			return &ConcurrentQueryResult{
+				FastestResult:  result,
+				SuccessResult:  result,
+				AllResults:     allResults,
+				HasSuccess:     true,
+				FastestTime:    result.ResponseTime,
+				TotalQueryTime: time.Since(start),
+			}
+		}
+
+		qo.logger.Debug("⏭️ 权重随机模式当前上游未成功，尝试回退", map[string]interface{}{
+			"server":  choice.server,
+			"attempt": i + 1,
+			"error":   result.Error,
+		})
+	}
+
+	if last == nil {
+		last = &QueryResult{
+			Server:       "none",
+			Error:        fmt.Errorf("all %d upstream queries failed", len(weighted)),
+			ResponseTime: time.Since(start),
+		}
+	}
+
+	qo.logger.Warn("⚠️ 权重随机模式所有尝试均失败", map[string]interface{}{
+		"total":      len(weighted),
+		"attempts":   len(allResults),
+		"server":     last.Server,
+		"total_time": time.Since(start).String(),
+	})
+
+	return &ConcurrentQueryResult{
+		FastestResult:  last,
+		AllResults:     allResults,
+		HasSuccess:     false,
+		FastestTime:    last.ResponseTime,
+		TotalQueryTime: time.Since(start),
+	}
+}
+
+// filterValidUpstreams 过滤有效的上游服务器（剥离 "#权重" 后缀后校验，返回净地址）
 func (qo *SimpleModernOptimizer) filterValidUpstreams(upstreams []string) []string {
 	var validUpstreams []string
 
 	for _, upstream := range upstreams {
-		if qo.isValidUpstream(upstream) {
-			validUpstreams = append(validUpstreams, upstream)
+		addr, _, _ := config.SplitUpstreamWeight(upstream)
+		if qo.isValidUpstream(addr) {
+			validUpstreams = append(validUpstreams, addr)
 		} else {
 			qo.logger.Warn("⚠️ 跳过不支持的上游服务器", map[string]interface{}{
 				"server": upstream,
@@ -613,6 +771,9 @@ func (qo *SimpleModernOptimizer) filterValidUpstreams(upstreams []string) []stri
 
 // isValidUpstream 检查上游服务器是否有效
 func (qo *SimpleModernOptimizer) isValidUpstream(upstream string) bool {
+	// 兼容带 "#权重" 后缀的写法：校验时先剥离权重
+	upstream, _, _ = config.SplitUpstreamWeight(upstream)
+
 	// 支持的协议前缀
 	supportedSchemes := []string{"udp://", "tcp://", "https://", "tls://", "h3://"}
 

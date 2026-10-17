@@ -24,6 +24,7 @@ type ConfigJSON struct {
 	ReplaceCFAPI          string          `json:"replace_cf_api"`
 	ReplaceAPICount       int             `json:"replace_api_count"`
 	BackupDNS             string          `json:"backup_dns"`
+	DNSMode               string          `json:"dns_mode"`
 	IPPrefer              string          `json:"ip_prefer"`
 	SplitLists            []SplitListJSON `json:"split_lists"`
 	CloudflareNetFile     string          `json:"cloudflare_net_file"`
@@ -296,6 +297,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 		ReplaceCFAPI:        c.ReplaceCFAPI,
 		ReplaceAPICount:     c.ReplaceAPICount,
 		BackupDNS:           c.BackupDNS,
+		DNSMode:             c.DNSMode,
 		IPPrefer:            c.IPPrefer,
 		SplitLists:          lists,
 		CloudflareNetFile:   c.CloudflareNetFile,
@@ -432,6 +434,14 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		return nil, fmt.Errorf("ip_prefer: 非法取值 %q", j.IPPrefer)
 	}
 
+	// 全局默认解析模式：非法值直接拒绝（旧配置缺 dns_mode 字段时为空串＝跟随默认 race）
+	if !ValidDNSMode(j.DNSMode) {
+		return nil, fmt.Errorf("dns_mode: 非法取值 %q（可选 race/failover/wrandom）", j.DNSMode)
+	}
+	if j.DNSMode == "" {
+		j.DNSMode = def.DNSMode
+	}
+
 	// 老配置里没有 query_log 字段（retention 与 max_rows 均为零值）时整体按默认策略，默认启用
 	queryLog := QueryLogConfig{Enabled: j.QueryLog.Enabled, MaxRows: j.QueryLog.MaxRows}
 	if j.QueryLog.Retention == "" && j.QueryLog.MaxRows == 0 {
@@ -450,6 +460,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		ReplaceCFAPI:        j.ReplaceCFAPI,
 		ReplaceAPICount:     j.ReplaceAPICount,
 		BackupDNS:           j.BackupDNS,
+		DNSMode:             j.DNSMode,
 		IPPrefer:            j.IPPrefer,
 		SplitLists:          splitLists,
 		CloudflareNetFile:   j.CloudflareNetFile,

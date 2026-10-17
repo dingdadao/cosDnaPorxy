@@ -132,6 +132,127 @@ func TestValidUpstreamScheme(t *testing.T) {
 	}
 }
 
+// 权重后缀解析：#<非负整数> 拆出权重，其余（含非法后缀）视为未指定
+func TestSplitUpstreamWeight(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantAddr string
+		wantW    int
+		wantHas  bool
+	}{
+		{"显式权重", "udp://1.1.1.1:53#70", "udp://1.1.1.1:53", 70, true},
+		{"无权重后缀", "udp://1.1.1.1:53", "udp://1.1.1.1:53", 0, false},
+		{"权重为 0（禁用）", "udp://1.1.1.1:53#0", "udp://1.1.1.1:53", 0, true},
+		{"带空白裁剪", "  udp://1.1.1.1:53#30  ", "udp://1.1.1.1:53", 30, true},
+		{"非数字后缀视为未指定", "udp://1.1.1.1:53#abc", "udp://1.1.1.1:53#abc", 0, false},
+		{"负权重视为未指定", "udp://1.1.1.1:53#-5", "udp://1.1.1.1:53#-5", 0, false},
+		{"DoH 带权重", "https://223.5.5.5/dns-query#20", "https://223.5.5.5/dns-query", 20, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, w, has := SplitUpstreamWeight(tc.in)
+			if addr != tc.wantAddr || w != tc.wantW || has != tc.wantHas {
+				t.Errorf("SplitUpstreamWeight(%q) = (%q, %d, %v)，期望 (%q, %d, %v)",
+					tc.in, addr, w, has, tc.wantAddr, tc.wantW, tc.wantHas)
+			}
+		})
+	}
+}
+
+// 归一化保留权重后缀（地址部分按协议补默认端口）
+func TestNormalizeUpstreamWithWeight(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"udp://1.1.1.1#70", "udp://1.1.1.1:53#70"},
+		{"udp://1.1.1.1:5353#20", "udp://1.1.1.1:5353#20"},
+		{"tls://dns.google#50", "tls://dns.google:853#50"},
+		{"https://223.5.5.5/dns-query#30", "https://223.5.5.5/dns-query#30"},
+		{"udp://1.1.1.1#0", "udp://1.1.1.1:53#0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := NormalizeUpstream(tc.in)
+			if err != nil {
+				t.Fatalf("NormalizeUpstream(%q) 报错: %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("NormalizeUpstream(%q) = %q，期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 非法权重后缀必须被拒绝，而不是静默当地址的一部分
+func TestNormalizeUpstreamRejectsBadWeight(t *testing.T) {
+	for _, in := range []string{"udp://1.1.1.1:53#abc", "udp://1.1.1.1:53#-5", "udp://1.1.1.1#x"} {
+		if _, err := NormalizeUpstream(in); err == nil {
+			t.Errorf("NormalizeUpstream(%q) 应报错", in)
+		}
+	}
+}
+
+// 运行时 dial 地址必须剥离权重后缀，否则 dial 会因 "#70" 失败
+func TestUpstreamDialAddrStripsWeight(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"udp://1.1.1.1:53#70", "1.1.1.1:53"},
+		{"udp://1.1.1.1#70", "1.1.1.1:53"},
+		{"tls://dns.google#50", "dns.google:853"},
+		{"1.1.1.1:5353#10", "1.1.1.1:5353"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := UpstreamDialAddr(tc.in); got != tc.want {
+				t.Errorf("UpstreamDialAddr(%q) = %q，期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 全局与分组的 dns_mode 校验：wrandom 合法，未知取值拒绝
+func TestValidDNSMode(t *testing.T) {
+	for _, ok := range []string{"", DNSModeRace, DNSModeFailover, DNSModeWRandom} {
+		if !ValidDNSMode(ok) {
+			t.Errorf("ValidDNSMode(%q) 应为合法", ok)
+		}
+	}
+	for _, bad := range []string{"random", "WRANDOM", "weighted", "parallel"} {
+		if ValidDNSMode(bad) {
+			t.Errorf("ValidDNSMode(%q) 应为非法", bad)
+		}
+	}
+}
+
+// ValidateConfig 应接受 wrandom 与带权重的上游，并拒绝非法 dns_mode
+func TestValidateConfigWeightedMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DNSMode = DNSModeWRandom
+	cfg.Upstream = []string{"udp://1.1.1.1:53#70", "udp://8.8.8.8:53#30"}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("wrandom 全局模式校验不应失败: %v", err)
+	}
+	if cfg.Upstream[0] != "udp://1.1.1.1:53#70" || cfg.Upstream[1] != "udp://8.8.8.8:53#30" {
+		t.Errorf("权重后缀应保留: %v", cfg.Upstream)
+	}
+
+	cfg = DefaultConfig()
+	cfg.DNSMode = "random"
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("非法全局 dns_mode 应报错")
+	}
+
+	cfg = DefaultConfig()
+	cfg.ISPGroups = []ISPGroup{{ISP: ISPGroupTelecom, Enabled: true, FallbackDNS: []string{"udp://1.1.1.1:53#70"}, DNSMode: DNSModeWRandom}}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("分组 wrandom 模式校验不应失败: %v", err)
+	}
+}
+
 // ValidateConfig 应就地补全各上游字段的缺省端口（存量配置 udp://1.1.1.1 才会恢复正常）
 func TestValidateConfigNormalizesUpstreams(t *testing.T) {
 	cfg := &Config{

@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"runtime/debug"
@@ -17,6 +18,7 @@ import (
 	"cosDnaPorxy/internal/utils"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 // hasModernProtocols 检查是否包含现代协议或新格式（统一URL scheme）
@@ -83,6 +85,9 @@ type RefactoredHandler struct {
 	// 入站加密与客户端维度分流
 	certStore          *CertStore
 	clientGroupMatcher *ClientGroupMatcher
+
+	// 并发 miss 合并：同一 scope+域名+qtype+模式+上游集合的回源只发一次
+	upstreamFlight singleflight.Group
 
 	// 运营商段库（按运营商自动分组的数据来源）
 	ispDB          *source.DB // nil 表示当前未启用运营商识别
@@ -662,6 +667,15 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	// 协议守卫：RD=0的非递归请求仅用缓存回答，缓存未命中回REFUSED
 	if !req.RecursionDesired {
+		if s, ok := h.cacheManager.GetServeScoped(scope, domain, q.Qtype); ok {
+			h.serveCacheHit(w, req, s)
+			h.recordQuery(w, querylog.Entry{
+				Domain: domain, QType: dns.TypeToString[q.Qtype],
+				Action: querylog.ActionCache, Rcode: dns.RcodeToString[s.Rcode],
+				Answers: s.Answers,
+			})
+			return
+		}
 		resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, q.Qtype)
 		if !hit {
 			h.sendErrorResponse(w, req, dns.RcodeRefused)
@@ -704,7 +718,22 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 
 	clientDecision := h.clientDecisionFromScope(scope)
 
-	// 1. 检查缓存（命中返回递减TTL后的副本）
+	// 1. 检查缓存（快路径直接打补丁写出预打包字节；不适用时回退到深拷贝路径）
+	if s, ok := h.cacheManager.GetServeScoped(scope, domain, qtype); ok {
+		h.serveCacheHit(w, req, s)
+		h.Logger.Debug("✅ [DNS查询完成-非IP记录-缓存命中] ", map[string]interface{}{
+			"domain":      domain,
+			"qtype":       dns.TypeToString[qtype],
+			"client_addr": w.RemoteAddr().String(),
+			"source":      "cache_non_ip",
+		})
+		h.recordQuery(w, querylog.Entry{
+			Domain: domain, QType: dns.TypeToString[qtype],
+			Action: querylog.ActionCache, Rcode: dns.RcodeToString[s.Rcode],
+			Answers: s.Answers, ElapsedMS: time.Since(start).Milliseconds(),
+		})
+		return
+	}
 	resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, qtype)
 	if hit {
 		h.writeResponse(w, req, resp)
@@ -791,6 +820,27 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	clientDecision := h.clientDecisionFromScope(scope)
 
 	// 1. 缓存检查（使用单飞行模式避免重复查询）
+	//    快路径：域名未被标记为云服务时，直接打补丁写出预打包字节，省掉每次命中的整包深拷贝。
+	//    被任何常见类型标记为云时交回原路径（保证「域名带云标记时优先云响应」的原有语义）。
+	if s, ok := h.cacheManager.GetServeScoped(scope, domain, qtype); ok {
+		if !h.cacheManager.IsDomainCloudScoped(scope, domain) {
+			h.serveCacheHit(w, req, s)
+			totalTime := totalTimer.End()
+			h.Logger.Debug("✅ [DNS查询完成-缓存命中] ", map[string]interface{}{
+				"domain":      domain,
+				"qtype":       dns.TypeToString[qtype],
+				"client_addr": w.RemoteAddr().String(),
+				"source":      "cache_normal",
+				"total_time":  totalTime,
+			})
+			h.recordQuery(w, querylog.Entry{
+				Domain: domain, QType: dns.TypeToString[qtype],
+				Action: querylog.ActionCache, Rcode: dns.RcodeToString[s.Rcode],
+				Answers: s.Answers, ElapsedMS: totalTime.Milliseconds(),
+			})
+			return
+		}
+	}
 	resp, hit, _, _ := h.cacheManager.GetWithFlightScoped(scope, domain, qtype)
 	if hit {
 		// 检查域名级别的云服务状态，确保A/AAAA记录处理一致性
@@ -1003,6 +1053,121 @@ func (h *RefactoredHandler) writeResponse(w dns.ResponseWriter, req *dns.Msg, re
 	w.WriteMsg(resp)
 }
 
+// wireBufPool 复用直写响应的字节缓冲
+var wireBufPool = sync.Pool{
+	New: func() interface{} { return make([]byte, 0, 4096) },
+}
+
+// serveCacheHit 缓存命中统一出口：优先直写预打包字节，不适用时按需从字节重建响应走深拷贝路径
+func (h *RefactoredHandler) serveCacheHit(w dns.ResponseWriter, req *dns.Msg, s Serve) {
+	if h.writeResponseWire(w, req, s) {
+		return
+	}
+	// 回退：UDP 需截断、QNAME 编码不符等罕见场景。字节是权威内容，按需 Unpack 重建一份可写响应。
+	// 重建出的 TTL 是写入缓存时的原始值，需按缓存时长递减，与直写路径保持一致。
+	msg := new(dns.Msg)
+	if err := msg.Unpack(s.Wire); err != nil {
+		h.sendErrorResponse(w, req, dns.RcodeServerFailure)
+		return
+	}
+	decrementTTLs(msg, time.Since(s.StoredAt))
+	h.writeResponse(w, req, msg)
+}
+
+// writeResponseWire 用缓存里的预打包字节直写响应：只改写 ID、AD位、Question 大小写与各 RR 的 TTL，
+// 需要时按请求追加 EDNS OPT。语义与 writeResponse 对齐，但省掉每次命中的整包深拷贝。
+// 返回 false 表示当前请求不适合直写（如 UDP 需要截断、Question 长度对不上），调用方应回退。
+func (h *RefactoredHandler) writeResponseWire(w dns.ResponseWriter, req *dns.Msg, s Serve) bool {
+	wire := s.Wire
+	if !s.Meta.ok || len(wire) < 12 || len(req.Question) != 1 {
+		return false
+	}
+
+	opt := req.IsEdns0()
+	need := len(wire)
+	if opt != nil {
+		need += 11 // OPT: NAME(1) + TYPE(2) + CLASS(2) + TTL(4) + RDLEN(2)
+	}
+
+	// UDP 截断交由 miekg 的 Msg.Truncate 处理（按需删记录并置 TC），这里直接回退
+	if w.RemoteAddr().Network() == "udp" {
+		size := 512
+		if opt != nil && opt.UDPSize() > 512 {
+			size = int(opt.UDPSize())
+		}
+		if need > size {
+			return false
+		}
+	}
+
+	buf := wireBufPool.Get().([]byte)
+	if cap(buf) < need {
+		buf = make([]byte, need)
+	}
+	buf = buf[:need]
+	copy(buf, wire)
+
+	// 报文 ID 与请求一致
+	buf[0] = byte(req.Id >> 8)
+	buf[1] = byte(req.Id)
+	// 清 AD 位（未做 DNSSEC 校验且可能改写响应，RFC 4035）
+	buf[3] &^= 0x20
+
+	// Question 段回写客户端原始问题（与 writeResponse 的 resp.Question = req.Question 一致）
+	// QNAME 必须按 wire 编码重写且保留大小写（0x20 随机化的客户端会校验）；
+	// 编码长度与缓存中不一致（理论上不会发生，域名相同则结构相同）时回退
+	q := req.Question[0]
+	qlen := s.Meta.qnameLen
+	if s.Meta.qnameOff+qlen+4 > len(wire) {
+		wireBufPool.Put(buf[:0])
+		return false
+	}
+	end, err := dns.PackDomainName(q.Name, buf, s.Meta.qnameOff, nil, false)
+	if err != nil || end != s.Meta.qnameOff+qlen {
+		wireBufPool.Put(buf[:0])
+		return false
+	}
+	binary.BigEndian.PutUint16(buf[end:end+2], q.Qtype)
+	binary.BigEndian.PutUint16(buf[end+2:end+4], q.Qclass)
+
+	// TTL 按缓存时长递减（下限 0），规则与 decrementTTLs 一致
+	if elapsed := uint32(time.Since(s.StoredAt).Seconds()); elapsed > 0 {
+		for _, f := range s.Meta.ttls {
+			ttl := f.ttl
+			if ttl <= elapsed {
+				ttl = 0
+			} else {
+				ttl -= elapsed
+			}
+			binary.BigEndian.PutUint32(buf[f.off:f.off+4], ttl)
+		}
+	}
+
+	// 按请求回带 EDNS OPT（RFC 6891）
+	if opt != nil {
+		o := len(wire)
+		buf[o] = 0    // NAME: 根
+		buf[o+1] = 0  // TYPE 高字节
+		buf[o+2] = 41 // TYPE = OPT(41)
+		binary.BigEndian.PutUint16(buf[o+3:o+5], opt.UDPSize())
+		buf[o+5] = 0 // 扩展 rcode
+		buf[o+6] = 0 // version
+		var flags uint16
+		if opt.Do() {
+			flags = 0x8000
+		}
+		binary.BigEndian.PutUint16(buf[o+7:o+9], flags)
+		buf[o+9] = 0  // RDLEN 高字节
+		buf[o+10] = 0 // RDLEN 低字节
+		// ARCOUNT + 1
+		binary.BigEndian.PutUint16(buf[10:12], binary.BigEndian.Uint16(buf[10:12])+1)
+	}
+
+	w.Write(buf)
+	wireBufPool.Put(buf[:0])
+	return true
+}
+
 // sendErrorResponse 发送错误响应（走统一响应出口）
 func (h *RefactoredHandler) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode int) {
 	resp := &dns.Msg{}
@@ -1139,6 +1304,11 @@ func (h *RefactoredHandler) effectiveReplaceConfig(cd ClientDecision) ReplaceCon
 func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (SplitDecision, []string) {
 	if !cd.Matched {
 		d := h.matcherHandler.MatchDomain(domain)
+		// 域名分流全部未命中（d.DNSMode 为空）：套用全局默认解析模式（race/failover/wrandom）。
+		// 命中分流列表时其 DNSMode 已由 normDNSMode 归一化为非空，不会被覆盖。
+		if d.DNSMode == "" {
+			d.DNSMode = normDNSMode(h.getConfig().DNSMode)
+		}
 		return d, h.upstreamsFor(domain, d)
 	}
 
